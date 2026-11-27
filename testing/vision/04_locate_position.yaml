@@ -1,0 +1,20 @@
+id: vis-locate-position
+name: 'Vision 04 · Locate Position'
+description: 'Locates the library main entrance door coordinates on a 0-1000 scale.'
+group_id: vision
+active: true
+order: 3
+required_caps:
+  - vision
+
+cases:
+  - name: 'Building facade'
+    steps:
+      - name: 'Locate entrance'
+        prompt: 'Locate the main entrance door in this image. Reply with ONLY its position as coordinates "x,y" in a 0-1000 scale, e.g. "512,340".'
+        attachment: 04_locate_position-1.jpg
+        options:
+          temperature: 0.2
+        evaluation:
+          type: regex
+          pattern: '(?i)\b\d{1,4}\s*,\s*\d{1,4}\b'

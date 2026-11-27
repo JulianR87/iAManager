@@ -1,0 +1,22 @@
+id: vis-compare-images
+name: 'Vision 06 · Compare Images'
+description: 'Spots the single difference (yellow sticky note on laptop) between two images.'
+group_id: vision
+active: true
+order: 5
+required_caps:
+  - vision
+
+cases:
+  - name: 'Desk comparison'
+    steps:
+      - name: 'Spot difference'
+        prompt: These two images are almost identical. What is the single difference between the first and the second one?
+        attachments:
+          - 06_compare_images-1.jpg
+          - 06_compare_images-2.jpg
+        options:
+          temperature: 0.2
+        evaluation:
+          type: regex
+          pattern: '(?i)\b(sticky note|note|yellow paper|post-it)\b'

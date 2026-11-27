@@ -1,0 +1,3607 @@
+"use strict";
+
+// ---------- settings ----------
+async function showSettingsView() {
+  hideAllMainViews();
+  if (typeof stopSpeechPlayback === "function") {
+    stopSpeechPlayback();
+  }
+  currentView = "settings";
+
+  document.querySelectorAll(".topbar-actions button").forEach((b) => b.classList.remove("active"));
+  $("settings-btn")?.classList.add("active");
+
+  const view = $("settings-view");
+  if (view) view.hidden = false;
+
+  if (!window.location.pathname.startsWith("/settings")) {
+    history.pushState(null, "", "/settings");
+  }
+
+  try {
+    currentConfig = await api("/api/config");
+  } catch (e) {
+    toast(t("toast.error", { msg: e.message }), "error");
+    return;
+  }
+  const effectiveLang = currentConfig.language || (window.I18n ? window.I18n.getLang() : "en");
+  $("set-language").value = effectiveLang;
+  renderSettingsTranslations(effectiveLang);
+  $("set-port").value = currentConfig.port;
+  $("set-expose").checked = !!currentConfig.expose_network;
+  $("set-password").value = "";
+
+  const globalDefaults = getGlobalChatDefaults();
+  if ($("set-default-system")) {
+    $("set-default-system").value = globalDefaults.system || "";
+    updateSettingsDefaultSystemTokens();
+  }
+  if ($("set-default-temp")) $("set-default-temp").value = String(globalDefaults.temperature != null && globalDefaults.temperature !== "" ? globalDefaults.temperature : "0.7");
+  if ($("set-default-top-k")) $("set-default-top-k").value = String(globalDefaults.top_k != null && globalDefaults.top_k !== "" ? globalDefaults.top_k : "40");
+  if ($("set-default-top-p")) $("set-default-top-p").value = String(globalDefaults.top_p != null && globalDefaults.top_p !== "" ? globalDefaults.top_p : "0.9");
+  if ($("set-default-num-ctx")) $("set-default-num-ctx").value = String(normalizeNumCtxPct(globalDefaults.num_ctx ?? 100));
+  if ($("set-default-think-level")) $("set-default-think-level").value = globalDefaults.think_level || "auto";
+  if ($("set-default-web-tools")) $("set-default-web-tools").checked = !!globalDefaults.web_tools;
+  if ($("set-default-artifacts")) $("set-default-artifacts").checked = !!globalDefaults.artifacts;
+  if ($("set-default-skills")) $("set-default-skills").checked = !!globalDefaults.skills;
+
+  const chatSessionsCfg = currentConfig.chat_sessions || {};
+  if ($("set-chat-sessions-enabled")) $("set-chat-sessions-enabled").checked = chatSessionsCfg.enabled !== false;
+  if ($("set-chat-sessions-on-model-delete")) $("set-chat-sessions-on-model-delete").value = chatSessionsCfg.on_model_delete === "keep" ? "keep" : "delete";
+
+  const testingLimits = currentConfig.testing || {};
+  if ($("set-testing-max-stage-tokens")) $("set-testing-max-stage-tokens").value = String(Math.max(0, testingLimits.max_stage_tokens || 0));
+  if ($("set-testing-max-stage-seconds")) $("set-testing-max-stage-seconds").value = String(Math.max(0, testingLimits.max_stage_seconds || 0));
+  if ($("set-testing-mode")) $("set-testing-mode").value = testingLimits.mode === "all" ? "all" : "any";
+  bindTestingSummaryEvents();
+  loadSkipRulesFromConfig();
+
+  const buildEl = $("settings-build-info");
+  if (buildEl) {
+    buildEl.textContent = currentConfig.version ? `v${currentConfig.version}` : "";
+    buildEl.title = currentConfig.version || "";
+  }
+  loadComfySettings(currentConfig);
+  if (typeof ragSettingsInit === "function") ragSettingsInit();
+  if (typeof skillsSettingsInit === "function") skillsSettingsInit(currentConfig);
+  if (typeof mcpSettingsInit === "function") mcpSettingsInit(currentConfig);
+  bindExternalModelsEvents();
+  bindSystemPromptsEvents();
+  bindGatewayEvents();
+  bindComfySettingsEvents();
+  bindSettingsNavEvents();
+  bindDefaultSystemPromptFileEvents();
+  bindSystemPromptsModalEvents();
+  bindChatDefaultsEvents();
+  bindChatSessionsSettingsEvents();
+  bindHuggingFaceEvents();
+  bindSettingsSecretEvents();
+  updateHFTokenBadge();
+  syncHFTokenInput();
+  void loadOllamaKey();
+
+  const mobileBackBtn = $("settings-mobile-back-btn");
+  if (mobileBackBtn && !mobileBackBtn._bound) {
+    mobileBackBtn._bound = true;
+    mobileBackBtn.addEventListener("click", showSettingsMobileMenu);
+  }
+
+  const path = window.location.pathname;
+  let targetSecId = "sec-general";
+  if (path === "/settings/chat-defaults") targetSecId = "sec-chat-defaults";
+  else if (path === "/settings/chat-sessions") targetSecId = "sec-chat-sessions";
+  else if (path === "/settings/testing") targetSecId = "sec-testing";
+  else if (path === "/settings/prompts") targetSecId = "sec-prompts";
+  else if (path === "/settings/network") targetSecId = "sec-network";
+  else if (path === "/settings/huggingface") targetSecId = "sec-hf";
+  else if (path === "/settings/external") targetSecId = "sec-ext-models";
+  else if (path === "/settings/archived" || path === "/archived") targetSecId = "sec-archived";
+  else if (path === "/settings/gateway") targetSecId = "sec-gateway";
+  else if (path === "/settings/rag") targetSecId = "sec-rag";
+  else if (path === "/settings/skills") targetSecId = "sec-skills";
+  else if (path === "/settings/mcp") targetSecId = "sec-mcp";
+  else if (path === "/settings/comfyui") targetSecId = "sec-comfyui";
+  else if (path === "/settings/opencode" || path === "/opencode") targetSecId = "sec-opencode";
+  else if (path === "/settings/general") targetSecId = "sec-general";
+  else if (path === "/settings" || path === "/settings/") {
+    if (window.innerWidth <= 900) {
+      showSettingsMobileMenu();
+      targetSecId = null;
+    }
+  }
+
+  if (targetSecId) {
+    showSettingsSection(targetSecId, false);
+  }
+}
+
+function openSettings() {
+  return showSettingsView();
+}
+
+function updateSettingsDefaultSystemTokens() {
+  const sys = $("set-default-system");
+  const badge = $("set-default-system-tokens");
+  if (!badge) return;
+  const val = (sys?.value || "").trim();
+  const count = typeof estimateTokens === "function" ? estimateTokens(val) : 0;
+  if (count > 0) {
+    badge.textContent = `~${count.toLocaleString()} tok`;
+    badge.classList.add("has-tokens");
+    badge.title = `${count.toLocaleString()} approximate tokens`;
+  } else {
+    badge.textContent = "0 tok";
+    badge.classList.remove("has-tokens");
+    badge.title = "Approximate tokens";
+  }
+}
+window.updateSettingsDefaultSystemTokens = updateSettingsDefaultSystemTokens;
+
+function updatePromptEditorTokens() {
+  const sys = $("prompt-edit-content");
+  const badge = $("prompt-edit-tokens");
+  if (!badge) return;
+  const val = (sys?.value || "").trim();
+  const count = typeof estimateTokens === "function" ? estimateTokens(val) : 0;
+  if (count > 0) {
+    badge.textContent = `~${count.toLocaleString()} tok`;
+    badge.classList.add("has-tokens");
+    badge.title = `${count.toLocaleString()} approximate tokens`;
+  } else {
+    badge.textContent = "0 tok";
+    badge.classList.remove("has-tokens");
+    badge.title = "Approximate tokens";
+  }
+}
+window.updatePromptEditorTokens = updatePromptEditorTokens;
+
+function loadFileIntoDefaultSystemPrompt(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const text = e.target?.result;
+    if (typeof text !== "string") return;
+    const sysEl = $("set-default-system");
+    if (!sysEl) return;
+    sysEl.value = text;
+    updateSettingsDefaultSystemTokens();
+    toast(t("chat.system_file_loaded") || "System prompt loaded from file", "success");
+  };
+  reader.onerror = () => {
+    toast(t("chat.system_file_read_error") || "Could not read file", "error");
+  };
+  reader.readAsText(file);
+}
+
+function bindDefaultSystemPromptFileEvents() {
+  const sysEl = $("set-default-system");
+  if (sysEl && !sysEl._boundTokens) {
+    sysEl._boundTokens = true;
+    sysEl.addEventListener("input", updateSettingsDefaultSystemTokens);
+    sysEl.addEventListener("change", updateSettingsDefaultSystemTokens);
+  }
+
+  const sysFileBtn = $("set-default-system-file-btn");
+  const sysFileInput = $("set-default-system-file-input");
+  if (sysFileBtn && sysFileInput && !sysFileBtn._bound) {
+    sysFileBtn._bound = true;
+    sysFileBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      sysFileInput.click();
+    });
+    sysFileInput.addEventListener("change", () => {
+      const file = sysFileInput.files?.[0];
+      if (file) {
+        loadFileIntoDefaultSystemPrompt(file);
+      }
+      sysFileInput.value = "";
+    });
+  }
+
+  const sysClearBtn = $("set-default-system-clear-btn");
+  if (sysClearBtn && !sysClearBtn._bound) {
+    sysClearBtn._bound = true;
+    sysClearBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const sys = $("set-default-system");
+      if (sys) {
+        sys.value = "";
+        updateSettingsDefaultSystemTokens();
+        sys.dispatchEvent(new Event("input", { bubbles: true }));
+        sys.dispatchEvent(new Event("change", { bubbles: true }));
+        sys.focus();
+      }
+    });
+  }
+
+  const sysField = $("set-default-system-field");
+  if (sysField && !sysField._boundDnd) {
+    sysField._boundDnd = true;
+    let sysDndDepth = 0;
+    sysField.addEventListener("dragenter", (e) => {
+      if (e.dataTransfer?.types?.includes("Files")) {
+        e.preventDefault();
+        e.stopPropagation();
+        sysDndDepth += 1;
+        sysField.classList.add("drag-over");
+      }
+    });
+    sysField.addEventListener("dragover", (e) => {
+      if (e.dataTransfer?.types?.includes("Files")) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = "copy";
+      }
+    });
+    sysField.addEventListener("dragleave", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      sysDndDepth = Math.max(0, sysDndDepth - 1);
+      if (sysDndDepth === 0) {
+        sysField.classList.remove("drag-over");
+      }
+    });
+    sysField.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      sysDndDepth = 0;
+      sysField.classList.remove("drag-over");
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (files.length > 0) {
+        loadFileIntoDefaultSystemPrompt(files[0]);
+      }
+    });
+  }
+}
+
+function bindChatDefaultsEvents() {
+  const resetAllBtn = $("set-reset-all-models-btn");
+  if (resetAllBtn && !resetAllBtn._bound) {
+    resetAllBtn._bound = true;
+    resetAllBtn.addEventListener("click", async () => {
+      const allOverrides = typeof getAllModelChatOptions === "function" ? getAllModelChatOptions() : {};
+      const count = Object.keys(allOverrides).length;
+      if (count === 0) {
+        toast(t("settings.reset_all_models_none"), "info");
+        return;
+      }
+
+      const conf = await askConfirm({
+        title: t("settings.reset_all_models_confirm_title"),
+        text: t("settings.reset_all_models_confirm_desc", { count }),
+        okText: t("settings.reset_all_models_btn"),
+        okClass: "danger",
+      });
+      if (!conf?.ok) return;
+
+      if (typeof saveGlobalChatDefaults === "function") {
+        saveGlobalChatDefaults({
+          system: $("set-default-system")?.value ?? "",
+          temperature: parseFloat($("set-default-temp")?.value) || 0.7,
+          top_k: parseInt($("set-default-top-k")?.value, 10) || 40,
+          top_p: parseFloat($("set-default-top-p")?.value) || 0.9,
+          num_ctx: typeof normalizeNumCtxPct === "function" ? normalizeNumCtxPct($("set-default-num-ctx")?.value ?? 100) : 100,
+          think_level: $("set-default-think-level")?.value ?? "auto",
+          web_tools: $("set-default-web-tools")?.checked ?? false,
+          artifacts: $("set-default-artifacts")?.checked ?? false,
+          skills: $("set-default-skills")?.checked ?? false,
+        });
+      }
+
+      if (typeof resetAllModelChatOptionsToDefaults === "function") {
+        resetAllModelChatOptionsToDefaults();
+      }
+      toast(t("settings.reset_all_models_done"), "success");
+    });
+  }
+}
+
+// ---------- persistent chat sessions ----------
+
+// patchChatSessionsConfig sends only the field that changed. The server keeps
+// every field the patch leaves out, so a partial body is safe.
+async function patchChatSessionsConfig(patch) {
+  const res = await api("/api/config", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_sessions: patch }),
+  });
+  if (currentConfig) currentConfig.chat_sessions = res?.chat_sessions || currentConfig.chat_sessions;
+  return res;
+}
+
+function bindChatSessionsSettingsEvents() {
+  const enabled = $("set-chat-sessions-enabled");
+  if (enabled && !enabled._bound) {
+    enabled._bound = true;
+    enabled.addEventListener("change", async () => {
+      const on = enabled.checked;
+      if (!on) {
+        // Turning the feature off cancels whatever is in flight, so say so
+        // before doing it rather than surprising the user with a stopped run.
+        const conf = await askConfirm({
+          title: t("settings.chat_sessions_disable_title"),
+          text: t("settings.chat_sessions_disable_desc"),
+          okText: t("settings.chat_sessions_disable_ok"),
+          okClass: "danger",
+        });
+        if (!conf?.ok) {
+          enabled.checked = true;
+          return;
+        }
+      }
+      try {
+        await patchChatSessionsConfig({ enabled: on });
+        toast(t(on ? "settings.chat_sessions_enabled_done" : "settings.chat_sessions_disabled_done"), "success");
+        // Any other open tab keeps its own copy of the flag, so nudge it to
+        // re-read instead of leaving a "+ Session" button that answers 403.
+        broadcastChatSessionsSetting(on);
+      } catch (e) {
+        enabled.checked = !on;
+        toast(t("toast.error", { msg: e.message }), "error");
+      }
+    });
+  }
+
+  const onModelDelete = $("set-chat-sessions-on-model-delete");
+  if (onModelDelete && !onModelDelete._bound) {
+    onModelDelete._bound = true;
+    onModelDelete.addEventListener("change", async () => {
+      const value = onModelDelete.value === "keep" ? "keep" : "delete";
+      try {
+        await patchChatSessionsConfig({ on_model_delete: value });
+        toast(t("settings.chat_sessions_on_model_delete_done", { mode: t(value === "keep" ? "settings.chat_sessions_keep_sessions" : "settings.chat_sessions_delete_its_sessions") }), "success");
+      } catch (e) {
+        toast(t("toast.error", { msg: e.message }), "error");
+      }
+    });
+  }
+
+  const clearAll = $("set-chat-sessions-clear-all");
+  if (clearAll && !clearAll._bound) {
+    clearAll._bound = true;
+    clearAll.addEventListener("click", async () => {
+      let count = 0;
+      try {
+        count = (await api("/api/chat/sessions"))?.sessions?.length || 0;
+      } catch (_) { /* the confirm below still explains what is at stake */ }
+      const conf = await askConfirm({
+        title: t("settings.chat_sessions_clear_all_title"),
+        text: t("settings.chat_sessions_clear_all_desc_count", { count }),
+        okText: t("settings.chat_sessions_clear_all_btn"),
+        okClass: "danger",
+      });
+      if (!conf?.ok) return;
+      try {
+        const res = await api("/api/chat/sessions", { method: "DELETE" });
+        toast(t("settings.chat_sessions_clear_all_done", { count: res?.deleted ?? count }), "success");
+        // Any other open tab must forget the sessions it still lists.
+        broadcastChatSessionsSetting(true);
+      } catch (e) {
+        toast(t("toast.error", { msg: e.message }), "error");
+      }
+    });
+  }
+}
+
+function bindSettingsNavEvents() {
+  const navItems = document.querySelectorAll(".settings-nav-item");
+  navItems.forEach((btn) => {
+    if (btn._bound) return;
+    btn._bound = true;
+    btn.addEventListener("click", () => {
+      const sectionId = btn.dataset.section;
+      if (!sectionId) return;
+      showSettingsSection(sectionId, true);
+    });
+  });
+}
+
+function showSettingsSection(sectionId, updateUrl = true) {
+  resetSettingsSecretVisibility();
+  const settingsView = $("settings-view");
+  if (settingsView) {
+    settingsView.classList.add("settings-mobile-section-open");
+  }
+
+  const navItems = document.querySelectorAll(".settings-nav-item");
+  navItems.forEach((b) => {
+    b.classList.toggle("active", b.dataset.section === sectionId);
+  });
+
+  const allSections = document.querySelectorAll(".settings-section-card");
+  allSections.forEach((sec) => {
+    sec.hidden = true;
+  });
+
+  const targetSec = $(sectionId);
+  if (targetSec) {
+    targetSec.hidden = false;
+    const mainEl = document.querySelector(".settings-main");
+    if (mainEl) mainEl.scrollTop = 0;
+  }
+
+  if (updateUrl) {
+    let subRoute = "/settings";
+    if (sectionId === "sec-general") subRoute = "/settings/general";
+    else if (sectionId === "sec-chat-defaults") subRoute = "/settings/chat-defaults";
+    else if (sectionId === "sec-chat-sessions") subRoute = "/settings/chat-sessions";
+    else if (sectionId === "sec-testing") subRoute = "/settings/testing";
+    else if (sectionId === "sec-prompts") subRoute = "/settings/prompts";
+    else if (sectionId === "sec-network") subRoute = "/settings/network";
+    else if (sectionId === "sec-hf") subRoute = "/settings/huggingface";
+    else if (sectionId === "sec-ext-models") subRoute = "/settings/external";
+    else if (sectionId === "sec-archived") subRoute = "/settings/archived";
+    else if (sectionId === "sec-gateway") subRoute = "/settings/gateway";
+    else if (sectionId === "sec-rag") subRoute = "/settings/rag";
+    else if (sectionId === "sec-skills") subRoute = "/settings/skills";
+    else if (sectionId === "sec-mcp") subRoute = "/settings/mcp";
+    else if (sectionId === "sec-opencode") subRoute = "/settings/opencode";
+    if (window.location.pathname !== subRoute) {
+      history.pushState(null, "", subRoute);
+    }
+  }
+}
+
+function showSettingsMobileMenu() {
+  resetSettingsSecretVisibility();
+  const settingsView = $("settings-view");
+  if (settingsView) {
+    settingsView.classList.remove("settings-mobile-section-open");
+  }
+  if (window.location.pathname !== "/settings") {
+    history.pushState(null, "", "/settings");
+  }
+}
+window.showSettingsMobileMenu = showSettingsMobileMenu;
+
+// ---------- HuggingFace settings ----------
+
+function updateHFTokenBadge() {
+  const badge = $("hf-token-badge");
+  if (!badge) return;
+  if (currentConfig?.has_hf_token) {
+    badge.textContent = t("settings.hf_token_set");
+    badge.classList.remove("badge-na");
+  } else {
+    badge.textContent = t("settings.hf_token_unset");
+    badge.classList.add("badge-na");
+  }
+}
+window.updateHFTokenBadge = updateHFTokenBadge;
+
+// syncHFTokenInput clears the field and shows a "saved" placeholder when a
+// token is already stored, so an empty box never looks like the token was
+// erased.
+function syncHFTokenInput() {
+  const input = $("set-hf-token");
+  if (!input) return;
+  resetSettingsSecretVisibility("set-hf-token");
+  input.value = "";
+  input.placeholder = currentConfig?.has_hf_token
+    ? t("settings.hf_token_saved_placeholder")
+    : "hf_...";
+}
+window.syncHFTokenInput = syncHFTokenInput;
+
+const settingsSecretState = new Map();
+
+function settingsSecretRec(inputId) {
+  let r = settingsSecretState.get(inputId);
+  if (!r) {
+    r = { gen: 0, originSaved: false, busy: false };
+    settingsSecretState.set(inputId, r);
+  }
+  return r;
+}
+
+function setSettingsSecretVisible(inputId, visible) {
+  const input = $(inputId);
+  const btn = document.querySelector(`[data-secret-eye="${inputId}"]`);
+  if (input) input.type = visible ? "text" : "password";
+  if (btn) {
+    btn.setAttribute("aria-pressed", visible ? "true" : "false");
+    btn.setAttribute("data-i18n", visible ? "settings.secret_hide" : "settings.secret_show");
+    const label = t(visible ? "settings.secret_hide" : "settings.secret_show");
+    btn.title = label;
+    btn.setAttribute("aria-label", label);
+    const eye = btn.querySelector(".icon-eye");
+    const off = btn.querySelector(".icon-eye-off");
+    if (eye) { if (visible) eye.setAttribute("hidden", ""); else eye.removeAttribute("hidden"); }
+    if (off) { if (visible) off.removeAttribute("hidden"); else off.setAttribute("hidden", ""); }
+  }
+}
+window.setSettingsSecretVisible = setSettingsSecretVisible;
+
+function getSettingsSecretDraft(inputId) {
+  const input = $(inputId);
+  if (settingsSecretRec(inputId).originSaved) return "";
+  return input ? String(input.value ?? "").trim() : "";
+}
+window.getSettingsSecretDraft = getSettingsSecretDraft;
+
+function resetSettingsSecretVisibility(inputId) {
+  const ids = inputId ? [inputId] : [...settingsSecretState.keys()];
+  for (const id of ids) {
+    const rec = settingsSecretRec(id);
+    rec.gen++;
+    rec.busy = false;
+    if (rec.originSaved) {
+      const input = $(id);
+      if (input) input.value = "";
+      rec.originSaved = false;
+    }
+    setSettingsSecretVisible(id, false);
+    const btn = document.querySelector(`[data-secret-eye="${id}"]`);
+    if (btn) btn.disabled = false;
+  }
+}
+window.resetSettingsSecretVisibility = resetSettingsSecretVisibility;
+
+async function toggleSettingsSecret(inputId) {
+  const input = $(inputId);
+  const rec = settingsSecretRec(inputId);
+  if (!input || rec.busy) return;
+  const btn = document.querySelector(`[data-secret-eye="${inputId}"]`);
+  if (input.type === "text") {
+    rec.gen++;
+    if (rec.originSaved) {
+      input.value = "";
+      rec.originSaved = false;
+    }
+    setSettingsSecretVisible(inputId, false);
+    return;
+  }
+  if (input.value !== "" || inputId === "hf-ollama-key") {
+    setSettingsSecretVisible(inputId, true);
+    return;
+  }
+  const kind = inputId === "set-hf-token" ? "hf_token" : inputId === "ext-model-apikey" ? "external_api_key" : "";
+  if (!kind) return;
+  let body;
+  if (kind === "hf_token") {
+    if (!currentConfig?.has_hf_token) return;
+    body = { kind };
+  } else {
+    if (!editingExtModel || !editingExtModel.api_key) return;
+    body = { kind, id: editingExtModel.id || editingExtModel.name };
+  }
+  const gen = ++rec.gen;
+  rec.busy = true;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api("/api/settings/secrets/reveal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (settingsSecretRec(inputId).gen !== gen) return;
+    if (kind === "external_api_key") {
+      const still = editingExtModel ? (editingExtModel.id || editingExtModel.name) : "";
+      if (still !== body.id) return;
+    }
+    input.value = res.value || "";
+    rec.originSaved = true;
+    setSettingsSecretVisible(inputId, true);
+    rec.busy = false;
+    if (btn) btn.disabled = false;
+  } catch (e) {
+    if (settingsSecretRec(inputId).gen === gen) {
+      rec.busy = false;
+      if (btn) btn.disabled = false;
+      toast(t("toast.error", { msg: e.message }), "error");
+    }
+  }
+}
+window.toggleSettingsSecret = toggleSettingsSecret;
+
+function bindSettingsSecretEvents() {
+  document.querySelectorAll("[data-secret-eye]").forEach((btn) => {
+    if (btn._bound) return;
+    btn._bound = true;
+    btn.addEventListener("click", () => { void toggleSettingsSecret(btn.dataset.secretEye); });
+  });
+  ["set-hf-token", "ext-model-apikey"].forEach((id) => {
+    const input = $(id);
+    if (input && !input._secretBound) {
+      input._secretBound = true;
+      input.addEventListener("input", () => {
+        const rec = settingsSecretRec(id);
+        rec.originSaved = false;
+        rec.gen++;
+        rec.busy = false;
+        const btn = document.querySelector(`[data-secret-eye="${id}"]`);
+        if (btn) btn.disabled = false;
+      });
+    }
+  });
+  if (!document._secretVisBound) {
+    document._secretVisBound = true;
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") resetSettingsSecretVisibility();
+    });
+  }
+}
+window.bindSettingsSecretEvents = bindSettingsSecretEvents;
+
+function openHuggingFaceSettings() {
+  const go = async () => {
+    await showSettingsView();
+    showSettingsSection("sec-hf", true);
+  };
+  void go();
+}
+window.openHuggingFaceSettings = openHuggingFaceSettings;
+
+async function loadOllamaKey() {
+  const input = $("hf-ollama-key");
+  const note = $("hf-ollama-key-note");
+  if (!input) return;
+  input.value = "";
+  if (note) note.textContent = "";
+  let res = null;
+  try {
+    res = await api("/api/ollama/key");
+  } catch (e) {
+    res = null;
+  }
+  const path = res?.path || "~/.ollama/id_ed25519.pub";
+  if (res?.found && res.public_key) {
+    input.value = res.public_key;
+    if (note) note.textContent = path;
+  } else if (note) {
+    note.textContent = t("settings.hf_key_missing", { path });
+  }
+}
+
+function bindHuggingFaceEvents() {
+  const copyBtn = $("hf-ollama-key-copy");
+  if (copyBtn && !copyBtn._bound) {
+    copyBtn._bound = true;
+    copyBtn.addEventListener("click", async () => {
+      const val = $("hf-ollama-key")?.value || "";
+      if (!val) return;
+      try {
+        await navigator.clipboard.writeText(val);
+      } catch (e) {
+        const input = $("hf-ollama-key");
+        if (input) {
+          input.removeAttribute("readonly");
+          input.select();
+          try { document.execCommand("copy"); } catch (_) { /* ignore */ }
+          input.setAttribute("readonly", "readonly");
+        }
+      }
+      toast(t("settings.hf_key_copied"), "success");
+    });
+  }
+
+  const clearBtn = $("hf-token-clear-btn");
+  if (clearBtn && !clearBtn._bound) {
+    clearBtn._bound = true;
+    clearBtn.addEventListener("click", async () => {
+      resetSettingsSecretVisibility("set-hf-token");
+      try {
+        const res = await api("/api/config", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ hf_token: "" }),
+        });
+        if (currentConfig) currentConfig.has_hf_token = res.has_hf_token;
+        if ($("set-hf-token")) $("set-hf-token").value = "";
+        syncHFTokenInput();
+        updateHFTokenBadge();
+        toast(t("settings.hf_token_cleared"), "success");
+      } catch (e) {
+        toast(t("toast.error", { msg: e.message }), "error");
+      }
+    });
+  }
+}
+
+
+// ---------- testing auto-skip summary ----------
+
+function fmtTestingTokens(n) {
+  return `${Number(n).toLocaleString()} tokens`;
+}
+
+function fmtTestingSeconds(s) {
+  s = Number(s) || 0;
+  if (s >= 60) {
+    const m = s / 60;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)} min`;
+  }
+  return `${s}s`;
+}
+
+function updateTestingSummary() {
+  const el = $("set-testing-summary");
+  if (!el) return;
+  if (Array.isArray(testingSkipRules) && testingSkipRules.length > 0) {
+    el.textContent = t("settings.testing_summary_rules", { count: testingSkipRules.length });
+    return;
+  }
+  const tokens = Math.max(0, parseInt($("set-testing-max-stage-tokens")?.value, 10) || 0);
+  const seconds = Math.max(0, parseInt($("set-testing-max-stage-seconds")?.value, 10) || 0);
+  const mode = $("set-testing-mode")?.value === "all" ? "all" : "any";
+  const vars = { tokens: fmtTestingTokens(tokens), time: fmtTestingSeconds(seconds) };
+  let key = "settings.testing_summary_off";
+  if (tokens && seconds) key = mode === "all" ? "settings.testing_summary_all" : "settings.testing_summary_any";
+  else if (tokens) key = "settings.testing_summary_tokens";
+  else if (seconds) key = "settings.testing_summary_time";
+  el.textContent = t(key, vars);
+}
+window.updateTestingSummary = updateTestingSummary;
+
+function bindTestingSummaryEvents() {
+  for (const id of ["set-testing-mode", "set-testing-max-stage-tokens", "set-testing-max-stage-seconds"]) {
+    const el = $(id);
+    if (el && !el._testingBound) {
+      el._testingBound = true;
+      el.addEventListener("input", updateTestingSummary);
+      el.addEventListener("change", updateTestingSummary);
+    }
+  }
+}
+
+// ---------- testing auto-skip rules by model speed ----------
+
+let testingSkipRules = [];
+
+function fmtSpeedRange(min, max) {
+  min = Math.max(0, Number(min) || 0);
+  max = Number(max) || 0;
+  if (max > 0) return `${min}–${max} tok/s`;
+  if (min > 0) return `${min}+ tok/s`;
+  return t("settings.testing_rule_any_speed");
+}
+
+function testingRuleSummary(rule) {
+  const range = fmtSpeedRange(rule.min_tps, rule.max_tps);
+  const tokens = Math.max(0, parseInt(rule.max_tokens, 10) || 0);
+  const seconds = Math.max(0, parseInt(rule.max_seconds, 10) || 0);
+  const mode = rule.mode === "all" ? "all" : "any";
+  const vars = { range, tokens: fmtTestingTokens(tokens), time: fmtTestingSeconds(seconds) };
+  let key = "settings.testing_rule_summary_off";
+  if (tokens && seconds) key = mode === "all" ? "settings.testing_rule_summary_all" : "settings.testing_rule_summary_any";
+  else if (tokens) key = "settings.testing_rule_summary_tokens";
+  else if (seconds) key = "settings.testing_rule_summary_time";
+  return t(key, vars);
+}
+
+function renderSkipRules() {
+  const box = $("testing-skip-rules");
+  if (!box) return;
+  box.innerHTML = "";
+  testingSkipRules.forEach((rule, idx) => {
+    const row = document.createElement("div");
+    row.className = "skip-rule-row";
+    row.dataset.idx = String(idx);
+    row.innerHTML = `
+      <input type="number" class="skip-min" min="0" step="10" value="${escapeHtml(String(rule.min_tps ?? 0))}" autocomplete="off">
+      <span class="muted skip-dash">–</span>
+      <input type="number" class="skip-max" min="0" step="10" value="${rule.max_tps ? escapeHtml(String(rule.max_tps)) : ""}" placeholder="∞" autocomplete="off">
+      <input type="number" class="skip-tokens" min="0" step="100" value="${rule.max_tokens ? escapeHtml(String(rule.max_tokens)) : ""}" placeholder="—" autocomplete="off">
+      <input type="number" class="skip-seconds" min="0" step="10" value="${rule.max_seconds ? escapeHtml(String(rule.max_seconds)) : ""}" placeholder="—" autocomplete="off">
+      <select class="skip-mode" autocomplete="off">
+        <option value="any"${rule.mode === "all" ? "" : " selected"}>OR</option>
+        <option value="all"${rule.mode === "all" ? " selected" : ""}>AND</option>
+      </select>
+      <span class="skip-rule-btns">
+        <button type="button" class="btn-icon skip-up" title="↑">↑</button>
+        <button type="button" class="btn-icon skip-down" title="↓">↓</button>
+        <button type="button" class="btn-icon skip-del" title="×">×</button>
+      </span>
+      <div class="skip-rule-summary muted"></div>
+    `;
+    box.appendChild(row);
+    updateSkipRuleSummary(row, rule);
+  });
+  updateTestingSummary();
+}
+
+function updateSkipRuleSummary(row, rule) {
+  const el = row.querySelector(".skip-rule-summary");
+  if (el) el.textContent = testingRuleSummary(rule);
+}
+
+function readSkipRuleRow(row) {
+  const num = (sel) => {
+    const raw = (row.querySelector(sel)?.value ?? "").trim();
+    return raw === "" ? 0 : Number(raw);
+  };
+  return {
+    min_tps: Math.max(0, num(".skip-min") || 0),
+    max_tps: Math.max(0, num(".skip-max") || 0),
+    max_tokens: Math.max(0, Math.floor(num(".skip-tokens") || 0)),
+    max_seconds: Math.max(0, Math.floor(num(".skip-seconds") || 0)),
+    mode: row.querySelector(".skip-mode")?.value === "all" ? "all" : "any",
+  };
+}
+
+function syncSkipRulesFromDOM() {
+  const box = $("testing-skip-rules");
+  if (!box) return;
+  const next = [];
+  box.querySelectorAll(".skip-rule-row").forEach((row) => {
+    const rule = readSkipRuleRow(row);
+    next.push(rule);
+    updateSkipRuleSummary(row, rule);
+  });
+  testingSkipRules = next;
+  updateTestingSummary();
+}
+
+function bindSkipRulesEvents() {
+  const box = $("testing-skip-rules");
+  if (box && !box._skipRulesBound) {
+    box._skipRulesBound = true;
+    box.addEventListener("input", syncSkipRulesFromDOM);
+    box.addEventListener("change", syncSkipRulesFromDOM);
+    box.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      const row = e.target.closest(".skip-rule-row");
+      if (!row) return;
+      const idx = Number(row.dataset.idx);
+      if (btn.classList.contains("skip-del")) {
+        testingSkipRules.splice(idx, 1);
+      } else if (btn.classList.contains("skip-up") && idx > 0) {
+        const [r] = testingSkipRules.splice(idx, 1);
+        testingSkipRules.splice(idx - 1, 0, r);
+      } else if (btn.classList.contains("skip-down") && idx < testingSkipRules.length - 1) {
+        const [r] = testingSkipRules.splice(idx, 1);
+        testingSkipRules.splice(idx + 1, 0, r);
+      } else {
+        return;
+      }
+      renderSkipRules();
+    });
+  }
+  const add = $("set-testing-add-rule");
+  if (add && !add._skipRuleAddBound) {
+    add._skipRuleAddBound = true;
+    add.addEventListener("click", () => {
+      testingSkipRules.push({ min_tps: 0, max_tps: 0, max_tokens: 0, max_seconds: 0, mode: "any" });
+      renderSkipRules();
+    });
+  }
+}
+
+function loadSkipRulesFromConfig() {
+  const raw = currentConfig?.testing?.skip_rules;
+  testingSkipRules = Array.isArray(raw) ? raw.map((r) => ({
+    min_tps: Math.max(0, Number(r.min_tps) || 0),
+    max_tps: Math.max(0, Number(r.max_tps) || 0),
+    max_tokens: Math.max(0, Math.floor(Number(r.max_tokens) || 0)),
+    max_seconds: Math.max(0, Math.floor(Number(r.max_seconds) || 0)),
+    mode: r.mode === "all" ? "all" : "any",
+  })) : [];
+  bindSkipRulesEvents();
+  renderSkipRules();
+}
+
+// ---------- System Prompts Library ----------
+let systemPromptsList = [];
+
+async function loadSystemPrompts(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("prompts-list");
+  const badge = $("prompts-badge");
+  const navBadge = $("prompts-nav-badge");
+  if (!listEl) return;
+  try {
+    const data = await api("/api/system-prompts");
+    systemPromptsList = data.prompts || [];
+    if (badge) badge.textContent = String(systemPromptsList.length);
+    if (navBadge) navBadge.textContent = String(systemPromptsList.length);
+    const filterText = ($("prompt-search-input")?.value || "").trim().toLowerCase();
+    renderPromptsList(filterText, targetLang);
+  } catch (e) {
+    if (listEl) listEl.innerHTML = `<div class="muted small">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderPromptsList(filterText = "", lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("prompts-list");
+  if (!listEl) return;
+  const filtered = systemPromptsList.filter((p) => {
+    if (!filterText) return true;
+    return (p.title && p.title.toLowerCase().includes(filterText)) ||
+           (p.prompt && p.prompt.toLowerCase().includes(filterText));
+  });
+
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="muted small">${escapeHtml(t("settings.prompts_none", null, targetLang))}</div>`;
+    return;
+  }
+
+  listEl.innerHTML = filtered.map((p) => {
+    const dateStr = p.updated_at ? new Date(p.updated_at * 1000).toLocaleDateString() : "";
+    const promptText = p.prompt || "";
+    const tokenCount = typeof estimateTokens === "function" ? estimateTokens(promptText) : 0;
+    const tokenStr = typeof fmtTokens === "function" ? fmtTokens(tokenCount) : `~${tokenCount} tok`;
+    return `
+      <div class="prompt-card" data-id="${escapeHtml(p.id)}">
+        <!-- View Mode -->
+        <div class="prompt-card-view">
+          <div class="prompt-card-head">
+            <div class="prompt-card-title-wrap">
+              <div class="prompt-card-title">${escapeHtml(p.title || "Untitled")}</div>
+            </div>
+            <div class="prompt-card-meta">
+              <span class="prompt-token-pill mono" title="Approximate tokens">${escapeHtml(tokenStr)}</span>
+              <div class="prompt-card-date">${escapeHtml(dateStr)}</div>
+            </div>
+          </div>
+          <div class="prompt-card-body">${escapeHtml(promptText)}</div>
+          <div class="prompt-card-actions">
+            <button type="button" class="ghost prompt-copy-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_copy_btn">${escapeHtml(t("settings.prompt_copy_btn", null, targetLang))}</button>
+            <button type="button" class="ghost prompt-export-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_export_btn">${escapeHtml(t("settings.prompt_export_btn", null, targetLang))}</button>
+            <button type="button" class="ghost prompt-edit-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_edit_btn">${escapeHtml(t("settings.prompt_edit_btn", null, targetLang))}</button>
+            <button type="button" class="ghost danger-text prompt-del-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_delete_btn">${escapeHtml(t("settings.prompt_delete_btn", null, targetLang))}</button>
+          </div>
+        </div>
+
+        <!-- Inline Edit Mode -->
+        <div class="prompt-card-edit" hidden>
+          <div class="field">
+            <label class="small muted" data-i18n="settings.prompt_title_label">${escapeHtml(t("settings.prompt_title_label", null, targetLang))}</label>
+            <input type="text" class="prompt-inline-title" value="${escapeHtml(p.title || "")}" autocomplete="off">
+          </div>
+          <div class="field field-vertical">
+            <div class="chat-system-head">
+              <div class="chat-system-label-wrap">
+                <label class="small muted" data-i18n="settings.prompt_content_label">${escapeHtml(t("settings.prompt_content_label", null, targetLang))}</label>
+                <span class="prompt-inline-tokens system-token-badge mono${tokenCount > 0 ? " has-tokens" : ""}" title="Approximate tokens">${escapeHtml(tokenStr)}</span>
+              </div>
+              <div class="chat-system-actions">
+                <button type="button" class="ghost chat-system-file-btn prompt-inline-file-btn" title="${escapeHtml(t("settings.prompt_load_file", null, targetLang))}">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <path d="M14 2v6h6"/>
+                    <path d="M12 18v-6"/>
+                    <path d="M9 15l3-3 3 3"/>
+                  </svg>
+                </button>
+                <button type="button" class="ghost chat-system-file-btn prompt-inline-clear-btn" title="${escapeHtml(t("chat.clear_system_prompt", null, targetLang))}">
+                  <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3 6h18"/>
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                  </svg>
+                </button>
+                <input type="file" class="prompt-inline-file-input" hidden accept=".txt,.md,.markdown,.json,.yaml,.yml,.prompt,.py,.js,.ts,.html,.css,*/*">
+              </div>
+            </div>
+            <textarea class="prompt-inline-content mono" rows="6" autocomplete="off">${escapeHtml(p.prompt || "")}</textarea>
+          </div>
+          <div class="prompt-inline-actions">
+            <button type="button" class="primary prompt-inline-save-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_save_btn">${escapeHtml(t("settings.prompt_save_btn", null, targetLang))}</button>
+            <button type="button" class="ghost prompt-inline-cancel-btn" data-id="${escapeHtml(p.id)}" data-i18n="settings.prompt_cancel_btn">${escapeHtml(t("settings.prompt_cancel_btn", null, targetLang))}</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  // Bind copy
+  listEl.querySelectorAll(".prompt-copy-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const item = systemPromptsList.find((p) => p.id === id);
+      if (item && item.prompt) {
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(item.prompt);
+          } else {
+            const ta = document.createElement("textarea");
+            ta.value = item.prompt;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            document.body.removeChild(ta);
+          }
+          toast(t("chat.copied", null, targetLang) || "Copied to clipboard", "success");
+        } catch {
+          toast(t("chat.copy_failed", null, targetLang) || "Could not copy", "error");
+        }
+      }
+    });
+  });
+
+  // Bind export
+  listEl.querySelectorAll(".prompt-export-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const item = systemPromptsList.find((p) => p.id === id);
+      if (!item) return;
+
+      let defaultFn = item.filename || (item.title ? `${item.title}.md` : "prompt.md");
+      if (!defaultFn.includes(".")) defaultFn += ".md";
+
+      if (window.showSaveFilePicker) {
+        try {
+          const handle = await window.showSaveFilePicker({
+            suggestedName: defaultFn,
+            types: [
+              {
+                description: "Markdown Document (*.md)",
+                accept: { "text/markdown": [".md", ".markdown"] }
+              },
+              {
+                description: "Text Document (*.txt)",
+                accept: { "text/plain": [".txt", ".prompt"] }
+              },
+              {
+                description: "All Files (*.*)",
+                accept: { "*/*": [] }
+              }
+            ]
+          });
+          const writable = await handle.createWritable();
+          await writable.write(item.prompt || "");
+          await writable.close();
+          toast(t("settings.prompt_exported", null, targetLang) || "Prompt exported", "success");
+          return;
+        } catch (err) {
+          if (err && err.name === "AbortError") {
+            return; // User cancelled
+          }
+        }
+      }
+
+      // Fallback
+      const askMsg = t("settings.prompt_export_ask_name", null, targetLang) || "Export file name:";
+      const chosenName = window.prompt(askMsg, defaultFn);
+      if (!chosenName) return;
+
+      try {
+        const blob = new Blob([item.prompt || ""], { type: "text/markdown;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = chosenName.trim();
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        toast(t("settings.prompt_exported", null, targetLang) || "Prompt exported", "success");
+      } catch (e) {
+        toast(e.message, "error");
+      }
+    });
+  });
+
+  // Bind inline edit expand
+  listEl.querySelectorAll(".prompt-edit-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const card = btn.closest(".prompt-card");
+      if (!card) return;
+      const viewEl = card.querySelector(".prompt-card-view");
+      const editEl = card.querySelector(".prompt-card-edit");
+      if (viewEl && editEl) {
+        viewEl.hidden = true;
+        editEl.hidden = false;
+        const titleInput = editEl.querySelector(".prompt-inline-title");
+        if (titleInput) titleInput.focus();
+      }
+    });
+  });
+
+  // Bind inline edit cancel
+  listEl.querySelectorAll(".prompt-inline-cancel-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const card = btn.closest(".prompt-card");
+      if (!card) return;
+      const viewEl = card.querySelector(".prompt-card-view");
+      const editEl = card.querySelector(".prompt-card-edit");
+      if (viewEl && editEl) {
+        editEl.hidden = true;
+        viewEl.hidden = false;
+      }
+    });
+  });
+
+  // Bind inline edit save
+  listEl.querySelectorAll(".prompt-inline-save-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const card = btn.closest(".prompt-card");
+      if (!card) return;
+      const titleInput = card.querySelector(".prompt-inline-title");
+      const contentInput = card.querySelector(".prompt-inline-content");
+      const title = (titleInput?.value || "").trim();
+      const prompt = (contentInput?.value || "").trim();
+      if (!title && !prompt) {
+        toast(t("settings.prompt_title_label", null, targetLang) + " required", "error");
+        return;
+      }
+      try {
+        await api("/api/system-prompts/" + encodeURIComponent(id), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title, prompt }),
+        });
+        toast(t("settings.prompt_saved", null, targetLang), "success");
+        loadSystemPrompts(targetLang);
+      } catch (err) {
+        toast(t("toast.error", { msg: err.message }, targetLang), "error");
+      }
+    });
+  });
+
+  // Bind inline content token updates
+  listEl.querySelectorAll(".prompt-inline-content").forEach((ta) => {
+    const parent = ta.closest(".prompt-card-edit");
+    const badge = parent?.querySelector(".prompt-inline-tokens");
+    const update = () => {
+      if (!badge) return;
+      const count = typeof estimateTokens === "function" ? estimateTokens(ta.value) : 0;
+      if (count > 0) {
+        badge.textContent = `~${count.toLocaleString()} tok`;
+        badge.classList.add("has-tokens");
+      } else {
+        badge.textContent = "0 tok";
+        badge.classList.remove("has-tokens");
+      }
+    };
+    ta.addEventListener("input", update);
+    ta.addEventListener("change", update);
+  });
+
+  // Bind inline file import
+  listEl.querySelectorAll(".prompt-inline-file-btn").forEach((btn) => {
+    const parent = btn.closest(".prompt-card-edit");
+    const fileInput = parent?.querySelector(".prompt-inline-file-input");
+    if (fileInput) {
+      btn.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", () => {
+        const file = fileInput.files?.[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const text = e.target?.result;
+            if (typeof text === "string") {
+              const ta = parent.querySelector(".prompt-inline-content");
+              if (ta) {
+                ta.value = text;
+                ta.dispatchEvent(new Event("input", { bubbles: true }));
+              }
+              const titleInp = parent.querySelector(".prompt-inline-title");
+              if (titleInp && !titleInp.value.trim()) {
+                titleInp.value = file.name.replace(/\.[^/.]+$/, "");
+              }
+              toast(t("chat.system_file_loaded", null, targetLang) || "System prompt loaded from file", "success");
+            }
+          };
+          reader.onerror = () => {
+            toast(t("chat.system_file_read_error", null, targetLang) || "Could not read file", "error");
+          };
+          reader.readAsText(file);
+        }
+        fileInput.value = "";
+      });
+    }
+  });
+
+  // Bind inline clear
+  listEl.querySelectorAll(".prompt-inline-clear-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const parent = btn.closest(".prompt-card-edit");
+      const ta = parent?.querySelector(".prompt-inline-content");
+      if (ta) {
+        ta.value = "";
+        ta.dispatchEvent(new Event("input", { bubbles: true }));
+        ta.focus();
+      }
+    });
+  });
+
+  // Bind delete with confirm modal
+  listEl.querySelectorAll(".prompt-del-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.id;
+      const item = systemPromptsList.find((p) => p.id === id);
+      if (!item) return;
+      const conf = await askConfirm({
+        title: t("settings.prompt_delete_btn", null, targetLang) || "Delete",
+        text: t("settings.prompt_delete_confirm", { title: item.title || "Untitled" }, targetLang),
+        okText: t("settings.prompt_delete_btn", null, targetLang) || "Delete",
+        okClass: "danger",
+        mono: item.title,
+      });
+      if (conf?.ok) {
+        try {
+          await api("/api/system-prompts/" + encodeURIComponent(id), { method: "DELETE" });
+          toast(t("settings.prompt_deleted", null, targetLang), "success");
+          loadSystemPrompts(targetLang);
+        } catch (err) {
+          toast(t("toast.error", { msg: err.message }, targetLang), "error");
+        }
+      }
+    });
+  });
+}
+
+function loadFileIntoPromptEditor(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const text = e.target?.result;
+    if (typeof text !== "string") return;
+    const contentEl = $("prompt-edit-content");
+    if (contentEl) {
+      contentEl.value = text;
+      updatePromptEditorTokens();
+    }
+    const titleEl = $("prompt-edit-title");
+    if (titleEl && !titleEl.value.trim()) {
+      const fileName = file.name.replace(/\.[^/.]+$/, "");
+      titleEl.value = fileName;
+    }
+    toast(t("chat.system_file_loaded") || "System prompt loaded from file", "success");
+  };
+  reader.onerror = () => {
+    toast(t("chat.system_file_read_error") || "Could not read file", "error");
+  };
+  reader.readAsText(file);
+}
+
+function bindSystemPromptsEvents() {
+  const newBtn = $("prompt-new-btn");
+  const editorBox = $("prompt-editor-box");
+  const cancelBtn = $("prompt-cancel-btn");
+  const saveBtn = $("prompt-save-btn");
+  const fileBtn = $("prompt-edit-file-btn");
+  const fileInput = $("prompt-edit-file-input");
+  const dropZone = $("prompt-edit-dropzone");
+
+  const editContentEl = $("prompt-edit-content");
+  if (editContentEl && !editContentEl._boundTokens) {
+    editContentEl._boundTokens = true;
+    editContentEl.addEventListener("input", updatePromptEditorTokens);
+    editContentEl.addEventListener("change", updatePromptEditorTokens);
+  }
+
+  if (newBtn && !newBtn._bound) {
+    newBtn._bound = true;
+    newBtn.addEventListener("click", () => {
+      $("prompt-edit-id").value = "";
+      $("prompt-edit-title").value = "";
+      $("prompt-edit-content").value = "";
+      updatePromptEditorTokens();
+      editorBox.hidden = false;
+      $("prompt-edit-title").focus();
+    });
+  }
+
+  if (cancelBtn && !cancelBtn._bound) {
+    cancelBtn._bound = true;
+    cancelBtn.addEventListener("click", () => {
+      editorBox.hidden = true;
+    });
+  }
+
+  if (saveBtn && !saveBtn._bound) {
+    saveBtn._bound = true;
+    saveBtn.addEventListener("click", async () => {
+      const id = $("prompt-edit-id").value.trim();
+      const title = $("prompt-edit-title").value.trim();
+      const prompt = $("prompt-edit-content").value.trim();
+      if (!title && !prompt) {
+        toast(t("settings.prompt_title_label") + " required", "error");
+        return;
+      }
+      try {
+        if (id) {
+          await api("/api/system-prompts/" + encodeURIComponent(id), {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title, prompt }),
+          });
+        } else {
+          await api("/api/system-prompts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ title, prompt }),
+          });
+        }
+        toast(t("settings.prompt_saved"), "success");
+        editorBox.hidden = true;
+        loadSystemPrompts();
+      } catch (err) {
+        toast(t("toast.error", { msg: err.message }), "error");
+      }
+    });
+  }
+
+  const searchInput = $("prompt-search-input");
+  const searchClear = $("prompt-search-clear");
+  if (searchInput && !searchInput._bound) {
+    searchInput._bound = true;
+    const updateClear = () => {
+      if (searchClear) searchClear.hidden = !searchInput.value;
+    };
+    searchInput.addEventListener("input", () => {
+      updateClear();
+      renderPromptsList(searchInput.value.trim().toLowerCase());
+    });
+    if (searchClear) {
+      searchClear.addEventListener("click", () => {
+        searchInput.value = "";
+        updateClear();
+        renderPromptsList("");
+        searchInput.focus();
+      });
+    }
+  }
+
+  if (fileBtn && fileInput && !fileBtn._bound) {
+    fileBtn._bound = true;
+    fileBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      fileInput.click();
+    });
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files?.[0];
+      if (file) {
+        loadFileIntoPromptEditor(file);
+      }
+      fileInput.value = "";
+    });
+  }
+
+  const promptEditClearBtn = $("prompt-edit-clear-btn");
+  if (promptEditClearBtn && !promptEditClearBtn._bound) {
+    promptEditClearBtn._bound = true;
+    promptEditClearBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const el = $("prompt-edit-content");
+      if (el) {
+        el.value = "";
+        updatePromptEditorTokens();
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.focus();
+      }
+    });
+  }
+
+  if (dropZone && !dropZone._boundDnd) {
+    dropZone._boundDnd = true;
+    let dndDepth = 0;
+    dropZone.addEventListener("dragenter", (e) => {
+      if (e.dataTransfer?.types?.includes("Files")) {
+        e.preventDefault();
+        e.stopPropagation();
+        dndDepth += 1;
+        dropZone.classList.add("drag-over");
+      }
+    });
+    dropZone.addEventListener("dragover", (e) => {
+      if (e.dataTransfer?.types?.includes("Files")) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = "copy";
+      }
+    });
+    dropZone.addEventListener("dragleave", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dndDepth = Math.max(0, dndDepth - 1);
+      if (dndDepth === 0) {
+        dropZone.classList.remove("drag-over");
+      }
+    });
+    dropZone.addEventListener("drop", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dndDepth = 0;
+      dropZone.classList.remove("drag-over");
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (files.length > 0) {
+        loadFileIntoPromptEditor(files[0]);
+      }
+    });
+  }
+}
+
+// ---------- Archived Models in Settings -----------
+async function loadArchivedModelsInSettings(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("settings-archived-list");
+  const badge = $("archived-badge");
+  const navBadge = $("archived-nav-badge");
+  if (!listEl) return;
+  try {
+    const data = await api("/api/models");
+    const allModels = data.models || [];
+    const archived = allModels.filter((m) => !!m.archived);
+    if (badge) badge.textContent = String(archived.length);
+    if (navBadge) navBadge.textContent = String(archived.length);
+    if (!archived.length) {
+      listEl.innerHTML = `<div class="muted small">${escapeHtml(t("settings.archived_none", null, targetLang))}</div>`;
+      return;
+    }
+
+    listEl.innerHTML = archived.map((m) => {
+      const sizeStr = typeof formatBytes === "function" ? formatBytes(m.size) : `${(m.size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+      const fam = m.details?.family || "";
+      const quant = m.details?.quantization_level || "";
+      const meta = [sizeStr, fam, quant].filter(Boolean).join(" · ");
+      return `
+        <div class="archived-model-card" data-name="${escapeHtml(m.name)}">
+          <div class="archived-model-info">
+            <div class="archived-model-name">${escapeHtml(m.name)}</div>
+            <div class="archived-model-meta">${escapeHtml(meta)}</div>
+          </div>
+          <div class="archived-model-actions">
+            <button type="button" class="btn-icon settings-archive-chat-btn" data-name="${escapeHtml(m.name)}" title="${escapeHtml(t("detail.chat_title", null, targetLang) || "Chat")}">💬</button>
+            <button type="button" class="ghost settings-unarchive-btn" data-name="${escapeHtml(m.name)}" data-i18n="settings.unarchive_btn">${escapeHtml(t("settings.unarchive_btn", null, targetLang))}</button>
+            <button type="button" class="btn-icon danger-text settings-archive-del-btn" data-name="${escapeHtml(m.name)}" title="${escapeHtml(t("detail.delete_title", null, targetLang))}">×</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    listEl.querySelectorAll(".settings-archive-chat-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        if (!name) return;
+        if (typeof showChatViewWithModel === "function") {
+          showChatViewWithModel(name);
+        }
+      });
+    });
+
+    listEl.querySelectorAll(".settings-unarchive-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const name = btn.dataset.name;
+        if (!name) return;
+        try {
+          await api("/api/models/unarchive", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          toast(t("toast.unarchived", { name }, targetLang), "success");
+          loadArchivedModelsInSettings(targetLang);
+          refreshModels();
+        } catch (err) {
+          toast(t("toast.error", { msg: err.message }, targetLang), "error");
+        }
+      });
+    });
+
+    listEl.querySelectorAll(".settings-archive-del-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const name = btn.dataset.name;
+        if (!name) return;
+        if (typeof confirmDelete === "function") {
+          confirmDelete(name);
+        }
+      });
+    });
+  } catch (e) {
+    if (listEl) listEl.innerHTML = `<div class="muted small">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// ---------- External Models ----------
+let lastTestedExtModel = null;
+let lastTestedCapabilities = null;
+let editingExtModel = null;
+
+function sortCapabilityList(list) {
+  return (list || []).slice().sort((a, b) => {
+    const ka = typeof capabilityOrderKey === "function" ? capabilityOrderKey(a) : 0;
+    const kb = typeof capabilityOrderKey === "function" ? capabilityOrderKey(b) : 0;
+    if (ka !== kb) return ka - kb;
+    return String(a).localeCompare(String(b));
+  });
+}
+
+function editExternalModel(m) {
+  if (!m) return;
+  editingExtModel = m;
+  const nameInput = $("ext-model-name");
+  const urlInput = $("ext-model-url");
+  const keyInput = $("ext-model-apikey");
+  const addBtn = $("ext-model-add-btn");
+  const cancelBtn = $("ext-model-cancel-btn");
+  const resultEl = $("ext-test-result");
+
+  if (nameInput) {
+    nameInput.value = m.name;
+    nameInput.focus();
+  }
+  if (urlInput) urlInput.value = m.url;
+  if (keyInput) {
+    resetSettingsSecretVisibility("ext-model-apikey");
+    keyInput.value = "";
+    keyInput.placeholder = m.api_key ? "******** (Keep existing key / Mantener clave)" : (t("settings.ext_model_apikey_placeholder") || "Bearer token or secret key");
+  }
+  if (cancelBtn) cancelBtn.hidden = false;
+  if (addBtn) addBtn.textContent = t("settings.ext_model_save_btn");
+
+  const allCaps = sortCapabilityList(["completion", "tools", "thinking", "vision"]);
+  const activeCaps = Array.isArray(m.capabilities) && m.capabilities.length > 0 ? m.capabilities : ["completion", "tools", "thinking"];
+  lastTestedExtModel = m.name;
+  lastTestedCapabilities = activeCaps;
+  if (resultEl) {
+    resultEl.hidden = false;
+    resultEl.className = "ext-test-result ext-test-success";
+    const capsHtml = allCaps.map((c) => {
+      const slug = String(c).toLowerCase().trim();
+      const label = typeof formatCapabilityLabel === "function" ? formatCapabilityLabel(c) : (slug.charAt(0).toUpperCase() + slug.slice(1));
+      const isActive = activeCaps.includes(c);
+      return `<span class="ext-cap-pill ${isActive ? "active" : "inactive"}" data-cap="${escapeHtml(slug)}">${escapeHtml(label)}</span>`;
+    }).join("");
+    resultEl.innerHTML = `
+      <div class="ext-test-head">
+        <span class="ext-test-badge good">✏️</span>
+        <span>${escapeHtml(t("settings.ext_model_edit"))}: <strong>${escapeHtml(m.name)}</strong></span>
+      </div>
+      <div class="ext-test-caps"><span class="muted small">${escapeHtml(t("detail.capabilities"))}:</span> ${capsHtml}</div>
+    `;
+
+    resultEl.querySelectorAll(".ext-cap-pill").forEach((pill) => {
+      pill.addEventListener("click", () => {
+        pill.classList.toggle("active");
+        pill.classList.toggle("inactive");
+      });
+    });
+  }
+
+  const sec = $("sec-ext-models");
+  if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function cancelEditExternalModel() {
+  editingExtModel = null;
+  const nameInput = $("ext-model-name");
+  const urlInput = $("ext-model-url");
+  const keyInput = $("ext-model-apikey");
+  const addBtn = $("ext-model-add-btn");
+  const cancelBtn = $("ext-model-cancel-btn");
+  const resultEl = $("ext-test-result");
+
+  if (nameInput) nameInput.value = "";
+  if (urlInput) urlInput.value = "";
+  if (keyInput) {
+    resetSettingsSecretVisibility("ext-model-apikey");
+    keyInput.value = "";
+    keyInput.placeholder = t("settings.ext_model_apikey_placeholder") || "Bearer token or secret key";
+  }
+  if (cancelBtn) cancelBtn.hidden = true;
+  if (addBtn) addBtn.textContent = t("settings.ext_model_add_btn");
+  if (resultEl) resultEl.hidden = true;
+  lastTestedExtModel = null;
+  lastTestedCapabilities = null;
+}
+
+async function openSettingsExternalModel(name) {
+  await showSettingsView();
+  showSettingsSection("sec-ext-models", true);
+  try {
+    const data = await api("/api/external-models");
+    const list = data.models || [];
+    const found = list.find((x) => (x.id || x.name) === name)
+      || list.find((x) => x.name === name || x.name === name + ":latest");
+    if (found) {
+      editExternalModel(found);
+    }
+  } catch { }
+}
+window.openSettingsExternalModel = openSettingsExternalModel;
+
+function cloneExternalModel(m) {
+  if (!m) return;
+  cancelEditExternalModel();
+  const nameInput = $("ext-model-name");
+  const urlInput = $("ext-model-url");
+  const keyInput = $("ext-model-apikey");
+  const cancelBtn = $("ext-model-cancel-btn");
+  const resultEl = $("ext-test-result");
+
+  if (nameInput) {
+    nameInput.value = `${m.name}-copy`;
+    nameInput.focus();
+    nameInput.select();
+  }
+  if (urlInput) urlInput.value = m.url;
+  if (keyInput) {
+    resetSettingsSecretVisibility("ext-model-apikey");
+    keyInput.value = "";
+    keyInput.placeholder = m.api_key ? "******** (Keep existing key / Mantener clave)" : (t("settings.ext_model_apikey_placeholder") || "Bearer token or secret key");
+  }
+  if (cancelBtn) cancelBtn.hidden = false;
+
+  const allCaps = sortCapabilityList(["completion", "tools", "thinking", "vision"]);
+  const activeCaps = Array.isArray(m.capabilities) && m.capabilities.length > 0 ? m.capabilities : ["completion", "tools", "thinking"];
+  lastTestedExtModel = `${m.name}-copy`;
+  lastTestedCapabilities = activeCaps;
+
+  if (resultEl) {
+    resultEl.hidden = false;
+    resultEl.className = "ext-test-result ext-test-success";
+    const capsHtml = allCaps.map((c) => {
+      const slug = String(c).toLowerCase().trim();
+      const label = typeof formatCapabilityLabel === "function" ? formatCapabilityLabel(c) : (slug.charAt(0).toUpperCase() + slug.slice(1));
+      const isActive = activeCaps.includes(c);
+      return `<span class="ext-cap-pill ${isActive ? "active" : "inactive"}" data-cap="${escapeHtml(slug)}">${escapeHtml(label)}</span>`;
+    }).join("");
+    resultEl.innerHTML = `
+      <div class="ext-test-head">
+        <span class="ext-test-badge good">📋</span>
+        <span>${escapeHtml(t("settings.ext_model_clone"))}: <strong>${escapeHtml(m.name)}</strong></span>
+      </div>
+      <div class="ext-test-caps"><span class="muted small">${escapeHtml(t("detail.capabilities"))}:</span> ${capsHtml}</div>
+    `;
+
+    resultEl.querySelectorAll(".ext-cap-pill").forEach((pill) => {
+      pill.addEventListener("click", () => {
+        pill.classList.toggle("active");
+        pill.classList.toggle("inactive");
+      });
+    });
+  }
+
+  const sec = $("sec-ext-models");
+  if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function openSettingsCloneExternalModel(name) {
+  await showSettingsView();
+  showSettingsSection("sec-ext-models", true);
+  try {
+    const data = await api("/api/external-models");
+    const list = data.models || [];
+    const found = list.find((x) => (x.id || x.name) === name)
+      || list.find((x) => x.name === name || x.name === name + ":latest");
+    if (found) {
+      cloneExternalModel(found);
+    }
+  } catch { }
+}
+window.openSettingsCloneExternalModel = openSettingsCloneExternalModel;
+
+async function loadExternalModels(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("ext-models-list");
+  const badge = $("ext-models-badge");
+  const navBadge = $("ext-models-nav-badge");
+  if (!listEl) return;
+  try {
+    const data = await api("/api/external-models");
+    const list = data.models || [];
+    let extMetaChanged = false;
+    if (typeof models !== "undefined" && Array.isArray(models)) {
+      for (const rec of list) {
+        const recId = rec.id || rec.name;
+        const entry = models.find((x) => x && x.is_external && x.name === recId);
+        if (entry && (entry.provider !== (rec.provider || "") || entry.remote_name !== rec.name)) {
+          entry.provider = rec.provider || "";
+          entry.remote_name = rec.name;
+          extMetaChanged = true;
+        }
+      }
+    }
+    if (extMetaChanged) {
+      if (typeof renderTable === "function") renderTable();
+      if (typeof syncChatModelOptions === "function") syncChatModelOptions();
+    }
+    if (badge) badge.textContent = String(list.length);
+    if (navBadge) navBadge.textContent = String(list.length);
+    if (!list.length) {
+      listEl.innerHTML = `<div class="muted small">${escapeHtml(t("settings.ext_models_none", null, targetLang))}</div>`;
+      return;
+    }
+    listEl.innerHTML = list.map((m) => {
+      const caps = sortCapabilityList(m.capabilities || ["completion", "tools", "thinking"])
+        .map((c) => {
+          const slug = String(c).toLowerCase().trim();
+          const label = typeof formatCapabilityLabel === "function" ? formatCapabilityLabel(c) : (slug.charAt(0).toUpperCase() + slug.slice(1));
+          return `<span class="ext-cap-pill active" data-cap="${escapeHtml(slug)}">${escapeHtml(label)}</span>`;
+        })
+        .join("");
+      const isPaused = !!m.disabled;
+      const extId = m.id || m.name;
+      return `
+        <div class="ext-model-card ${isPaused ? "is-paused" : ""}" data-name="${escapeHtml(extId)}">
+          <div class="ext-model-card-info">
+            <div class="ext-model-card-name">
+              ${escapeHtml(m.name)}
+              <span class="model-external-tag">${escapeHtml(externalProviderLabel(m.provider, targetLang))}</span>
+              ${isPaused ? `<span class="badge" style="background:rgba(234,179,8,0.15);color:#facc15;border:1px solid rgba(234,179,8,0.4);font-size:11px;padding:1px 6px;">⏸️ ${escapeHtml(t("settings.ext_model_paused_badge", null, targetLang))}</span>` : ""}
+            </div>
+            <div class="ext-model-card-url" title="${escapeHtml(m.url)}">${escapeHtml(m.url)}</div>
+            <div class="ext-caps-pills" style="margin-top:2px;">${caps}</div>
+          </div>
+          <div class="ext-model-card-actions">
+            <button type="button" class="btn-icon ext-model-chat-btn" data-name="${escapeHtml(extId)}" title="${escapeHtml(t("detail.chat_title", null, targetLang) || "Chat")}">💬</button>
+            <button type="button" class="btn-icon ext-model-toggle-btn" data-name="${escapeHtml(extId)}" title="${isPaused ? escapeHtml(t("settings.ext_model_resume", null, targetLang)) : escapeHtml(t("settings.ext_model_pause", null, targetLang))}">${isPaused ? "▶️" : "⏸️"}</button>
+            <button type="button" class="btn-icon ext-model-clone-btn" data-name="${escapeHtml(extId)}" title="${escapeHtml(t("settings.ext_model_clone", null, targetLang))}">📋</button>
+            <button type="button" class="btn-icon ext-model-edit-btn" data-name="${escapeHtml(extId)}" title="${escapeHtml(t("settings.ext_model_edit", null, targetLang))}">✏️</button>
+            <button type="button" class="btn-icon danger-text ext-model-del-btn" data-name="${escapeHtml(extId)}" title="${escapeHtml(t("detail.delete_external_title", null, targetLang))}">🗑️</button>
+          </div>
+        </div>
+      `;
+    }).join("");
+
+    listEl.querySelectorAll(".ext-model-chat-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        if (!name) return;
+        if (typeof showChatViewWithModel === "function") {
+          showChatViewWithModel(name);
+        }
+      });
+    });
+
+    listEl.querySelectorAll(".ext-model-toggle-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        if (!name) return;
+        try {
+          const res = await api("/api/external-models/toggle", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+          });
+          toast(res.disabled ? t("settings.ext_model_paused_toast", { name }, targetLang) : t("settings.ext_model_resumed_toast", { name }, targetLang), "success");
+          loadExternalModels(targetLang);
+          refreshModels();
+        } catch (err) {
+          toast(t("toast.error", { msg: err.message }, targetLang), "error");
+        }
+      });
+    });
+
+    listEl.querySelectorAll(".ext-model-clone-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        const m = list.find((x) => (x.id || x.name) === name) || list.find((x) => x.name === name);
+        if (m) cloneExternalModel(m);
+      });
+    });
+
+    listEl.querySelectorAll(".ext-model-edit-btn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        const m = list.find((x) => (x.id || x.name) === name) || list.find((x) => x.name === name);
+        if (m) editExternalModel(m);
+      });
+    });
+
+    listEl.querySelectorAll(".ext-model-del-btn").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const name = btn.dataset.name;
+        if (!name) return;
+        const conf = await askConfirm({
+          title: t("detail.delete_external_title", null, targetLang),
+          text: t("settings.ext_model_remove_confirm", { name }, targetLang),
+          okText: t("action.delete", null, targetLang),
+          okClass: "danger",
+          mono: name,
+        });
+        if (conf.ok) {
+          try {
+            await api("/api/external-models/" + encodeURIComponent(name), { method: "DELETE" });
+            toast(t("settings.ext_model_removed", { name }, targetLang), "success");
+            if (editingExtModel && (editingExtModel.id || editingExtModel.name) === name) {
+              cancelEditExternalModel();
+            }
+            loadExternalModels(targetLang);
+            refreshModels();
+          } catch (err) {
+            toast(t("toast.error", { msg: err.message }, targetLang), "error");
+          }
+        }
+      });
+    });
+  } catch (e) {
+    if (listEl) listEl.innerHTML = `<div class="muted small">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function testExternalModel() {
+  const nameInput = $("ext-model-name");
+  const urlInput = $("ext-model-url");
+  const keyInput = $("ext-model-apikey");
+  const testBtn = $("ext-model-test-btn");
+  const resultEl = $("ext-test-result");
+
+  const name = nameInput ? nameInput.value.trim() : "";
+  const url = urlInput ? urlInput.value.trim() : "";
+  const apiKey = getSettingsSecretDraft("ext-model-apikey");
+
+  if (!url) {
+    toast(t("settings.ext_model_url") + " required", "error");
+    return;
+  }
+
+  if (testBtn) testBtn.disabled = true;
+  if (resultEl) {
+    resultEl.hidden = false;
+    resultEl.className = "ext-test-result ext-test-running";
+    resultEl.textContent = t("settings.ext_test_testing");
+  }
+
+  try {
+    const res = await api("/api/external-models/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: editingExtModel ? (editingExtModel.id || editingExtModel.name) : "",
+        name,
+        url,
+        api_key: apiKey,
+      }),
+    });
+
+    lastTestedExtModel = name;
+    lastTestedCapabilities = sortCapabilityList(res.capabilities || []);
+
+    if (resultEl) {
+      resultEl.className = "ext-test-result ext-test-success";
+      const allCaps = sortCapabilityList(["completion", "tools", "thinking", "vision"]);
+      const capsHtml = allCaps.map((c) => {
+        const slug = String(c).toLowerCase().trim();
+        const label = typeof formatCapabilityLabel === "function" ? formatCapabilityLabel(c) : (slug.charAt(0).toUpperCase() + slug.slice(1));
+        const isActive = (res.capabilities || []).includes(c);
+        return `<span class="ext-cap-pill ${isActive ? "active" : "inactive"}" data-cap="${escapeHtml(slug)}">${escapeHtml(label)}</span>`;
+      }).join("");
+      resultEl.innerHTML = `
+        <div class="ext-test-head">
+          <span class="ext-test-badge good">✓</span>
+          <span>${escapeHtml(t("settings.ext_test_success", { latency: res.latency_ms || 0 }))}</span>
+        </div>
+        <div class="ext-test-caps"><span class="muted small">${escapeHtml(t("detail.capabilities"))}:</span> ${capsHtml}</div>
+        ${res.max_context > 0 ? `<div class="ext-test-caps"><span class="muted small">${escapeHtml(t("col.context"))}:</span> <span class="mono">${escapeHtml(fmtCtx(res.max_context))}</span></div>` : ""}
+      `;
+
+      resultEl.querySelectorAll(".ext-cap-pill").forEach((pill) => {
+        pill.addEventListener("click", () => {
+          pill.classList.toggle("active");
+          pill.classList.toggle("inactive");
+        });
+      });
+    }
+  } catch (e) {
+    lastTestedExtModel = null;
+    lastTestedCapabilities = null;
+    if (resultEl) {
+      resultEl.className = "ext-test-result ext-test-error";
+      resultEl.textContent = t("settings.ext_test_failed", { error: e.message });
+    }
+  } finally {
+    if (testBtn) testBtn.disabled = false;
+  }
+}
+
+async function addExternalModel() {
+  const nameInput = $("ext-model-name");
+  const urlInput = $("ext-model-url");
+  const keyInput = $("ext-model-apikey");
+  const resultEl = $("ext-test-result");
+
+  const name = nameInput ? nameInput.value.trim() : "";
+  const url = urlInput ? urlInput.value.trim() : "";
+  const apiKey = getSettingsSecretDraft("ext-model-apikey");
+
+  if (!name || !url) {
+    toast(t("settings.ext_model_name") + " & " + t("settings.ext_model_url") + " required", "error");
+    return;
+  }
+
+  let caps = [];
+  if (resultEl && !resultEl.hidden) {
+    resultEl.querySelectorAll(".ext-cap-pill.active").forEach((p) => {
+      if (p.dataset.cap && !caps.includes(p.dataset.cap)) {
+        caps.push(p.dataset.cap);
+      }
+    });
+  }
+  if (!caps.length) {
+    if (lastTestedExtModel === name && Array.isArray(lastTestedCapabilities) && lastTestedCapabilities.length > 0) {
+      caps = lastTestedCapabilities;
+    } else {
+      caps = ["completion", "tools", "thinking"];
+    }
+  }
+  caps = sortCapabilityList(caps);
+
+  const isEditing = !!editingExtModel;
+  const editId = editingExtModel ? (editingExtModel.id || editingExtModel.name) : "";
+  const isExistingDisabled = editingExtModel ? !!editingExtModel.disabled : false;
+
+  try {
+    await api("/api/external-models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: isEditing ? editId : "",
+        name,
+        url,
+        api_key: apiKey,
+        capabilities: caps,
+        disabled: isExistingDisabled,
+      }),
+    });
+
+    toast(isEditing ? t("settings.ext_model_updated", { name }) : t("settings.ext_model_added", { name }), "success");
+    cancelEditExternalModel();
+    loadExternalModels();
+    refreshModels();
+  } catch (e) {
+    toast(t("toast.error", { msg: e.message }), "error");
+  }
+}
+
+function bindExternalModelsEvents() {
+  const testBtn = $("ext-model-test-btn");
+  if (testBtn && !testBtn._bound) {
+    testBtn._bound = true;
+    testBtn.addEventListener("click", testExternalModel);
+  }
+  const addBtn = $("ext-model-add-btn");
+  if (addBtn && !addBtn._bound) {
+    addBtn._bound = true;
+    addBtn.addEventListener("click", addExternalModel);
+  }
+  const cancelBtn = $("ext-model-cancel-btn");
+  if (cancelBtn && !cancelBtn._bound) {
+    cancelBtn._bound = true;
+    cancelBtn.addEventListener("click", cancelEditExternalModel);
+  }
+}
+
+// ---------- Gateway (exposed models tunnel) ----------
+
+// Must match config.DefaultGatewayPort in internal/config/config.go.
+const GATEWAY_DEFAULT_PORT = 7861;
+
+let gatewayModelsCache = [];
+let gatewayModelsListCache = null;
+let gatewaySelectedModels = new Set();
+
+async function loadGatewaySection(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const gw = (currentConfig && currentConfig.gateway) || {};
+  if ($("gw-enable")) $("gw-enable").checked = !!gw.enabled;
+  if ($("gw-port")) $("gw-port").value = gw.port > 0 ? String(gw.port) : "";
+  if ($("gw-expose")) $("gw-expose").checked = !!gw.expose_network;
+  if ($("gw-require-auth")) $("gw-require-auth").checked = !!gw.require_auth;
+
+  if (Array.isArray(gw.models)) {
+    gatewaySelectedModels = new Set(gw.models);
+  } else {
+    // Models allowlist not configured: default to all visible models
+    gatewaySelectedModels = new Set(gatewayModelsCache);
+  }
+
+  updateGatewayWarning(targetLang);
+  updateGatewayStatus(targetLang);
+  await Promise.all([
+    renderGatewayModels(targetLang).catch(() => {}),
+    loadGatewayKeys(targetLang).catch(() => {}),
+  ]);
+  refreshGatewayStatusFromServer(targetLang).catch(() => {});
+}
+
+function gatewayEffectivePort() {
+  const raw = parseInt($("gw-port")?.value, 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : GATEWAY_DEFAULT_PORT;
+}
+
+function updateGatewayWarning(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const warn = $("gw-expose-warning");
+  if (warn) {
+    const exposed = $("gw-expose")?.checked;
+    const authed = $("gw-require-auth")?.checked;
+    warn.hidden = !(exposed && !authed);
+  }
+  updateGatewayAuthBadge(targetLang);
+}
+
+function updateGatewayAuthBadge(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const reqAuth = !!$("gw-require-auth")?.checked;
+  const authBadge = $("gw-keys-auth-badge");
+  const hintText = $("gw-keys-hint-text");
+  if (authBadge) {
+    if (reqAuth) {
+      authBadge.textContent = targetLang === "es" ? "Requerido" : "Required";
+      authBadge.className = "badge badge-warn";
+    } else {
+      authBadge.textContent = targetLang === "es" ? "Opcional (auth desactivada)" : "Optional (auth is off)";
+      authBadge.className = "badge badge-muted";
+    }
+  }
+  if (hintText) {
+    if (reqAuth) {
+      hintText.textContent = targetLang === "es"
+        ? "Requerido: Los clientes deben enviar Authorization: Bearer <key> usando una de estas claves."
+        : "Required: Third-party clients must send Authorization: Bearer <key> using one of these keys.";
+    } else {
+      hintText.textContent = t("settings.gateway_key_optional_note", null, targetLang);
+    }
+  }
+}
+
+function updateGatewayStatus(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const enabled = !!$("gw-enable")?.checked;
+  const badge = $("gateway-status-badge");
+  const navBadge = $("gateway-nav-badge");
+  const port = gatewayEffectivePort();
+  const host = $("gw-expose")?.checked ? "0.0.0.0" : "127.0.0.1";
+  if (badge) {
+    if (enabled) {
+      // Optimistic local render (form state, may include unsaved edits).
+      // refreshGatewayStatusFromServer() reconciles with the real listener.
+      badge.textContent = `${host}:${port}`;
+      badge.className = "badge badge-good";
+      badge.removeAttribute("title");
+    } else {
+      badge.textContent = t("settings.gateway_off", null, targetLang);
+      badge.className = "badge badge-muted";
+      badge.removeAttribute("title");
+    }
+  }
+  if (navBadge) {
+    navBadge.textContent = enabled ? String(gatewaySelectedModels.size) : "0";
+  }
+  const countBadge = $("gw-models-selected-count");
+  if (countBadge) {
+    countBadge.textContent = t("settings.gateway_models_selected_count", {
+      count: gatewaySelectedModels.size,
+      total: gatewayModelsCache.length,
+    }, targetLang);
+  }
+  updateGatewayAuthBadge(targetLang);
+}
+
+// Reconciles the badge with the real listener state from
+// GET /api/gateway/status. Only overrides the optimistic render when the
+// form matches the saved config (otherwise the user has unsaved edits and
+// the local preview stands until they press Save).
+async function refreshGatewayStatusFromServer(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const badge = $("gateway-status-badge");
+  if (!badge) return;
+  let st;
+  try {
+    st = await api("/api/gateway/status");
+  } catch {
+    return; // keep the optimistic render on network/auth errors
+  }
+  const saved = (currentConfig && currentConfig.gateway) || {};
+  const formEnabled = !!$("gw-enable")?.checked;
+  const formPort = gatewayEffectivePort();
+  const formHost = $("gw-expose")?.checked ? "0.0.0.0" : "127.0.0.1";
+  const savedPort = saved.port > 0 ? saved.port : GATEWAY_DEFAULT_PORT;
+  const savedHost = saved.expose_network ? "0.0.0.0" : "127.0.0.1";
+  if (!!saved.enabled !== formEnabled || savedPort !== formPort || savedHost !== formHost) return;
+  if (!formEnabled) return; // already shows Off
+  if (st.listening && st.addr) {
+    badge.textContent = st.addr;
+    badge.className = "badge badge-good";
+    badge.removeAttribute("title");
+  } else {
+    badge.textContent = `${formHost}:${formPort}`;
+    badge.className = "badge badge-warn";
+    badge.title = t("settings.gateway_not_listening", null, targetLang);
+  }
+}
+
+async function renderGatewayModels(lang = null, forceRefresh = false) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("gw-models-list");
+  if (!listEl) return;
+  let list = gatewayModelsListCache;
+  if (!list || forceRefresh) {
+    try {
+      const data = await api("/api/models");
+      list = (data.models || []).filter((m) => !m.archived && !m.disabled && !m.is_ghost);
+      gatewayModelsListCache = list;
+    } catch (e) {
+      if (!gatewayModelsListCache) {
+        listEl.innerHTML = `<div class="muted small">${escapeHtml(e.message)}</div>`;
+        return;
+      }
+      list = gatewayModelsListCache;
+    }
+  }
+  gatewayModelsCache = list.map((m) => m.name);
+
+  // If models were never configured at all (null/undefined in config), default to all visible models
+  const gwModelsConfig = currentConfig?.gateway?.models;
+  if (!Array.isArray(gwModelsConfig) && gatewaySelectedModels.size === 0 && gatewayModelsCache.length > 0) {
+    gatewaySelectedModels = new Set(gatewayModelsCache);
+  } else {
+    // Keep only models that still exist
+    gatewaySelectedModels = new Set([...gatewaySelectedModels].filter((n) => gatewayModelsCache.includes(n)));
+  }
+
+  if (list.length === 0) {
+    listEl.innerHTML = `<div class="muted small">${escapeHtml(t("settings.gateway_models_none", null, targetLang))}</div>`;
+  } else {
+    listEl.innerHTML = list.map((m) => {
+      const checked = gatewaySelectedModels.has(m.name);
+      const extTag = m.is_external ? ` <span class="model-external-tag">${escapeHtml(externalProviderLabel(m.provider, targetLang))}</span>` : "";
+      const label = m.is_external
+        ? `${m.remote_name || m.name} · ${externalCleanEndpoint(m.url)}`
+        : m.name;
+      return `
+        <label class="gw-model-item${checked ? " selected" : ""}" data-name="${escapeHtml(m.name)}">
+          <input type="checkbox" value="${escapeHtml(m.name)}"${checked ? " checked" : ""} />
+          <span class="gw-model-name mono">${escapeHtml(label)}${extTag}</span>
+        </label>
+      `;
+    }).join("");
+  }
+
+  listEl.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+    cb.addEventListener("change", () => {
+      if (cb.checked) gatewaySelectedModels.add(cb.value);
+      else gatewaySelectedModels.delete(cb.value);
+      cb.closest(".gw-model-item")?.classList.toggle("selected", cb.checked);
+      updateGatewayStatus(targetLang);
+    });
+  });
+
+  const filterVal = $("gw-models-filter")?.value?.trim().toLowerCase();
+  if (filterVal) {
+    listEl.querySelectorAll(".gw-model-item").forEach((item) => {
+      const name = (item.dataset.name || "").toLowerCase();
+      item.hidden = !name.includes(filterVal);
+    });
+  }
+
+  updateGatewayStatus(targetLang);
+}
+
+function getGatewayModelsSelection() {
+  // If the gateway model list hasn't loaded yet (cache empty), don't claim
+  // "no models": return the saved config value as-is (or undefined so the
+  // key is omitted from PATCH and the server preserves it). Sending []
+  // here would silently convert null ("all models") into [] ("none").
+  if (gatewayModelsCache.length === 0) {
+    const saved = currentConfig?.gateway?.models;
+    if (Array.isArray(saved)) return [...saved];
+    return undefined;
+  }
+  const sel = [...gatewaySelectedModels];
+  // Preserve null ("all models") across unrelated saves: if the config never
+  // had an explicit list and everything visible is selected, omit the key
+  // instead of freezing the current list.
+  if (!Array.isArray(currentConfig?.gateway?.models) &&
+      sel.length === gatewayModelsCache.length &&
+      gatewayModelsCache.every((n) => gatewaySelectedModels.has(n))) {
+    return undefined;
+  }
+  return sel;
+}
+
+async function loadGatewayKeys(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const listEl = $("gw-keys-list");
+  if (!listEl) return;
+  try {
+    const data = await api("/api/gateway/keys");
+    const list = data.keys || [];
+    if (list.length === 0) {
+      listEl.innerHTML = `<div class="muted small">${escapeHtml(t("settings.gateway_keys_none", null, targetLang))}</div>`;
+      return;
+    }
+    listEl.innerHTML = list.map((k) => `
+      <div class="ext-model-card" data-id="${escapeHtml(k.id)}">
+        <div class="ext-model-card-info">
+          <div class="ext-model-card-name">${escapeHtml(k.name)}</div>
+          <div class="ext-model-card-url mono">${escapeHtml(k.prefix || "")}</div>
+        </div>
+        <div class="ext-model-card-actions">
+          <button type="button" class="btn-icon danger-text gw-key-del-btn" data-id="${escapeHtml(k.id)}" title="${escapeHtml(t("action.delete", null, targetLang))}">🗑️</button>
+        </div>
+      </div>
+    `).join("");
+    listEl.querySelectorAll(".gw-key-del-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        try {
+          await api("/api/gateway/keys/" + encodeURIComponent(btn.dataset.id), { method: "DELETE" });
+          toast(t("toast.deleted", null, targetLang), "success");
+          loadGatewayKeys(targetLang);
+        } catch (e) {
+          toast(t("toast.error", { msg: e.message }, targetLang), "error");
+        }
+      });
+    });
+  } catch (e) {
+    listEl.innerHTML = `<div class="muted small">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function createGatewayKey() {
+  const input = $("gw-key-name");
+  const name = input?.value?.trim() || "";
+  if (!name) {
+    input?.focus();
+    return;
+  }
+  try {
+    const res = await api("/api/gateway/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const box = $("gw-key-secret");
+    const val = $("gw-key-secret-value");
+    if (box && val) {
+      val.textContent = res.key || "";
+      box.hidden = false;
+    }
+    if (input) input.value = "";
+    toast(t("settings.gateway_key_created"), "success");
+    loadGatewayKeys();
+  } catch (e) {
+    toast(t("toast.error", { msg: e.message }), "error");
+  }
+}
+
+function bindGatewayEvents() {
+  const enableEl = $("gw-enable");
+  if (enableEl && !enableEl._bound) {
+    enableEl._bound = true;
+    enableEl.addEventListener("change", () => updateGatewayStatus());
+  }
+  const exposeEl = $("gw-expose");
+  if (exposeEl && !exposeEl._bound) {
+    exposeEl._bound = true;
+    exposeEl.addEventListener("change", () => {
+      updateGatewayWarning();
+      updateGatewayStatus();
+    });
+  }
+  const authEl = $("gw-require-auth");
+  if (authEl && !authEl._bound) {
+    authEl._bound = true;
+    authEl.addEventListener("change", () => {
+      updateGatewayWarning();
+      updateGatewayStatus();
+    });
+  }
+  const portEl = $("gw-port");
+  if (portEl && !portEl._bound) {
+    portEl._bound = true;
+    portEl.addEventListener("input", () => updateGatewayStatus());
+  }
+  const selectAll = $("gw-models-select-all");
+  if (selectAll && !selectAll._bound) {
+    selectAll._bound = true;
+    selectAll.addEventListener("click", () => {
+      gatewaySelectedModels = new Set(gatewayModelsCache);
+      const items = document.querySelectorAll("#gw-models-list .gw-model-item");
+      items.forEach((item) => {
+        const cb = item.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = true;
+        item.classList.add("selected");
+      });
+      updateGatewayStatus();
+    });
+  }
+  const clearBtn = $("gw-models-clear");
+  if (clearBtn && !clearBtn._bound) {
+    clearBtn._bound = true;
+    clearBtn.addEventListener("click", () => {
+      gatewaySelectedModels = new Set();
+      const items = document.querySelectorAll("#gw-models-list .gw-model-item");
+      items.forEach((item) => {
+        const cb = item.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = false;
+        item.classList.remove("selected");
+      });
+      updateGatewayStatus();
+    });
+  }
+  const filterInput = $("gw-models-filter");
+  if (filterInput && !filterInput._bound) {
+    filterInput._bound = true;
+    filterInput.addEventListener("input", () => {
+      const q = filterInput.value.trim().toLowerCase();
+      const items = document.querySelectorAll("#gw-models-list .gw-model-item");
+      items.forEach((item) => {
+        const name = (item.dataset.name || "").toLowerCase();
+        item.hidden = q ? !name.includes(q) : false;
+      });
+    });
+  }
+  const createBtn = $("gw-key-create-btn");
+  if (createBtn && !createBtn._bound) {
+    createBtn._bound = true;
+    createBtn.addEventListener("click", () => { void createGatewayKey(); });
+  }
+  const nameInput = $("gw-key-name");
+  if (nameInput && !nameInput._bound) {
+    nameInput._bound = true;
+    nameInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void createGatewayKey();
+      }
+    });
+  }
+  const copyBtn = $("gw-key-copy-btn");
+  if (copyBtn && !copyBtn._bound) {
+    copyBtn._bound = true;
+    copyBtn.addEventListener("click", async () => {
+      const val = $("gw-key-secret-value")?.textContent || "";
+      if (!val) return;
+      try {
+        await navigator.clipboard.writeText(val);
+        toast(t("settings.gateway_key_copied"), "success");
+      } catch {
+        const tmp = document.createElement("textarea");
+        tmp.value = val;
+        document.body.appendChild(tmp);
+        tmp.select();
+        try { document.execCommand("copy"); } catch { }
+        tmp.remove();
+      }
+    });
+  }
+}
+
+function renderSettingsTranslations(lang = null) {
+  const targetLang = lang || currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  const settingsView = $("settings-view");
+  if (settingsView && typeof window.I18n?.applyTranslations === "function") {
+    window.I18n.applyTranslations(settingsView, targetLang);
+  }
+  updatePasswordSection(targetLang);
+  updateExposeWarning(targetLang);
+  loadExternalModels(targetLang);
+  loadSystemPrompts(targetLang);
+  loadArchivedModelsInSettings(targetLang);
+  loadGatewaySection(targetLang);
+  updateTestingSummary();
+  if (typeof refreshOpenCodeUI === "function") {
+    refreshOpenCodeUI();
+  }
+}
+
+function updatePasswordSection(lang = null) {
+  if (!currentConfig) return;
+  const targetLang = lang || currentConfig.language || (window.I18n ? window.I18n.getLang() : "en");
+  const badge = $("pwd-badge");
+  if (currentConfig.has_password) {
+    badge.textContent = t("settings.pwd_set", null, targetLang);
+    badge.className = "badge badge-good";
+  } else {
+    badge.textContent = t("settings.pwd_unset", null, targetLang);
+    badge.className = "badge badge-muted";
+  }
+  $("pwd-clear-btn").hidden = !currentConfig.has_password;
+  $("settings-logout-btn").hidden = !currentConfig.has_password;
+}
+
+function updateBindPreview(lang = null) {
+  if (!currentConfig) return;
+  const targetLang = lang || currentConfig.language || (window.I18n ? window.I18n.getLang() : "en");
+  const badge = $("bind-preview");
+  const expose = $("set-expose").checked;
+  if (expose) {
+    badge.textContent = t("settings.bind_lan", null, targetLang);
+    badge.className = "badge badge-warn";
+  } else {
+    badge.textContent = t("settings.bind_local", null, targetLang);
+    badge.className = "badge badge-muted";
+  }
+}
+
+function updateExposeWarning(lang = null) {
+  if (!currentConfig) return;
+  const wantExpose = $("set-expose").checked;
+  $("expose-warning").hidden = !(wantExpose && !currentConfig.has_password);
+  updateBindPreview(lang);
+}
+
+// ---------- System Prompts Library Modal ----------
+let promptsModalTargetTextarea = null;
+let promptsModalCallback = null;
+
+async function openSystemPromptsPickerModal(targetTextarea = null, onSelect = null) {
+  promptsModalTargetTextarea = targetTextarea;
+  promptsModalCallback = onSelect;
+  const modal = $("prompts-modal");
+  if (!modal) return;
+  const searchInput = $("prompts-modal-search-input");
+  if (searchInput) searchInput.value = "";
+  modal.hidden = false;
+  await loadAndRenderPromptsModal("", true);
+  if (searchInput) searchInput.focus();
+}
+window.openSystemPromptsPickerModal = openSystemPromptsPickerModal;
+
+function closeSystemPromptsPickerModal() {
+  const modal = $("prompts-modal");
+  if (modal) modal.hidden = true;
+  promptsModalTargetTextarea = null;
+  promptsModalCallback = null;
+}
+window.closeSystemPromptsPickerModal = closeSystemPromptsPickerModal;
+
+async function loadAndRenderPromptsModal(filterQuery = "", forceFetch = false) {
+  const listEl = $("prompts-modal-list");
+  if (!listEl) return;
+  const targetLang = currentConfig?.language || (window.I18n ? window.I18n.getLang() : "en");
+  
+  if (forceFetch || !systemPromptsList || systemPromptsList.length === 0) {
+    try {
+      const data = await api("/api/system-prompts");
+      systemPromptsList = data.prompts || [];
+    } catch {
+      systemPromptsList = [];
+    }
+  }
+  
+  const q = (filterQuery || "").toLowerCase();
+  const filtered = (systemPromptsList || []).filter(
+    (p) => (p.title || "").toLowerCase().includes(q) || (p.prompt || "").toLowerCase().includes(q)
+  );
+
+  if (filtered.length === 0) {
+    listEl.innerHTML = `<div class="muted small">${escapeHtml(t("prompts.modal_empty", null, targetLang))}</div>`;
+    return;
+  }
+
+  listEl.innerHTML = filtered.map((p) => {
+    const promptText = p.prompt || "";
+    const tokenCount = typeof estimateTokens === "function" ? estimateTokens(promptText) : 0;
+    const tokenStr = typeof fmtTokens === "function" ? fmtTokens(tokenCount) : `~${tokenCount} tok`;
+    return `
+      <div class="prompts-modal-item" data-id="${escapeHtml(p.id)}">
+        <div class="prompts-modal-item-head">
+          <div class="prompts-modal-item-title-wrap">
+            <span class="prompts-modal-item-title">${escapeHtml(p.title || "Untitled Prompt")}</span>
+            <span class="prompt-token-pill mono" title="Approximate tokens">${escapeHtml(tokenStr)}</span>
+          </div>
+          <button type="button" class="primary prompts-modal-item-btn" data-id="${escapeHtml(p.id)}">${escapeHtml(t("prompts.modal_use", null, targetLang))}</button>
+        </div>
+        <div class="prompts-modal-item-preview">${escapeHtml(promptText)}</div>
+      </div>
+    `;
+  }).join("");
+
+  listEl.querySelectorAll(".prompts-modal-item").forEach((itemEl) => {
+    itemEl.addEventListener("click", (e) => {
+      const id = itemEl.dataset.id;
+      const promptObj = (systemPromptsList || []).find((p) => p.id === id);
+      if (!promptObj) return;
+      if (promptsModalTargetTextarea) {
+        promptsModalTargetTextarea.value = promptObj.prompt || "";
+        promptsModalTargetTextarea.dispatchEvent(new Event("input", { bubbles: true }));
+        promptsModalTargetTextarea.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      if (typeof promptsModalCallback === "function") {
+        promptsModalCallback(promptObj);
+      }
+      toast(t("prompts.modal_applied", null, targetLang), "success");
+      closeSystemPromptsPickerModal();
+    });
+  });
+}
+
+function bindSystemPromptsModalEvents() {
+  const closeBtn = $("prompts-modal-close");
+  const modal = $("prompts-modal");
+  
+  if (closeBtn && !closeBtn._bound) {
+    closeBtn._bound = true;
+    closeBtn.addEventListener("click", closeSystemPromptsPickerModal);
+  }
+  
+  if (modal && !modal._boundBackdrop) {
+    modal._boundBackdrop = true;
+    modal.addEventListener("click", (e) => {
+      if (e.target === modal) {
+        closeSystemPromptsPickerModal();
+      }
+    });
+  }
+  
+  const searchInput = $("prompts-modal-search-input");
+  const searchClear = $("prompts-modal-search-clear");
+  if (searchInput && !searchInput._bound) {
+    searchInput._bound = true;
+    const updateClear = () => {
+      if (searchClear) searchClear.hidden = !searchInput.value;
+    };
+    searchInput.addEventListener("input", () => {
+      updateClear();
+      loadAndRenderPromptsModal(searchInput.value.trim());
+    });
+    if (searchClear) {
+      searchClear.addEventListener("click", () => {
+        searchInput.value = "";
+        updateClear();
+        loadAndRenderPromptsModal("");
+        searchInput.focus();
+      });
+    }
+  }
+
+  // Connect Settings default prompt library button:
+  const settingsLibBtn = $("set-default-system-prompt-lib-btn");
+  if (settingsLibBtn && !settingsLibBtn._bound) {
+    settingsLibBtn._bound = true;
+    settingsLibBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      openSystemPromptsPickerModal($("set-default-system"));
+    });
+  }
+
+  // Connect Chat system prompt library button:
+  const chatLibBtn = $("chat-system-prompt-lib-btn");
+  if (chatLibBtn && !chatLibBtn._bound) {
+    chatLibBtn._bound = true;
+    chatLibBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      openSystemPromptsPickerModal($("chat-system"), () => {
+        if (typeof adjustChatSystemPromptHeight === "function") {
+          adjustChatSystemPromptHeight();
+        }
+        if (typeof saveChatOptionsForCurrentModel === "function") {
+          saveChatOptionsForCurrentModel();
+        }
+      });
+    });
+  }
+}
+
+// Bind immediately on boot if elements exist
+  if (typeof document !== "undefined") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bindSystemPromptsModalEvents);
+  } else {
+    bindSystemPromptsModalEvents();
+  }
+}
+
+// ---------- Agent Skills Settings & Catalog ----------
+
+let skillsCatalogCache = {
+  directories: [],
+  skills: [],
+  loaded: false,
+};
+
+let chatSelectedSkills = new Set();
+
+function getSelectedChatSkills() {
+  if (!$("chat-skills")?.checked) return [];
+  const availableNames = new Set((skillsCatalogCache.skills || []).map((sk) => sk.name));
+  const out = [];
+  for (const name of chatSelectedSkills) {
+    if (!skillsCatalogCache.loaded || availableNames.has(name)) {
+      out.push(name);
+    }
+  }
+  out.sort();
+  return out;
+}
+
+async function refreshSkillsCatalog() {
+  try {
+    const data = await api("/api/skills");
+    skillsCatalogCache = {
+      directories: Array.isArray(data?.directories) ? data.directories : [],
+      skills: Array.isArray(data?.skills) ? data.skills : [],
+      loaded: true,
+    };
+    const validNames = new Set(skillsCatalogCache.skills.map((sk) => sk.name));
+    for (const name of [...chatSelectedSkills]) {
+      if (!validNames.has(name)) {
+        chatSelectedSkills.delete(name);
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to load skills catalog:", err);
+  }
+  updateSkillsChatUI();
+  renderSkillsSettingsUI();
+  return skillsCatalogCache;
+}
+
+function renderChatSkillsPanel() {
+  const wrap = $("chat-skills-wrap");
+  const toggle = $("chat-skills");
+  const panel = $("chat-skills-panel");
+  const list = $("chat-skills-list");
+  if (!panel || !list) return;
+
+  const showPanel = Boolean(wrap && !wrap.hidden && toggle?.checked);
+  panel.hidden = !showPanel;
+  if (!showPanel) return;
+
+  if (!skillsCatalogCache.loaded) {
+    list.innerHTML = "";
+    const loadingEl = document.createElement("div");
+    loadingEl.className = "chat-mcp-empty";
+    loadingEl.textContent = "…";
+    list.appendChild(loadingEl);
+    void refreshSkillsCatalog();
+    return;
+  }
+
+  const skills = Array.isArray(skillsCatalogCache.skills) ? skillsCatalogCache.skills : [];
+  list.innerHTML = "";
+  if (!skills.length) {
+    const emptyEl = document.createElement("div");
+    emptyEl.className = "chat-mcp-empty";
+    const msgSpan = document.createElement("span");
+    msgSpan.textContent = t("chat.skills_empty");
+    emptyEl.appendChild(msgSpan);
+
+    const cfgBtn = document.createElement("button");
+    cfgBtn.type = "button";
+    cfgBtn.className = "ghost chat-mcp-cfg-btn";
+    cfgBtn.textContent = t("chat.skills_configure_btn");
+    cfgBtn.addEventListener("click", () => {
+      if (typeof showSettingsView === "function") {
+        void showSettingsView("/settings/skills");
+      }
+    });
+    emptyEl.appendChild(cfgBtn);
+    list.appendChild(emptyEl);
+    return;
+  }
+
+  skills.forEach((sk) => {
+    const checked = chatSelectedSkills.has(sk.name);
+    const row = document.createElement("div");
+    row.className = `chat-mcp-item${checked ? " is-active" : ""}`;
+
+    const main = document.createElement("div");
+    main.className = "chat-mcp-item-main";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "chat-mcp-item-title";
+    titleEl.textContent = sk.name;
+    main.appendChild(titleEl);
+
+    if (sk.description) {
+      const metaEl = document.createElement("div");
+      metaEl.className = "chat-mcp-item-meta";
+      metaEl.textContent = sk.description;
+      metaEl.title = sk.description;
+      main.appendChild(metaEl);
+    }
+
+    const switchLabel = document.createElement("label");
+    switchLabel.className = "switch chat-mcp-item-switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.className = "chat-skills-item-check";
+    input.dataset.skillName = sk.name;
+    input.checked = checked;
+    const slider = document.createElement("span");
+    slider.className = "switch-slider";
+    switchLabel.appendChild(input);
+    switchLabel.appendChild(slider);
+
+    row.appendChild(main);
+    row.appendChild(switchLabel);
+    list.appendChild(row);
+  });
+}
+
+function updateSkillsChatUI() {
+  const wrap = $("chat-skills-wrap");
+  const toggle = $("chat-skills");
+  const badge = $("chat-skills-count-badge");
+  const totalCount = skillsCatalogCache.skills.length;
+  const selectedCount = getSelectedChatSkills().length;
+
+  if (badge) {
+    if (toggle?.checked && totalCount > 0) {
+      badge.textContent = `${selectedCount}/${totalCount}`;
+      badge.hidden = false;
+    } else if (skillsCatalogCache.loaded) {
+      badge.textContent = String(totalCount);
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+  const navBadge = $("skills-nav-badge");
+  if (navBadge) {
+    navBadge.textContent = String(totalCount);
+    navBadge.hidden = totalCount === 0;
+  }
+  if (wrap) {
+    if (skillsCatalogCache.loaded && totalCount === 0) {
+      wrap.title = t("chat.skills_empty_hint");
+    } else {
+      wrap.title = t("chat.skills_hint");
+    }
+  }
+  if (toggle && wrap) {
+    toggle.title = wrap.title;
+  }
+
+  renderChatSkillsPanel();
+}
+
+async function chatSkillsSyncSession() {
+  if (typeof chatSessionId === "undefined" || !chatSessionId) return;
+  const skillsOn = Boolean($("chat-skills")?.checked);
+  const selectedSkills = skillsOn ? getSelectedChatSkills() : [];
+  try {
+    await api(`/api/chat/sessions/${encodeURIComponent(chatSessionId)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skills: skillsOn, selected_skills: selectedSkills }),
+    });
+  } catch (err) {
+    toast(String(err && err.message ? err.message : err), "error");
+  }
+}
+
+function chatSkillsSetEnabled(enabled, saveModelOptions = true) {
+  const nextOn = Boolean(enabled);
+  const toggle = $("chat-skills");
+  if (toggle) toggle.checked = nextOn;
+  // Toggling Skills interactively starts with every discovered skill at false.
+  chatSelectedSkills.clear();
+  updateSkillsChatUI();
+  if (saveModelOptions && typeof saveChatOptionsForCurrentModel === "function") {
+    saveChatOptionsForCurrentModel();
+  }
+  void chatSkillsSyncSession();
+}
+
+function applyChatSkillsOptions(opts) {
+  const skillsOn = Boolean(opts?.skills);
+  chatSelectedSkills = new Set(
+    skillsOn && Array.isArray(opts?.selected_skills)
+      ? opts.selected_skills.map((s) => String(s || "").trim()).filter(Boolean)
+      : []
+  );
+  const toggle = $("chat-skills");
+  if (toggle) {
+    toggle.checked = skillsOn;
+  }
+  updateSkillsChatUI();
+}
+
+function bindSkillsControls() {
+  const chatToggle = $("chat-skills");
+  const chatList = $("chat-skills-list");
+
+  if (chatToggle && !chatToggle._bound) {
+    chatToggle._bound = true;
+    chatToggle.addEventListener("change", () => {
+      chatSkillsSetEnabled(chatToggle.checked, true);
+    });
+  }
+  if (chatList && !chatList._bound) {
+    chatList._bound = true;
+    chatList.addEventListener("change", (ev) => {
+      const target = ev.target;
+      if (!target || !target.classList || !target.classList.contains("chat-skills-item-check")) return;
+      const name = target.dataset.skillName;
+      if (!name) return;
+      if (target.checked) {
+        chatSelectedSkills.add(name);
+      } else {
+        chatSelectedSkills.delete(name);
+      }
+      updateSkillsChatUI();
+      if (typeof saveChatOptionsForCurrentModel === "function") {
+        saveChatOptionsForCurrentModel();
+      }
+      void chatSkillsSyncSession();
+    });
+  }
+}
+
+async function saveSkillDirectories(dirs) {
+  const cleaned = (Array.isArray(dirs) ? dirs : [])
+    .map((d) => String(d || "").trim())
+    .filter(Boolean);
+  const res = await api("/api/config", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ skills: { directories: cleaned } }),
+  });
+  if (res && typeof res === "object") {
+    currentConfig = { ...currentConfig, ...res };
+  } else if (currentConfig) {
+    currentConfig.skills = { directories: cleaned };
+  }
+  await refreshSkillsCatalog();
+  toast(t("settings.skills_saved"), "success");
+}
+
+function renderSkillsSettingsUI() {
+  const dirsList = $("set-skills-dirs-list");
+  const catList = $("set-skills-catalog-list");
+  const catCount = $("set-skills-catalog-count");
+  if (!dirsList && !catList) return;
+
+  const dirs = skillsCatalogCache.directories;
+  const skills = skillsCatalogCache.skills;
+
+  if (catCount) {
+    catCount.textContent = String(skills.length);
+  }
+
+  if (dirsList) {
+    dirsList.innerHTML = "";
+    if (!dirs.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted small";
+      empty.textContent = t("settings.skills_dirs_empty");
+      dirsList.appendChild(empty);
+    } else {
+      dirs.forEach((d, idx) => {
+        const card = document.createElement("div");
+        card.className = "ext-model-card";
+
+        const info = document.createElement("div");
+        info.className = "ext-model-card-info";
+
+        const titleRow = document.createElement("div");
+        titleRow.className = "ext-model-card-name";
+        titleRow.textContent = d.raw_path || d.resolved_path || "";
+
+        const countBadge = document.createElement("span");
+        countBadge.className = "badge";
+        if (!d.exists) {
+          countBadge.textContent = t("settings.skills_dir_missing");
+          countBadge.style.background = "rgba(239, 68, 68, 0.15)";
+          countBadge.style.color = "#f87171";
+        } else {
+          countBadge.textContent = d.skill_count === 1
+            ? t("settings.skills_dir_skills_one")
+            : t("settings.skills_dir_skills_count", { count: d.skill_count || 0 });
+        }
+        titleRow.appendChild(countBadge);
+        info.appendChild(titleRow);
+
+        if (d.resolved_path && d.resolved_path !== d.raw_path) {
+          const resolvedEl = document.createElement("div");
+          resolvedEl.className = "ext-model-card-url mono";
+          resolvedEl.textContent = d.resolved_path;
+          info.appendChild(resolvedEl);
+        }
+
+        const actions = document.createElement("div");
+        actions.className = "ext-model-card-actions";
+        const removeBtn = document.createElement("button");
+        removeBtn.type = "button";
+        removeBtn.className = "btn-icon";
+        removeBtn.title = t("settings.skills_remove_dir");
+        removeBtn.textContent = "✕";
+        removeBtn.addEventListener("click", async () => {
+          const current = (currentConfig?.skills?.directories || dirs.map((x) => x.raw_path)).filter((_, i) => i !== idx);
+          try {
+            await saveSkillDirectories(current);
+          } catch (err) {
+            toast(err.message || "Error", "error");
+          }
+        });
+        actions.appendChild(removeBtn);
+
+        card.appendChild(info);
+        card.appendChild(actions);
+        dirsList.appendChild(card);
+      });
+    }
+  }
+
+  if (catList) {
+    catList.innerHTML = "";
+    if (!skills.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted small";
+      empty.textContent = t("settings.skills_catalog_empty");
+      catList.appendChild(empty);
+    } else {
+      skills.forEach((sk) => {
+        const card = document.createElement("div");
+        card.className = "ext-model-card";
+
+        const info = document.createElement("div");
+        info.className = "ext-model-card-info";
+
+        const nameEl = document.createElement("div");
+        nameEl.className = "ext-model-card-name";
+        nameEl.textContent = sk.name;
+
+        if (sk.license) {
+          const lic = document.createElement("span");
+          lic.className = "badge";
+          lic.textContent = sk.license;
+          nameEl.appendChild(lic);
+        }
+        if (sk.compatibility) {
+          const comp = document.createElement("span");
+          comp.className = "badge";
+          comp.textContent = sk.compatibility;
+          nameEl.appendChild(comp);
+        }
+        info.appendChild(nameEl);
+
+        if (sk.description) {
+          const descEl = document.createElement("div");
+          descEl.className = "muted small";
+          descEl.textContent = sk.description;
+          info.appendChild(descEl);
+        }
+
+        const dirEl = document.createElement("div");
+        dirEl.className = "ext-model-card-url mono";
+        dirEl.textContent = sk.dir;
+        info.appendChild(dirEl);
+
+        card.appendChild(info);
+        catList.appendChild(card);
+      });
+    }
+  }
+}
+
+function skillsSettingsInit(cfg) {
+  const input = $("set-skills-dir-input");
+  const addBtn = $("set-skills-add-dir-btn");
+  const rescanBtn = $("set-skills-rescan-btn");
+
+  const addCurrentInput = async () => {
+    const val = (input?.value || "").trim();
+    if (!val) return;
+    const baseDirs = Array.isArray(currentConfig?.skills?.directories)
+      ? [...currentConfig.skills.directories]
+      : (Array.isArray(cfg?.skills?.directories) ? [...cfg.skills.directories] : []);
+    if (!baseDirs.includes(val)) {
+      baseDirs.push(val);
+    }
+    try {
+      await saveSkillDirectories(baseDirs);
+      if (input) input.value = "";
+    } catch (err) {
+      toast(err.message || "Error", "error");
+    }
+  };
+
+  if (addBtn && !addBtn._bound) {
+    addBtn._bound = true;
+    addBtn.addEventListener("click", () => { void addCurrentInput(); });
+  }
+  if (input && !input._bound) {
+    input._bound = true;
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void addCurrentInput();
+      }
+    });
+  }
+  if (rescanBtn && !rescanBtn._bound) {
+    rescanBtn._bound = true;
+    rescanBtn.addEventListener("click", () => { void refreshSkillsCatalog(); });
+  }
+  void refreshSkillsCatalog();
+}
+
+if (typeof document !== "undefined") {
+  const initSkillsBoot = () => {
+    bindSkillsControls();
+    refreshSkillsCatalog().catch(() => {});
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initSkillsBoot);
+  } else {
+    initSkillsBoot();
+  }
+}
+
+// ---------- MCP (Model Context Protocol) Client Settings & Chat Selector ----------
+
+let mcpServersCache = {
+  mcp: { mcpServers: {} },
+  servers: [],
+  loaded: false,
+};
+let chatMcpSelectedServers = new Set();
+const mcpTestingTargets = new Set();
+
+function mcpEnabledServersList() {
+  return (mcpServersCache.servers || []).filter((srv) => srv && !srv.disabled);
+}
+
+function setMcpStatusMessage(text, kind = "info") {
+  const el = $("set-mcp-status");
+  if (!el) return;
+  const msg = String(text || "").trim();
+  el.hidden = !msg;
+  el.textContent = msg;
+  el.className = `mcp-status-msg${kind ? ` mcp-status-msg--${kind}` : ""}`;
+}
+
+function normalizeMcpEditorObject(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(t("settings.mcp_invalid_json"));
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "mcpServers")) {
+    if (!parsed.mcpServers || typeof parsed.mcpServers !== "object" || Array.isArray(parsed.mcpServers)) {
+      throw new Error(t("settings.mcp_invalid_json"));
+    }
+    return { mcpServers: parsed.mcpServers };
+  }
+  if (Object.prototype.hasOwnProperty.call(parsed, "servers")) {
+    if (!parsed.servers || typeof parsed.servers !== "object" || Array.isArray(parsed.servers)) {
+      throw new Error(t("settings.mcp_invalid_json"));
+    }
+    return { mcpServers: parsed.servers };
+  }
+  for (const val of Object.values(parsed)) {
+    if (!val || typeof val !== "object" || Array.isArray(val)) {
+      throw new Error(t("settings.mcp_invalid_json"));
+    }
+  }
+  return { mcpServers: parsed };
+}
+
+function parseMcpJsonEditor() {
+  const textarea = $("set-mcp-json");
+  const raw = (textarea?.value || "").trim();
+  if (!raw) {
+    return { mcpServers: {} };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${t("settings.mcp_invalid_json")}: ${err.message}`);
+  }
+  return normalizeMcpEditorObject(parsed);
+}
+
+function syncMcpEditorFromConfig(mcpCfg, force = false) {
+  const textarea = $("set-mcp-json");
+  if (!textarea) return;
+  if (!force && document.activeElement === textarea && textarea.value.trim()) {
+    return;
+  }
+  const normalized = {
+    mcpServers: mcpCfg && typeof mcpCfg.mcpServers === "object" && !Array.isArray(mcpCfg.mcpServers)
+      ? mcpCfg.mcpServers
+      : {},
+  };
+  textarea.value = JSON.stringify(normalized, null, 2);
+}
+
+async function refreshMcpServers(forceSyncEditor = false) {
+  try {
+    const data = await api("/api/mcp/servers");
+    const mcpCfg = data?.mcp && typeof data.mcp === "object" ? data.mcp : { mcpServers: {} };
+    mcpServersCache = {
+      mcp: mcpCfg,
+      servers: Array.isArray(data?.servers) ? data.servers : [],
+      loaded: true,
+    };
+    const enabledNames = new Set(mcpEnabledServersList().map((srv) => srv.name));
+    for (const name of [...chatMcpSelectedServers]) {
+      if (!enabledNames.has(name)) {
+        chatMcpSelectedServers.delete(name);
+      }
+    }
+    syncMcpEditorFromConfig(mcpCfg, forceSyncEditor);
+  } catch (err) {
+    console.warn("Failed to load MCP servers:", err);
+  }
+  updateMcpChatUI();
+  renderMcpSettingsUI();
+  return mcpServersCache;
+}
+
+function formatMcpJsonEditor() {
+  try {
+    const parsed = parseMcpJsonEditor();
+    const textarea = $("set-mcp-json");
+    if (textarea) {
+      textarea.value = JSON.stringify(parsed, null, 2);
+    }
+    setMcpStatusMessage("");
+  } catch (err) {
+    const msg = err?.message || t("settings.mcp_invalid_json");
+    setMcpStatusMessage(msg, "error");
+    toast(msg, "error");
+  }
+}
+
+async function testMcpServers(serverName = "", useEditorDraft = true) {
+  let draftMcp = null;
+  if (useEditorDraft && $("set-mcp-json")) {
+    try {
+      draftMcp = parseMcpJsonEditor();
+    } catch (err) {
+      const msg = err?.message || t("settings.mcp_invalid_json");
+      setMcpStatusMessage(msg, "error");
+      toast(msg, "error");
+      return;
+    }
+  }
+
+  const targetKey = serverName || "*";
+  mcpTestingTargets.add(targetKey);
+  setMcpStatusMessage(t("settings.mcp_testing"), "info");
+  renderMcpSettingsUI();
+
+  try {
+    const reqBody = {};
+    if (serverName) reqBody.server = serverName;
+    if (draftMcp) reqBody.mcp = draftMcp;
+    const data = await api("/api/mcp/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reqBody),
+    });
+    const tested = Array.isArray(data?.servers) ? data.servers : [];
+    if (!serverName && !draftMcp) {
+      mcpServersCache.servers = tested;
+    } else if (!serverName && draftMcp) {
+      mcpServersCache.servers = tested;
+      mcpServersCache.loaded = true;
+    } else if (tested.length) {
+      const byName = new Map(tested.map((s) => [s.name, s]));
+      const existing = [...(mcpServersCache.servers || [])];
+      let replaced = false;
+      for (let i = 0; i < existing.length; i += 1) {
+        const next = byName.get(existing[i].name);
+        if (next) {
+          existing[i] = next;
+          byName.delete(existing[i].name);
+          replaced = true;
+        }
+      }
+      if (!replaced) {
+        for (const extra of byName.values()) existing.push(extra);
+      }
+      mcpServersCache.servers = existing;
+    }
+
+    const enabled = tested.filter((s) => s && !s.disabled);
+    const okCount = enabled.filter((s) => s.connected).length;
+    const errCount = enabled.filter((s) => !s.connected && s.error).length;
+    if (enabled.length === 0) {
+      setMcpStatusMessage(t("settings.mcp_empty"), "info");
+    } else if (errCount > 0) {
+      setMcpStatusMessage(t("settings.mcp_test_failed", { ok: okCount, err: errCount }), okCount > 0 ? "warn" : "error");
+    } else {
+      setMcpStatusMessage(t("settings.mcp_test_done", { count: okCount }), "success");
+    }
+  } catch (err) {
+    const msg = err?.message || "MCP test failed";
+    setMcpStatusMessage(msg, "error");
+    toast(msg, "error");
+  } finally {
+    mcpTestingTargets.delete(targetKey);
+    renderMcpSettingsUI();
+    updateMcpChatUI();
+  }
+}
+
+async function saveMcpSettings() {
+  let parsed;
+  try {
+    parsed = parseMcpJsonEditor();
+  } catch (err) {
+    const msg = err?.message || t("settings.mcp_invalid_json");
+    setMcpStatusMessage(msg, "error");
+    toast(msg, "error");
+    return;
+  }
+
+  const saveBtn = $("set-mcp-save-btn");
+  if (saveBtn) saveBtn.disabled = true;
+  try {
+    const res = await api("/api/config", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mcp: parsed }),
+    });
+    if (res && typeof res === "object") {
+      currentConfig = { ...currentConfig, ...res };
+    } else if (currentConfig) {
+      currentConfig.mcp = parsed;
+    }
+    await refreshMcpServers(true);
+    toast(t("settings.mcp_saved"), "success");
+    if (mcpEnabledServersList().length > 0) {
+      await testMcpServers("", false);
+    } else {
+      setMcpStatusMessage(t("settings.mcp_saved"), "success");
+    }
+  } catch (err) {
+    const msg = err?.message || "Failed to save MCP configuration";
+    setMcpStatusMessage(msg, "error");
+    toast(msg, "error");
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+}
+
+function renderMcpSettingsUI() {
+  const list = $("set-mcp-servers-list");
+  const badge = $("set-mcp-badge");
+  const countEl = $("set-mcp-servers-count");
+  const navBadge = $("mcp-nav-badge");
+  const servers = Array.isArray(mcpServersCache.servers) ? mcpServersCache.servers : [];
+  const enabledCount = mcpEnabledServersList().length;
+
+  if (badge) badge.textContent = String(enabledCount);
+  if (countEl) countEl.textContent = String(servers.length);
+  if (navBadge) {
+    navBadge.textContent = String(enabledCount);
+    navBadge.hidden = enabledCount === 0;
+  }
+
+  if (!list) return;
+  list.innerHTML = "";
+  if (!servers.length) {
+    const empty = document.createElement("div");
+    empty.className = "muted small";
+    empty.textContent = t("settings.mcp_empty");
+    list.appendChild(empty);
+    return;
+  }
+
+  servers.forEach((srv) => {
+    const card = document.createElement("div");
+    card.className = `ext-model-card mcp-server-card${srv.disabled ? " is-paused" : ""}`;
+
+    const info = document.createElement("div");
+    info.className = "ext-model-card-info";
+
+    const nameRow = document.createElement("div");
+    nameRow.className = "ext-model-card-name";
+    nameRow.textContent = srv.name;
+
+    const transportBadge = document.createElement("span");
+    transportBadge.className = "badge";
+    transportBadge.textContent = srv.transport || "stdio";
+    nameRow.appendChild(transportBadge);
+
+    const statusBadge = document.createElement("span");
+    const isTesting = mcpTestingTargets.has("*") || mcpTestingTargets.has(srv.name);
+    if (isTesting) {
+      statusBadge.className = "badge";
+      statusBadge.textContent = t("settings.mcp_testing");
+    } else if (srv.disabled) {
+      statusBadge.className = "badge";
+      statusBadge.textContent = t("settings.mcp_disabled");
+    } else if (srv.connected) {
+      statusBadge.className = "badge mcp-badge-ok";
+      const srvLabel = srv.server_name
+        ? ` (${srv.server_name}${srv.server_version ? ` v${srv.server_version}` : ""})`
+        : "";
+      statusBadge.textContent = `${t("settings.mcp_connected")}${srvLabel}`;
+    } else if (srv.error) {
+      statusBadge.className = "badge mcp-badge-err";
+      statusBadge.textContent = "Error";
+    } else {
+      statusBadge.className = "badge";
+      statusBadge.textContent = t("settings.mcp_not_tested");
+    }
+    nameRow.appendChild(statusBadge);
+
+    if (srv.connected && Array.isArray(srv.tools)) {
+      const toolsCountBadge = document.createElement("span");
+      toolsCountBadge.className = "badge";
+      toolsCountBadge.textContent = t("settings.mcp_tools_count", { count: srv.tools.length });
+      nameRow.appendChild(toolsCountBadge);
+    }
+    info.appendChild(nameRow);
+
+    const endpointText = srv.transport === "stdio"
+      ? [srv.command, ...(Array.isArray(srv.args) ? srv.args : [])].filter(Boolean).join(" ")
+      : (srv.url || "");
+    if (endpointText) {
+      const epEl = document.createElement("div");
+      epEl.className = "ext-model-card-url mono";
+      epEl.textContent = endpointText;
+      epEl.title = endpointText;
+      info.appendChild(epEl);
+    }
+
+    if (srv.error && !srv.disabled) {
+      const errEl = document.createElement("div");
+      errEl.className = "mcp-server-error";
+      errEl.textContent = srv.error;
+      info.appendChild(errEl);
+    }
+
+    if (Array.isArray(srv.tools) && srv.tools.length > 0) {
+      const toolsWrap = document.createElement("div");
+      toolsWrap.className = "mcp-server-tools";
+      srv.tools.forEach((tool) => {
+        const pill = document.createElement("span");
+        pill.className = "mcp-tool-pill mono";
+        pill.textContent = tool.name;
+        if (tool.description) pill.title = tool.description;
+        toolsWrap.appendChild(pill);
+      });
+      info.appendChild(toolsWrap);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "ext-model-card-actions";
+    const testBtn = document.createElement("button");
+    testBtn.type = "button";
+    testBtn.className = "secondary small";
+    testBtn.textContent = isTesting ? t("settings.mcp_testing") : t("settings.mcp_test_btn");
+    testBtn.disabled = Boolean(srv.disabled || isTesting);
+    testBtn.addEventListener("click", () => {
+      void testMcpServers(srv.name, true);
+    });
+    actions.appendChild(testBtn);
+
+    card.appendChild(info);
+    card.appendChild(actions);
+    list.appendChild(card);
+  });
+}
+
+function getSelectedChatMcpServers() {
+  if (!$("chat-mcp")?.checked) return [];
+  const enabledNames = new Set(mcpEnabledServersList().map((srv) => srv.name));
+  const out = [];
+  for (const name of chatMcpSelectedServers) {
+    if (!mcpServersCache.loaded || enabledNames.has(name)) {
+      out.push(name);
+    }
+  }
+  out.sort();
+  return out;
+}
+
+function renderChatMcpPanel() {
+  const wrap = $("chat-mcp-wrap");
+  const toggle = $("chat-mcp");
+  const panel = $("chat-mcp-panel");
+  const list = $("chat-mcp-list");
+  if (!panel || !list) return;
+
+  const showPanel = Boolean(wrap && !wrap.hidden && toggle?.checked);
+  panel.hidden = !showPanel;
+  if (!showPanel) return;
+
+  if (!mcpServersCache.loaded) {
+    list.innerHTML = "";
+    const loadingEl = document.createElement("div");
+    loadingEl.className = "chat-mcp-empty";
+    loadingEl.textContent = "…";
+    list.appendChild(loadingEl);
+    void refreshMcpServers(false);
+    return;
+  }
+
+  const enabledServers = mcpEnabledServersList();
+  list.innerHTML = "";
+  if (!enabledServers.length) {
+    const emptyEl = document.createElement("div");
+    emptyEl.className = "chat-mcp-empty";
+    const msgSpan = document.createElement("span");
+    msgSpan.textContent = t("chat.mcp_empty");
+    emptyEl.appendChild(msgSpan);
+
+    const cfgBtn = document.createElement("button");
+    cfgBtn.type = "button";
+    cfgBtn.className = "ghost chat-mcp-cfg-btn";
+    cfgBtn.textContent = t("chat.mcp_configure_btn");
+    cfgBtn.addEventListener("click", () => {
+      if (typeof showSettingsView === "function") {
+        void showSettingsView("/settings/mcp");
+      }
+    });
+    emptyEl.appendChild(cfgBtn);
+    list.appendChild(emptyEl);
+    return;
+  }
+
+  enabledServers.forEach((srv) => {
+    const checked = chatMcpSelectedServers.has(srv.name);
+    const row = document.createElement("div");
+    row.className = `chat-mcp-item${checked ? " is-active" : ""}`;
+
+    const main = document.createElement("div");
+    main.className = "chat-mcp-item-main";
+
+    const titleEl = document.createElement("div");
+    titleEl.className = "chat-mcp-item-title";
+    titleEl.textContent = srv.name;
+    main.appendChild(titleEl);
+
+    const metaParts = [srv.transport || "stdio"];
+    if (srv.connected && Array.isArray(srv.tools)) {
+      metaParts.push(t("settings.mcp_tools_count", { count: srv.tools.length }));
+    } else if (srv.error) {
+      metaParts.push("error");
+    }
+    const metaEl = document.createElement("div");
+    metaEl.className = "chat-mcp-item-meta";
+    metaEl.textContent = metaParts.join(" · ");
+    main.appendChild(metaEl);
+
+    const switchLabel = document.createElement("label");
+    switchLabel.className = "switch chat-mcp-item-switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.className = "chat-mcp-server-check";
+    input.dataset.mcpServer = srv.name;
+    input.checked = checked;
+    const slider = document.createElement("span");
+    slider.className = "switch-slider";
+    switchLabel.appendChild(input);
+    switchLabel.appendChild(slider);
+
+    row.appendChild(main);
+    row.appendChild(switchLabel);
+    list.appendChild(row);
+  });
+}
+
+function updateMcpChatUI() {
+  const wrap = $("chat-mcp-wrap");
+  const toggle = $("chat-mcp");
+  const badge = $("chat-mcp-count-badge");
+  const enabledServers = mcpEnabledServersList();
+  const totalCount = enabledServers.length;
+  const selectedCount = getSelectedChatMcpServers().length;
+
+  if (badge) {
+    if (toggle?.checked && totalCount > 0) {
+      badge.textContent = `${selectedCount}/${totalCount}`;
+      badge.hidden = false;
+    } else if (mcpServersCache.loaded) {
+      badge.textContent = String(totalCount);
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+
+  if (wrap) {
+    wrap.title = (mcpServersCache.loaded && totalCount === 0)
+      ? t("chat.mcp_empty")
+      : t("chat.mcp_hint");
+  }
+  if (toggle && wrap) {
+    toggle.title = wrap.title;
+  }
+
+  renderChatMcpPanel();
+}
+
+async function chatMcpSyncSession() {
+  if (typeof chatSessionId === "undefined" || !chatSessionId) return;
+  const mcpOn = Boolean($("chat-mcp")?.checked);
+  const mcpServers = mcpOn ? getSelectedChatMcpServers() : [];
+  try {
+    await api(`/api/chat/sessions/${encodeURIComponent(chatSessionId)}/settings`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mcp: mcpOn, mcp_servers: mcpServers }),
+    });
+  } catch (err) {
+    toast(String(err && err.message ? err.message : err), "error");
+  }
+}
+
+function chatMcpSetEnabled(enabled, saveModelOptions = true) {
+  const nextOn = Boolean(enabled);
+  const toggle = $("chat-mcp");
+  if (toggle) toggle.checked = nextOn;
+  // Toggling MCPs interactively starts with every configured service at false.
+  chatMcpSelectedServers.clear();
+  updateMcpChatUI();
+  if (saveModelOptions && typeof saveChatOptionsForCurrentModel === "function") {
+    saveChatOptionsForCurrentModel();
+  }
+  void chatMcpSyncSession();
+}
+
+function applyChatMcpOptions(opts) {
+  const mcpOn = Boolean(opts?.mcp);
+  chatMcpSelectedServers = new Set(
+    mcpOn && Array.isArray(opts?.mcp_servers)
+      ? opts.mcp_servers.map((s) => String(s || "").trim()).filter(Boolean)
+      : []
+  );
+  const toggle = $("chat-mcp");
+  if (toggle) {
+    toggle.checked = mcpOn;
+  }
+  updateMcpChatUI();
+}
+
+function bindMcpControls() {
+  const formatBtn = $("set-mcp-format-btn");
+  const testBtn = $("set-mcp-test-btn");
+  const saveBtn = $("set-mcp-save-btn");
+  const chatToggle = $("chat-mcp");
+  const chatList = $("chat-mcp-list");
+
+  if (formatBtn && !formatBtn._bound) {
+    formatBtn._bound = true;
+    formatBtn.addEventListener("click", formatMcpJsonEditor);
+  }
+  if (testBtn && !testBtn._bound) {
+    testBtn._bound = true;
+    testBtn.addEventListener("click", () => { void testMcpServers("", true); });
+  }
+  if (saveBtn && !saveBtn._bound) {
+    saveBtn._bound = true;
+    saveBtn.addEventListener("click", () => { void saveMcpSettings(); });
+  }
+  if (chatToggle && !chatToggle._bound) {
+    chatToggle._bound = true;
+    chatToggle.addEventListener("change", () => {
+      chatMcpSetEnabled(chatToggle.checked, true);
+    });
+  }
+  if (chatList && !chatList._bound) {
+    chatList._bound = true;
+    chatList.addEventListener("change", (ev) => {
+      const target = ev.target;
+      if (!target || !target.classList || !target.classList.contains("chat-mcp-server-check")) return;
+      const name = target.dataset.mcpServer;
+      if (!name) return;
+      if (target.checked) {
+        chatMcpSelectedServers.add(name);
+      } else {
+        chatMcpSelectedServers.delete(name);
+      }
+      updateMcpChatUI();
+      if (typeof saveChatOptionsForCurrentModel === "function") {
+        saveChatOptionsForCurrentModel();
+      }
+      void chatMcpSyncSession();
+    });
+  }
+}
+
+function mcpSettingsInit(cfg) {
+  bindMcpControls();
+  if (cfg?.mcp) {
+    syncMcpEditorFromConfig(cfg.mcp, false);
+  }
+  void refreshMcpServers(true);
+}
+
+if (typeof document !== "undefined") {
+  const initMcpBoot = () => {
+    bindMcpControls();
+    refreshMcpServers(false).catch(() => {});
+  };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initMcpBoot);
+  } else {
+    initMcpBoot();
+  }
+}

@@ -1,0 +1,663 @@
+package config
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// ChatDefaults defines global fallback parameters for chat sessions.
+type ChatDefaults struct {
+	SystemPrompt string   `json:"system_prompt"`
+	Temperature  *float64 `json:"temperature,omitempty"`
+	TopK         *int     `json:"top_k,omitempty"`
+	TopP         *float64 `json:"top_p,omitempty"`
+	// NumCtx is the default context window (num_ctx) in tokens. nil/0 means
+	// "use the model's own default". Lowering it reduces VRAM/RAM usage.
+	NumCtx *int `json:"num_ctx,omitempty"`
+	// ThinkLevel is the default reasoning effort: "auto", "off", "low",
+	// "medium", "high" or "max". It replaces the old no_think boolean.
+	ThinkLevel string `json:"think_level,omitempty"`
+	// NoThink is deprecated and kept only to read older config files.
+	NoThink   *bool `json:"no_think,omitempty"`
+	WebTools  *bool `json:"web_tools,omitempty"`
+	Artifacts *bool `json:"artifacts,omitempty"`
+	Skills    *bool `json:"skills,omitempty"`
+}
+
+// ChatSessionsConfig controls the persistent, detached chat sessions: the
+// "+ Session" button in the chat options panel, which runs a turn on the server
+// and keeps going after the page is closed.
+type ChatSessionsConfig struct {
+	// Enabled turns the whole feature off. When false the API refuses to create
+	// or list sessions, so a browser that still has the old page open degrades to
+	// the plain, request-bound quick chat instead of failing mid-run.
+	Enabled *bool `json:"enabled,omitempty"`
+	// OnModelDelete decides what happens to a session whose model gets
+	// uninstalled: "delete" removes those sessions, "keep" leaves them and the
+	// UI flags them as missing their model. Defaults to "delete".
+	OnModelDelete string `json:"on_model_delete,omitempty"`
+}
+
+// IsEnabled reports whether persistent chat sessions are available. The feature
+// is on unless it was explicitly turned off.
+func (c ChatSessionsConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// DeleteSessionsOnModelUninstall reports whether uninstalling a model should
+// also drop the sessions that ran on it.
+func (c ChatSessionsConfig) DeleteSessionsOnModelUninstall() bool {
+	return c.OnModelDelete != "keep"
+}
+
+// GatewayConfig controls the optional OpenAI/Ollama-compatible gateway
+// that re-exposes selected models to third-party clients on its own port.
+type GatewayConfig struct {
+	// Enabled turns the gateway listener on. Applied live on config save
+	// (the listener is reconciled via SyncGateway, no restart needed).
+	Enabled bool `json:"enabled"`
+	// Port is the gateway listen port. 0 = default. Applied live on config
+	// save (reconciled via SyncGateway, no restart needed).
+	Port int `json:"port"`
+	// ExposeNetwork binds 0.0.0.0 instead of 127.0.0.1. Applied live on
+	// config save (reconciled via SyncGateway, no restart needed).
+	ExposeNetwork bool `json:"expose_network"`
+	// Models is the allowlist of exposed model names (local and external).
+	// When nil (unconfigured), all visible models are exposed.
+	// When set (including an empty slice), only the listed models are exposed.
+	Models []string `json:"models"`
+	// RequireAuth rejects requests without a valid Bearer API key.
+	RequireAuth bool `json:"require_auth"`
+}
+
+// Testing auto-skip modes: "any" skips when either condition trips,
+// "all" only skips when every enabled condition trips at once.
+const (
+	TestingModeAny = "any"
+	TestingModeAll = "all"
+)
+
+// TestingLimits holds optional automatic skip conditions for battery tests.
+// Each limit applies per stage (thinking or response) individually, not to
+// their sum: e.g. MaxStageTokens=50000 allows 49k thinking + 39k response.
+// Zero (or negative) disables the condition.
+type TestingLimits struct {
+	// MaxStageTokens caps the approximate tokens of a single stage
+	// (thinking or response). Token counts during streaming are estimated
+	// (~4 chars per token) since Ollama only reports exact counts at the
+	// end. 0 = no limit.
+	MaxStageTokens int `json:"max_stage_tokens,omitempty"`
+	// MaxStageSeconds caps the time spent in a single stage (thinking or
+	// response). 0 = no limit.
+	MaxStageSeconds int `json:"max_stage_seconds,omitempty"`
+	// Mode combines the enabled conditions: "any" (default) or "all".
+	Mode string `json:"mode,omitempty"`
+	// SkipRules holds optional per-speed auto-skip rules. When non-empty,
+	// rules replace the legacy MaxStageTokens/MaxStageSeconds/Mode limits:
+	// the first rule whose speed range contains the model's recorded tok/s
+	// applies. An empty list means "no cuts" (legacy zero behavior).
+	SkipRules []SkipRule `json:"skip_rules,omitempty"`
+}
+
+// SkipRule is one auto-skip rule bound to a model speed range.
+// Speed is the model's recorded tok/s. MinTPS is inclusive, MaxTPS is
+// exclusive; MaxTPS <= 0 means unbounded. Models without a recorded speed
+// only match rules with MinTPS == 0.
+type SkipRule struct {
+	MinTPS     float64 `json:"min_tps,omitempty"`
+	MaxTPS     float64 `json:"max_tps,omitempty"`
+	MaxTokens  int     `json:"max_tokens,omitempty"`
+	MaxSeconds int     `json:"max_seconds,omitempty"`
+	Mode       string  `json:"mode,omitempty"`
+}
+
+// NormalizeSkipRule clamps a rule to valid ranges (negatives mean disabled,
+// unknown modes become "any"). It reports whether the rule carries any
+// effective cut condition.
+func NormalizeSkipRule(r SkipRule) (SkipRule, bool) {
+	if r.MinTPS < 0 {
+		r.MinTPS = 0
+	}
+	if r.MaxTPS < 0 {
+		r.MaxTPS = 0
+	}
+	if r.MaxTPS > 0 && r.MaxTPS <= r.MinTPS {
+		r.MaxTPS = 0
+	}
+	if r.MaxTokens < 0 {
+		r.MaxTokens = 0
+	}
+	if r.MaxSeconds < 0 {
+		r.MaxSeconds = 0
+	}
+	r.Mode = NormalizeTestingMode(r.Mode)
+	return r, r.MaxTokens > 0 || r.MaxSeconds > 0
+}
+
+// NormalizeSkipRules normalizes every rule in place, dropping rules with no
+// effective condition.
+func NormalizeSkipRules(rules []SkipRule) []SkipRule {
+	out := rules[:0]
+	for _, r := range rules {
+		if nr, ok := NormalizeSkipRule(r); ok {
+			out = append(out, nr)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// NormalizeTestingMode returns "any" for empty/unknown modes.
+func NormalizeTestingMode(mode string) string {
+	switch mode {
+	case TestingModeAll:
+		return TestingModeAll
+	default:
+		return TestingModeAny
+	}
+}
+
+// DefaultGatewayPort is used when Gateway.Port is 0.
+const DefaultGatewayPort = 7861
+
+// GatewayBindAddress returns the host:port the gateway should listen on.
+func (g GatewayConfig) GatewayBindAddress() string {
+	host := "127.0.0.1"
+	if g.ExposeNetwork {
+		host = "0.0.0.0"
+	}
+	port := g.Port
+	if port <= 0 {
+		port = DefaultGatewayPort
+	}
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// ComfyUIConfig points the manager at a ComfyUI instance. Nothing here is
+// required: the chat integration stays invisible until a URL is set and at least
+// one workflow is registered, so an existing install is unaffected.
+type ComfyUIConfig struct {
+	// URL is the ComfyUI HTTP endpoint, e.g. "http://127.0.0.1:8188".
+	URL string `json:"url"`
+	// ClientID identifies the manager in ComfyUI's queue and websocket. Empty
+	// generates one per process, which is fine for a single-user desktop setup.
+	ClientID string `json:"client_id,omitempty"`
+	// TimeoutSeconds caps a single workflow run before the manager gives up on
+	// it. Diffusion on a slow machine can legitimately take minutes.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Workflow is the workflow id pre-selected in the chat panel. Empty means
+	// "let the model choose", which it does whenever exactly one workflow is
+	// enabled.
+	Workflow string `json:"workflow,omitempty"`
+}
+
+type RAGConfig struct {
+	DefaultEmbedding string `json:"default_embedding"`
+	Directory        string `json:"directory"`
+}
+
+// SkillsConfig holds the settings for Agent Skills directories.
+type SkillsConfig struct {
+	// Directories lists filesystem paths scanned for Agent Skills (folders containing SKILL.md).
+	// Relative paths are resolved next to config.json; "~/" expands to the user home directory.
+	Directories []string `json:"directories"`
+}
+
+// MCPServerConfig configures a single Model Context Protocol (MCP) server using
+// standard MCP JSON fields (command/args/env for stdio, url/headers for HTTP/SSE).
+type MCPServerConfig struct {
+	Command        string            `json:"command,omitempty"`
+	Args           []string          `json:"args,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	URL            string            `json:"url,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
+	Transport      string            `json:"transport,omitempty"`
+	Type           string            `json:"type,omitempty"`
+	Disabled       bool              `json:"disabled,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+}
+
+// EffectiveTransport returns the resolved MCP transport ("stdio", "sse", or "http").
+func (s MCPServerConfig) EffectiveTransport() string {
+	t := strings.ToLower(strings.TrimSpace(s.Transport))
+	if t == "" {
+		t = strings.ToLower(strings.TrimSpace(s.Type))
+	}
+	switch t {
+	case "stdio":
+		return "stdio"
+	case "sse":
+		return "sse"
+	case "http", "streamable-http", "streamable_http":
+		return "http"
+	}
+	if strings.TrimSpace(s.Command) != "" {
+		return "stdio"
+	}
+	if strings.TrimSpace(s.URL) != "" {
+		return "http"
+	}
+	return ""
+}
+
+// MCPConfig holds configured MCP servers keyed by server name using the standard
+// {"mcpServers": {...}} structure.
+type MCPConfig struct {
+	MCPServers map[string]MCPServerConfig `json:"mcpServers"`
+}
+
+// UnmarshalJSON accepts {"mcpServers": {...}}, {"servers": {...}}, or a direct
+// map of server definitions.
+func (m *MCPConfig) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		m.MCPServers = map[string]MCPServerConfig{}
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if sub, ok := raw["mcpServers"]; ok {
+		var servers map[string]MCPServerConfig
+		if string(sub) != "null" && len(sub) > 0 {
+			if err := json.Unmarshal(sub, &servers); err != nil {
+				return err
+			}
+		}
+		m.MCPServers = servers
+		NormalizeMCPConfig(m)
+		return nil
+	}
+	if sub, ok := raw["servers"]; ok {
+		var servers map[string]MCPServerConfig
+		if string(sub) != "null" && len(sub) > 0 {
+			if err := json.Unmarshal(sub, &servers); err != nil {
+				return err
+			}
+		}
+		m.MCPServers = servers
+		NormalizeMCPConfig(m)
+		return nil
+	}
+	var direct map[string]MCPServerConfig
+	if err := json.Unmarshal(data, &direct); err != nil {
+		return err
+	}
+	m.MCPServers = direct
+	NormalizeMCPConfig(m)
+	return nil
+}
+
+// NormalizeMCPConfig cleans server names, URLs, commands, and timeout bounds.
+func NormalizeMCPConfig(cfg *MCPConfig) {
+	if cfg == nil {
+		return
+	}
+	if cfg.MCPServers == nil {
+		cfg.MCPServers = map[string]MCPServerConfig{}
+		return
+	}
+	cleaned := make(map[string]MCPServerConfig, len(cfg.MCPServers))
+	for rawName, srv := range cfg.MCPServers {
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			continue
+		}
+		srv.Command = strings.TrimSpace(srv.Command)
+		srv.URL = strings.TrimSpace(srv.URL)
+		srv.Transport = strings.ToLower(strings.TrimSpace(srv.Transport))
+		srv.Type = strings.ToLower(strings.TrimSpace(srv.Type))
+		if srv.TimeoutSeconds < 0 {
+			srv.TimeoutSeconds = 0
+		} else if srv.TimeoutSeconds > 600 {
+			srv.TimeoutSeconds = 600
+		}
+		if len(srv.Args) > 0 {
+			args := make([]string, 0, len(srv.Args))
+			for _, a := range srv.Args {
+				args = append(args, a)
+			}
+			srv.Args = args
+		}
+		cleaned[name] = srv
+	}
+	cfg.MCPServers = cleaned
+}
+
+// DefaultComfyUIURL is ComfyUI's default listen address.
+const DefaultComfyUIURL = "http://127.0.0.1:8188"
+
+// DefaultComfyUITimeoutSeconds is generous enough for SDXL and video workflows
+// on consumer GPUs without letting a stuck run hold a chat turn open forever.
+const DefaultComfyUITimeoutSeconds = 600
+
+// Normalize fills in defaults and clamps out-of-range values so a bad config
+// file degrades into something usable instead of failing every run.
+func (c ComfyUIConfig) Normalize() ComfyUIConfig {
+	c.URL = strings.TrimSpace(strings.TrimRight(c.URL, "/"))
+	if c.URL == "" {
+		c.URL = DefaultComfyUIURL
+	}
+	if !strings.HasPrefix(c.URL, "http://") && !strings.HasPrefix(c.URL, "https://") {
+		c.URL = "http://" + c.URL
+	}
+	if c.TimeoutSeconds <= 0 {
+		c.TimeoutSeconds = DefaultComfyUITimeoutSeconds
+	}
+	return c
+}
+
+// Config holds the runtime configuration for iamanager.
+type Config struct {
+	Port          int    `json:"port"`
+	ExposeNetwork bool   `json:"expose_network"`
+	PasswordHash  string `json:"password_hash"`
+	SessionSecret string `json:"session_secret"`
+	OllamaURL     string `json:"ollama_url"`
+	Language      string `json:"language"`
+	// HFToken authenticates the manager's own HuggingFace API calls (explorer
+	// search/details) so gated/private repos are visible and rate limits are
+	// higher. It is NOT used by Ollama pulls: Ollama authenticates to hf.co
+	// with its own ed25519 key (see /api/ollama/key).
+	HFToken               string             `json:"hf_token,omitempty"`
+	ChatDefaults          ChatDefaults       `json:"chat_defaults"`
+	ChatSessions          ChatSessionsConfig `json:"chat_sessions"`
+	LeaderboardGroupOrder []string           `json:"leaderboard_group_order,omitempty"`
+	Testing               TestingLimits      `json:"testing"`
+	Gateway               GatewayConfig      `json:"gateway"`
+	ComfyUI               ComfyUIConfig      `json:"comfyui"`
+	RAG                   RAGConfig          `json:"rag"`
+	Skills                SkillsConfig       `json:"skills"`
+	MCP                   MCPConfig          `json:"mcp"`
+
+	path string `json:"-"`
+}
+
+// Defaults returns a Config populated with sensible default values.
+func Defaults() *Config {
+	defaultTemp := 0.7
+	defaultTopK := 40
+	defaultTopP := 0.9
+	defaultWebTools := false
+	defaultArtifacts := false
+	defaultSkills := false
+	defaultSessions := true
+
+	return &Config{
+		Port:          7860,
+		ExposeNetwork: false,
+		PasswordHash:  "",
+		SessionSecret: "",
+		OllamaURL:     "http://localhost:11434",
+		Language:      "en",
+		ChatDefaults: ChatDefaults{
+			SystemPrompt: "",
+			Temperature:  &defaultTemp,
+			TopK:         &defaultTopK,
+			TopP:         &defaultTopP,
+			ThinkLevel:   "auto",
+			WebTools:     &defaultWebTools,
+			Artifacts:    &defaultArtifacts,
+			Skills:       &defaultSkills,
+		},
+		ChatSessions: ChatSessionsConfig{
+			Enabled:       &defaultSessions,
+			OnModelDelete: "delete",
+		},
+		ComfyUI: ComfyUIConfig{
+			URL:            DefaultComfyUIURL,
+			TimeoutSeconds: DefaultComfyUITimeoutSeconds,
+		},
+		Skills: SkillsConfig{
+			Directories: []string{},
+		},
+		MCP: MCPConfig{
+			MCPServers: map[string]MCPServerConfig{},
+		},
+	}
+}
+
+// validLanguages is the set of supported UI languages.
+var validLanguages = map[string]bool{"en": true, "es": true}
+
+// validThinkLevels is the set of supported default reasoning levels.
+var validThinkLevels = map[string]bool{
+	"auto": true, "off": true, "low": true, "medium": true, "high": true, "max": true,
+}
+
+// IsValidThinkLevel reports whether lvl is a supported thinking level.
+func IsValidThinkLevel(lvl string) bool { return validThinkLevels[lvl] }
+
+// NormalizeThinkLevel returns lvl if valid, otherwise "auto".
+func NormalizeThinkLevel(lvl string) string {
+	if IsValidThinkLevel(lvl) {
+		return lvl
+	}
+	return "auto"
+}
+
+// IsValidLanguage reports whether lang is a supported UI language.
+func IsValidLanguage(lang string) bool { return validLanguages[lang] }
+
+// Load reads the config file at path. If the file does not exist a new one
+// is created with default values. If session_secret is empty a random one is
+// generated and persisted.
+func Load(path string) (*Config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := Defaults()
+	cfg.path = abs
+
+	data, err := os.ReadFile(abs)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := cfg.ensureSecret(); err != nil {
+			return nil, err
+		}
+		if err := cfg.Save(); err != nil {
+			return nil, fmt.Errorf("could not create default config at %s: %w", abs, err)
+		}
+		fmt.Printf("[iamanager] created default config at %s\n", abs)
+		return cfg, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("could not read config %s: %w", abs, err)
+	}
+
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("invalid config json: %w", err)
+	}
+	cfg.path = abs
+
+	if cfg.Port <= 0 || cfg.Port > 65535 {
+		return nil, fmt.Errorf("invalid port %d in config", cfg.Port)
+	}
+	if cfg.Gateway.Port < 0 || cfg.Gateway.Port > 65535 {
+		return nil, fmt.Errorf("invalid gateway port %d in config", cfg.Gateway.Port)
+	}
+	if cfg.OllamaURL == "" {
+		cfg.OllamaURL = Defaults().OllamaURL
+	}
+	// Normalize testing auto-skip limits: negatives mean disabled.
+	if cfg.Testing.MaxStageTokens < 0 {
+		cfg.Testing.MaxStageTokens = 0
+	}
+	if cfg.Testing.MaxStageSeconds < 0 {
+		cfg.Testing.MaxStageSeconds = 0
+	}
+	cfg.Testing.Mode = NormalizeTestingMode(cfg.Testing.Mode)
+	cfg.Testing.SkipRules = NormalizeSkipRules(cfg.Testing.SkipRules)
+
+	def := Defaults().ChatDefaults
+	if cfg.ChatDefaults.Temperature == nil {
+		cfg.ChatDefaults.Temperature = def.Temperature
+	}
+	if cfg.ChatDefaults.TopK == nil {
+		cfg.ChatDefaults.TopK = def.TopK
+	}
+	if cfg.ChatDefaults.TopP == nil {
+		cfg.ChatDefaults.TopP = def.TopP
+	}
+	if cfg.ChatDefaults.NumCtx == nil {
+		cfg.ChatDefaults.NumCtx = def.NumCtx
+	}
+	// Migrate the legacy no_think boolean into think_level.
+	cfg.ChatDefaults.ThinkLevel = NormalizeThinkLevel(cfg.ChatDefaults.ThinkLevel)
+	if cfg.ChatDefaults.NoThink != nil && *cfg.ChatDefaults.NoThink {
+		cfg.ChatDefaults.ThinkLevel = "off"
+	}
+	cfg.ChatDefaults.NoThink = nil
+	if cfg.ChatDefaults.WebTools == nil {
+		cfg.ChatDefaults.WebTools = def.WebTools
+	}
+	if cfg.ChatDefaults.Artifacts == nil {
+		cfg.ChatDefaults.Artifacts = def.Artifacts
+	}
+	if cfg.ChatDefaults.Skills == nil {
+		cfg.ChatDefaults.Skills = def.Skills
+	}
+	cfg.Skills.Directories = NormalizeSkillDirectories(cfg.Skills.Directories)
+	NormalizeMCPConfig(&cfg.MCP)
+	cfg.ComfyUI = cfg.ComfyUI.Normalize()
+	if cfg.ComfyUI.TimeoutSeconds > 3600 {
+		cfg.ComfyUI.TimeoutSeconds = 3600
+	}
+
+	dirty := false
+	if cfg.SessionSecret == "" {
+		if err := cfg.ensureSecret(); err != nil {
+			return nil, err
+		}
+		dirty = true
+	}
+	if !IsValidLanguage(cfg.Language) {
+		cfg.Language = Defaults().Language
+		dirty = true
+	}
+	if dirty {
+		if err := cfg.Save(); err != nil {
+			return nil, err
+		}
+	}
+
+	return cfg, nil
+}
+
+// Save writes the current config back to disk in pretty JSON.
+func (c *Config) Save() error {
+	if c.path == "" {
+		return errors.New("config has no path")
+	}
+	NormalizeMCPConfig(&c.MCP)
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, c.path)
+}
+
+// Path returns the absolute path of the loaded config file.
+func (c *Config) Path() string { return c.path }
+
+func (c *Config) RAGDirectory() string {
+	dir := strings.TrimSpace(c.RAG.Directory)
+	if dir == "" {
+		dir = "rags"
+	}
+	if filepath.IsAbs(dir) || c.path == "" {
+		return filepath.Clean(dir)
+	}
+	return filepath.Join(filepath.Dir(c.path), dir)
+}
+
+// NormalizeSkillDirectories trims, removes empties, and deduplicates skill
+// directory paths while preserving order. Always returns a non-nil slice.
+func NormalizeSkillDirectories(dirs []string) []string {
+	out := make([]string, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, raw := range dirs {
+		d := strings.TrimSpace(raw)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		out = append(out, d)
+	}
+	return out
+}
+
+// SkillsDirectories returns the cleaned, resolved filesystem paths configured
+// for Agent Skills, deduplicated while preserving order.
+func (c *Config) SkillsDirectories() []string {
+	out := make([]string, 0, len(c.Skills.Directories))
+	seen := make(map[string]bool, len(c.Skills.Directories))
+	home, _ := os.UserHomeDir()
+	baseDir := ""
+	if c.path != "" {
+		baseDir = filepath.Dir(c.path)
+	}
+	for _, raw := range c.Skills.Directories {
+		d := strings.TrimSpace(raw)
+		if d == "" {
+			continue
+		}
+		if d == "~" {
+			if home != "" {
+				d = home
+			}
+		} else if strings.HasPrefix(d, "~/") || strings.HasPrefix(d, "~\\") {
+			if home != "" {
+				d = filepath.Join(home, d[2:])
+			}
+		}
+		var resolved string
+		if filepath.IsAbs(d) || baseDir == "" {
+			resolved = filepath.Clean(d)
+		} else {
+			resolved = filepath.Clean(filepath.Join(baseDir, d))
+		}
+		if seen[resolved] {
+			continue
+		}
+		seen[resolved] = true
+		out = append(out, resolved)
+	}
+	return out
+}
+
+// HasPassword reports whether a password is configured.
+func (c *Config) HasPassword() bool { return c.PasswordHash != "" }
+
+// BindAddress returns the host:port the HTTP server should listen on.
+func (c *Config) BindAddress() string {
+	host := "127.0.0.1"
+	if c.ExposeNetwork {
+		host = "0.0.0.0"
+	}
+	return fmt.Sprintf("%s:%d", host, c.Port)
+}
+
+func (c *Config) ensureSecret() error {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Errorf("could not generate session secret: %w", err)
+	}
+	c.SessionSecret = hex.EncodeToString(buf)
+	return nil
+}

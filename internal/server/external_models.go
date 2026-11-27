@@ -1,0 +1,1380 @@
+package server
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/JulianR87/iAManager/internal/ollama"
+)
+
+// ExternalModelRecord stores metadata and configuration for a remote/external
+// model served via an OpenAI-compatible API (e.g., oMLX, vLLM, LM Studio).
+type ExternalModelRecord struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	URL           string    `json:"url"`
+	APIKey        string    `json:"api_key,omitempty"`
+	Capabilities  []string  `json:"capabilities,omitempty"`
+	Provider      string    `json:"provider,omitempty"`
+	ContextLength int64     `json:"context_length,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	Disabled      bool      `json:"disabled,omitempty"`
+}
+
+type externalModelsFile struct {
+	Models map[string]ExternalModelRecord `json:"models"`
+}
+
+type externalModelsStore struct {
+	path            string
+	mu              sync.RWMutex
+	models          map[string]ExternalModelRecord
+	providerChecked map[string]time.Time
+}
+
+func newExternalModelsStore(path string) *externalModelsStore {
+	return &externalModelsStore{
+		path:            path,
+		models:          make(map[string]ExternalModelRecord),
+		providerChecked: make(map[string]time.Time),
+	}
+}
+
+func (s *externalModelsStore) Load() error {
+	if s.path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var file externalModelsFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		if q := quarantineCorrupt(s.path); q != "" {
+			return fmt.Errorf("external_models: corrupt %s quarantined to %s: %w", s.path, q, err)
+		}
+		return fmt.Errorf("external_models: corrupt %s (quarantine failed): %w", s.path, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if file.Models != nil {
+		s.models = file.Models
+	} else {
+		s.models = make(map[string]ExternalModelRecord)
+	}
+	for k, v := range s.models {
+		if v.ID == "" {
+			v.ID = k
+			s.models[k] = v
+		}
+	}
+	return nil
+}
+
+func (s *externalModelsStore) IsExternal(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if _, ok := s.models[name]; ok {
+		return true
+	}
+	if strings.HasSuffix(name, ":latest") {
+		if _, ok := s.models[strings.TrimSuffix(name, ":latest")]; ok {
+			return true
+		}
+	} else {
+		if _, ok := s.models[name+":latest"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *externalModelsStore) Get(name string) (ExternalModelRecord, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ExternalModelRecord{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if rec, ok := s.models[name]; ok {
+		if rec.ID == "" {
+			rec.ID = name
+		}
+		return rec, true
+	}
+	if strings.HasSuffix(name, ":latest") {
+		trimmed := strings.TrimSuffix(name, ":latest")
+		if rec, ok := s.models[trimmed]; ok {
+			if rec.ID == "" {
+				rec.ID = trimmed
+			}
+			return rec, true
+		}
+	} else {
+		withLatest := name + ":latest"
+		if rec, ok := s.models[withLatest]; ok {
+			if rec.ID == "" {
+				rec.ID = withLatest
+			}
+			return rec, true
+		}
+	}
+	return ExternalModelRecord{}, false
+}
+
+var (
+	errExternalNotFound     = errors.New("external model not found")
+	errExternalPairConflict = errors.New("another external model already uses this name and endpoint")
+)
+
+const maskedAPIKey = "••••••••"
+
+func sameExternalPair(nameA, urlA, nameB, urlB string) bool {
+	return strings.TrimSpace(nameA) == strings.TrimSpace(nameB) &&
+		normalizeOpenAIEndpoint(urlA) == normalizeOpenAIEndpoint(urlB)
+}
+
+func (s *externalModelsStore) allocateID(name, targetURL string) string {
+	if _, ok := s.models[name]; !ok {
+		return name
+	}
+	sum := sha256.Sum256([]byte(normalizeOpenAIEndpoint(targetURL)))
+	base := name + "@ext-" + hex.EncodeToString(sum[:])[:12]
+	if _, ok := s.models[base]; !ok {
+		return base
+	}
+	for i := 1; ; i++ {
+		cand := fmt.Sprintf("%s-%d", base, i)
+		if _, ok := s.models[cand]; !ok {
+			return cand
+		}
+	}
+}
+
+func (s *externalModelsStore) findPair(name, targetURL string) (ExternalModelRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	k, ok := s.findPairLocked(name, targetURL)
+	if !ok {
+		return ExternalModelRecord{}, false
+	}
+	return s.models[k], true
+}
+
+func (s *externalModelsStore) validateUpsert(id, name, targetURL string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, exists := s.resolveKeyLocked(id)
+	if !exists {
+		return errExternalNotFound
+	}
+	if owner, clash := s.findPairLocked(name, targetURL); clash && owner != key {
+		return errExternalPairConflict
+	}
+	return nil
+}
+
+func (s *externalModelsStore) resolveKeyLocked(id string) (string, bool) {
+	if _, ok := s.models[id]; ok {
+		return id, true
+	}
+	if strings.HasSuffix(id, ":latest") {
+		trimmed := strings.TrimSuffix(id, ":latest")
+		if _, ok := s.models[trimmed]; ok {
+			return trimmed, true
+		}
+		return "", false
+	}
+	if _, ok := s.models[id+":latest"]; ok {
+		return id + ":latest", true
+	}
+	return "", false
+}
+
+func (s *externalModelsStore) findPairLocked(name, targetURL string) (string, bool) {
+	for k, v := range s.models {
+		if sameExternalPair(v.Name, v.URL, name, targetURL) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+func (s *externalModelsStore) Register(name, targetURL, apiKey string, capabilities []string, disabled bool) error {
+	_, err := s.Upsert("", name, targetURL, apiKey, capabilities, disabled, "")
+	return err
+}
+
+func (s *externalModelsStore) Upsert(id, name, targetURL, apiKey string, capabilities []string, disabled bool, provider string) (ExternalModelRecord, error) {
+	name = strings.TrimSpace(name)
+	targetURL = strings.TrimSpace(targetURL)
+	apiKey = strings.TrimSpace(apiKey)
+	id = strings.TrimSpace(id)
+	if name == "" {
+		return ExternalModelRecord{}, errors.New("missing model name")
+	}
+	if targetURL == "" {
+		return ExternalModelRecord{}, errors.New("missing model endpoint URL")
+	}
+	if len(capabilities) == 0 {
+		capabilities = []string{"completion", "tools", "thinking"}
+	}
+	if apiKey == maskedAPIKey {
+		apiKey = ""
+	}
+
+	s.mu.Lock()
+	var key string
+	var rec ExternalModelRecord
+	var exists bool
+	if id != "" {
+		key, exists = s.resolveKeyLocked(id)
+		if !exists {
+			s.mu.Unlock()
+			return ExternalModelRecord{}, errExternalNotFound
+		}
+		rec = s.models[key]
+		if owner, clash := s.findPairLocked(name, targetURL); clash && owner != key {
+			s.mu.Unlock()
+			return ExternalModelRecord{}, errExternalPairConflict
+		}
+	} else {
+		if owner, ok := s.findPairLocked(name, targetURL); ok {
+			key = owner
+			rec = s.models[key]
+			exists = true
+		} else {
+			key = s.allocateID(name, targetURL)
+		}
+	}
+
+	fieldsChanged := !exists || rec.Name != name || rec.URL != targetURL || (apiKey != "" && rec.APIKey != apiKey)
+	if apiKey == "" && exists && normalizeOpenAIEndpoint(rec.URL) == normalizeOpenAIEndpoint(targetURL) {
+		apiKey = rec.APIKey
+	}
+	rec.ID = key
+	rec.Name = name
+	rec.URL = targetURL
+	rec.APIKey = apiKey
+	rec.Capabilities = capabilities
+	rec.Disabled = disabled
+	if fieldsChanged {
+		rec.Provider = provider
+		// A new name/URL/api key targets a possibly different model: drop the
+		// cached context window so RefreshProviders re-probes it.
+		rec.ContextLength = 0
+		delete(s.providerChecked, key)
+	} else if provider != "" {
+		rec.Provider = provider
+	}
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	s.models[key] = rec
+	s.mu.Unlock()
+
+	if err := s.save(); err != nil {
+		return ExternalModelRecord{}, err
+	}
+	return rec, nil
+}
+
+// SetContextLength records the advertised context window for an existing model.
+// Non-positive values are ignored so a failed probe never clears a good value.
+func (s *externalModelsStore) SetContextLength(id string, n int64) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	key, ok := s.resolveKeyLocked(id)
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	rec := s.models[key]
+	if rec.ContextLength == n {
+		s.mu.Unlock()
+		return
+	}
+	rec.ContextLength = n
+	s.models[key] = rec
+	s.mu.Unlock()
+	_ = s.save()
+}
+
+func (s *externalModelsStore) ToggleDisabled(name string) (bool, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false, errors.New("missing model name")
+	}
+	s.mu.Lock()
+	rec, exists := s.models[name]
+	targetKey := name
+	if !exists && strings.HasSuffix(name, ":latest") {
+		targetKey = strings.TrimSuffix(name, ":latest")
+		rec, exists = s.models[targetKey]
+	}
+	if !exists {
+		s.mu.Unlock()
+		return false, errors.New("external model not found")
+	}
+	rec.Disabled = !rec.Disabled
+	s.models[targetKey] = rec
+	newDisabled := rec.Disabled
+	s.mu.Unlock()
+
+	if err := s.save(); err != nil {
+		return false, err
+	}
+	return newDisabled, nil
+}
+
+func (s *externalModelsStore) Unregister(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	s.mu.Lock()
+	existed := false
+	if _, ok := s.models[name]; ok {
+		delete(s.models, name)
+		delete(s.providerChecked, name)
+		existed = true
+	} else if strings.HasSuffix(name, ":latest") {
+		trimmed := strings.TrimSuffix(name, ":latest")
+		if _, ok := s.models[trimmed]; ok {
+			delete(s.models, trimmed)
+			delete(s.providerChecked, trimmed)
+			existed = true
+		}
+	} else {
+		withLatest := name + ":latest"
+		if _, ok := s.models[withLatest]; ok {
+			delete(s.models, withLatest)
+			delete(s.providerChecked, withLatest)
+			existed = true
+		}
+	}
+	s.mu.Unlock()
+
+	if !existed {
+		return nil
+	}
+	return s.save()
+}
+
+func (s *externalModelsStore) All() map[string]ExternalModelRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]ExternalModelRecord, len(s.models))
+	for k, v := range s.models {
+		res[k] = v
+	}
+	return res
+}
+
+func (s *externalModelsStore) save() error {
+	if s.path == "" {
+		return nil
+	}
+	// Full write lock for the whole snapshot+write: concurrent saves share
+	// the same ".tmp" file, so they must serialize (last writer wins, but
+	// the file on disk is always complete and valid).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	file := externalModelsFile{
+		Models: make(map[string]ExternalModelRecord, len(s.models)),
+	}
+	for k, v := range s.models {
+		file.Models[k] = v
+	}
+
+	return writeJSONFileAtomic(s.path, file, 0o600)
+}
+
+// ---------- OpenAI API Protocol Types ----------
+
+type openAIChatRequest struct {
+	Model              string               `json:"model"`
+	Messages           []openAIMessage      `json:"messages"`
+	Stream             bool                 `json:"stream"`
+	Temperature        *float64             `json:"temperature,omitempty"`
+	TopP               *float64             `json:"top_p,omitempty"`
+	TopK               *int                 `json:"top_k,omitempty"`
+	MaxTokens          *int                 `json:"max_tokens,omitempty"`
+	Stop               any                  `json:"stop,omitempty"`
+	FrequencyPenalty   *float64             `json:"frequency_penalty,omitempty"`
+	PresencePenalty    *float64             `json:"presence_penalty,omitempty"`
+	ReasoningEffort    string               `json:"reasoning_effort,omitempty"`
+	EnableThinking     *bool                `json:"enable_thinking,omitempty"`
+	ChatTemplateKwargs map[string]any       `json:"chat_template_kwargs,omitempty"`
+	Thinking           any                  `json:"thinking,omitempty"`
+	Tools              any                  `json:"tools,omitempty"`
+	StreamOptions      *openAIStreamOptions `json:"stream_options,omitempty"`
+}
+
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+type openAIMessage struct {
+	Role             string           `json:"role"`
+	Content          any              `json:"content"` // string or []openAIContentPart
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ToolCalls        []openAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+}
+
+type openAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *openAIImageURL `json:"image_url,omitempty"`
+}
+
+type openAIImageURL struct {
+	URL string `json:"url"`
+}
+
+type openAITool struct {
+	Type     string         `json:"type"`
+	Function openAIFunction `json:"function"`
+}
+
+type openAIFunction struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+type openAIToolCall struct {
+	Index    int                `json:"index,omitempty"`
+	ID       string             `json:"id,omitempty"`
+	Type     string             `json:"type,omitempty"`
+	Function openAIFunctionCall `json:"function"`
+}
+
+type openAIFunctionCall struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
+}
+
+type openAIChatCompletionChunk struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Index int `json:"index"`
+		Delta struct {
+			Role             string           `json:"role"`
+			Content          string           `json:"content"`
+			ReasoningContent string           `json:"reasoning_content"`
+			Reasoning        string           `json:"reasoning"`
+			ToolCalls        []openAIToolCall `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+type openAIChatCompletionResponse struct {
+	ID      string `json:"id"`
+	Choices []struct {
+		Message struct {
+			Role             string           `json:"role"`
+			Content          string           `json:"content"`
+			ReasoningContent string           `json:"reasoning_content"`
+			ToolCalls        []openAIToolCall `json:"tool_calls"`
+		} `json:"message"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    any    `json:"code"`
+	} `json:"error,omitempty"`
+}
+
+func normalizeOpenAIEndpoint(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	rawURL = strings.TrimRight(rawURL, "/")
+	if strings.HasSuffix(rawURL, "/chat/completions") {
+		return rawURL
+	}
+	if strings.HasSuffix(rawURL, "/v1") {
+		return rawURL + "/chat/completions"
+	}
+	if strings.Contains(rawURL, "/v1/") {
+		return rawURL + "/chat/completions"
+	}
+	return rawURL + "/v1/chat/completions"
+}
+
+// ---------- Capability Probing ----------
+
+// ExternalModelProbeResult details the test and detected capabilities.
+type ExternalModelProbeResult struct {
+	Connected    bool     `json:"connected"`
+	Vision       bool     `json:"vision"`
+	Tools        bool     `json:"tools"`
+	Thinking     bool     `json:"thinking"`
+	Capabilities []string `json:"capabilities"`
+	Model        string   `json:"model"`
+	Provider     string   `json:"provider,omitempty"`
+	MaxContext   int64    `json:"max_context,omitempty"`
+	LatencyMs    int64    `json:"latency_ms"`
+	Message      string   `json:"message,omitempty"`
+}
+
+// ProbeExternalModel runs test probes against an OpenAI-compatible endpoint.
+func ProbeExternalModel(ctx context.Context, targetURL, apiKey, modelName string) (*ExternalModelProbeResult, error) {
+	targetURL = strings.TrimSpace(targetURL)
+	apiKey = strings.TrimSpace(apiKey)
+	modelName = strings.TrimSpace(modelName)
+	if targetURL == "" {
+		return nil, errors.New("URL de endpoint requerida")
+	}
+	if modelName == "" {
+		return nil, errors.New("Nombre del modelo requerido")
+	}
+
+	endpoint := normalizeOpenAIEndpoint(targetURL)
+	httpClient := &http.Client{Timeout: 20 * time.Second}
+
+	start := time.Now()
+
+	// 1. Completion & Thinking probe via streaming (faster and captures reasoning_content deltas)
+	baseReq := openAIChatRequest{
+		Model: modelName,
+		Messages: []openAIMessage{
+			{Role: "user", Content: "Hi"},
+		},
+		Stream: true,
+		MaxTokens: func() *int {
+			v := 30
+			return &v
+		}(),
+	}
+
+	bodyBytes, err := json.Marshal(baseReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		if strings.HasSuffix(endpoint, "/v1/chat/completions") {
+			altEndpoint := strings.TrimSuffix(endpoint, "/v1/chat/completions") + "/chat/completions"
+			req2, err2 := http.NewRequestWithContext(ctx, http.MethodPost, altEndpoint, bytes.NewReader(bodyBytes))
+			if err2 == nil {
+				req2.Header.Set("Content-Type", "application/json")
+				req2.Header.Set("Accept", "text/event-stream")
+				if apiKey != "" {
+					req2.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				if resp2, err3 := httpClient.Do(req2); err3 == nil {
+					resp = resp2
+					endpoint = altEndpoint
+					err = nil
+				}
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("no se pudo conectar con %s: %w", targetURL, err)
+		}
+	}
+	defer resp.Body.Close()
+
+	respBodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errObj openAIChatCompletionResponse
+		_ = json.Unmarshal(respBodyBytes, &errObj)
+		if errObj.Error != nil && errObj.Error.Message != "" {
+			return nil, fmt.Errorf("error del servidor (%d): %s", resp.StatusCode, errObj.Error.Message)
+		}
+		return nil, fmt.Errorf("error del servidor (código HTTP %d): %s", resp.StatusCode, string(respBodyBytes))
+	}
+
+	latency := time.Since(start).Milliseconds()
+	connected := true
+	thinking := false
+	var fullText strings.Builder
+
+	// 1. Try parsing as standard JSON response first (if server returns JSON instead of SSE)
+	var directResp openAIChatCompletionResponse
+	if err := json.Unmarshal(respBodyBytes, &directResp); err == nil && len(directResp.Choices) > 0 {
+		msg := directResp.Choices[0].Message
+		if msg.ReasoningContent != "" || strings.Contains(msg.Content, "<think>") || strings.Contains(msg.Content, "Thinking Process:") {
+			thinking = true
+		}
+		fullText.WriteString(msg.Content)
+	} else {
+		// 2. Parse as SSE stream
+		scanner := bufio.NewScanner(bytes.NewReader(respBodyBytes))
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data == "[DONE]" {
+				break
+			}
+			var chunk openAIChatCompletionChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err == nil && len(chunk.Choices) > 0 {
+				d := chunk.Choices[0].Delta
+				if d.ReasoningContent != "" || d.Reasoning != "" {
+					thinking = true
+				}
+				if d.Content != "" {
+					fullText.WriteString(d.Content)
+				}
+			}
+		}
+	}
+
+	acc := fullText.String()
+	if strings.Contains(acc, "<think>") || strings.Contains(acc, "Thinking Process:") || strings.Contains(acc, "thinking process:") {
+		thinking = true
+	}
+
+	lowerName := strings.ToLower(modelName)
+	if !thinking && (strings.Contains(lowerName, "r1") || strings.Contains(lowerName, "qwen3") || strings.Contains(lowerName, "qwen") || strings.Contains(lowerName, "thinking") || strings.Contains(lowerName, "reason")) {
+		thinking = true
+	}
+
+	// Run Vision & Tools probes in parallel
+	var wg sync.WaitGroup
+	vision := false
+	tools := true
+
+	wg.Add(2)
+
+	// 2. Vision probe
+	go func() {
+		defer wg.Done()
+		const tinyPngBase64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAA="
+		visionReq := openAIChatRequest{
+			Model: modelName,
+			Messages: []openAIMessage{
+				{
+					Role: "user",
+					Content: []openAIContentPart{
+						{Type: "text", Text: "describe"},
+						{Type: "image_url", ImageURL: &openAIImageURL{URL: tinyPngBase64}},
+					},
+				},
+			},
+			Stream: false,
+			MaxTokens: func() *int {
+				v := 2
+				return &v
+			}(),
+		}
+		if vBytes, vErr := json.Marshal(visionReq); vErr == nil {
+			if vHttpReq, vHttpErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(vBytes)); vHttpErr == nil {
+				vHttpReq.Header.Set("Content-Type", "application/json")
+				if apiKey != "" {
+					vHttpReq.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				vClient := &http.Client{Timeout: 15 * time.Second}
+				if vResp, vDoErr := vClient.Do(vHttpReq); vDoErr == nil {
+					defer vResp.Body.Close()
+					if vResp.StatusCode == http.StatusOK {
+						vision = true
+					}
+				}
+			}
+		}
+		if !vision && (strings.Contains(lowerName, "qwen3") || strings.Contains(lowerName, "qwen") || strings.Contains(lowerName, "vision") || strings.Contains(lowerName, "vl") || strings.Contains(lowerName, "omni") || strings.Contains(lowerName, "gpt-4o")) {
+			vision = true
+		}
+	}()
+
+	// 3. Tools probe
+	go func() {
+		defer wg.Done()
+		toolsReq := openAIChatRequest{
+			Model: modelName,
+			Messages: []openAIMessage{
+				{Role: "user", Content: "use tool"},
+			},
+			Tools: []openAITool{
+				{
+					Type: "function",
+					Function: openAIFunction{
+						Name:        "probe_test",
+						Description: "A test function",
+						Parameters:  map[string]any{"type": "object", "properties": map[string]any{"arg": map[string]any{"type": "string"}}},
+					},
+				},
+			},
+			Stream: false,
+			MaxTokens: func() *int {
+				v := 2
+				return &v
+			}(),
+		}
+		if tBytes, tErr := json.Marshal(toolsReq); tErr == nil {
+			if tHttpReq, tHttpErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(tBytes)); tHttpErr == nil {
+				tHttpReq.Header.Set("Content-Type", "application/json")
+				if apiKey != "" {
+					tHttpReq.Header.Set("Authorization", "Bearer "+apiKey)
+				}
+				tClient := &http.Client{Timeout: 15 * time.Second}
+				if tResp, tDoErr := tClient.Do(tHttpReq); tDoErr == nil {
+					defer tResp.Body.Close()
+					if tResp.StatusCode == http.StatusOK {
+						tools = true
+					}
+				}
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	caps := []string{"completion"}
+	if vision {
+		caps = append(caps, "vision")
+	}
+	if thinking {
+		caps = append(caps, "thinking")
+	}
+	if tools {
+		caps = append(caps, "tools")
+	}
+
+	info := fetchExternalListingInfo(ctx, endpoint, apiKey, modelName)
+
+	return &ExternalModelProbeResult{
+		Connected:    connected,
+		Vision:       vision,
+		Tools:        tools,
+		Thinking:     thinking,
+		Capabilities: caps,
+		Model:        modelName,
+		Provider:     info.Provider,
+		MaxContext:   info.MaxContext,
+		LatencyMs:    latency,
+	}, nil
+}
+
+func canonicalProviderLabel(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" || strings.EqualFold(v, "system") {
+		return ""
+	}
+	if strings.EqualFold(v, "omlx") {
+		return "oMLX"
+	}
+	return v
+}
+
+func externalModelsEndpoint(normalizedEndpoint string) string {
+	return strings.TrimSuffix(normalizedEndpoint, "/chat/completions") + "/models"
+}
+
+// externalListingInfo captures provider and context metadata discovered from a
+// GET /v1/models listing. Zero values mean "not advertised".
+type externalListingInfo struct {
+	Provider   string
+	MaxContext int64
+}
+
+// fetchExternalListingInfo queries the OpenAI-compatible /models endpoint and
+// extracts the provider label and context window advertised for modelName.
+// Only an exact id match is honored; unknown servers simply yield zero values.
+func fetchExternalListingInfo(ctx context.Context, normalizedEndpoint, apiKey, modelName string) externalListingInfo {
+	modelsURL := externalModelsEndpoint(normalizedEndpoint)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL, nil)
+	if err != nil {
+		return externalListingInfo{}
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return externalListingInfo{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return externalListingInfo{}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return externalListingInfo{}
+	}
+	var listing struct {
+		Data []struct {
+			ID               string `json:"id"`
+			OwnedBy          string `json:"owned_by"`
+			MaxModelLen      int64  `json:"max_model_len"`
+			MaxContextLength int64  `json:"max_context_length"`
+			ContextLength    int64  `json:"context_length"`
+			Nctx             int64  `json:"n_ctx"`
+			Meta             struct {
+				Nctx int64 `json:"n_ctx"`
+			} `json:"meta"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &listing); err != nil {
+		return externalListingInfo{}
+	}
+	for _, m := range listing.Data {
+		if m.ID != modelName {
+			continue
+		}
+		maxCtx := m.MaxModelLen
+		if maxCtx == 0 {
+			maxCtx = m.MaxContextLength
+		}
+		if maxCtx == 0 {
+			maxCtx = m.ContextLength
+		}
+		if maxCtx == 0 {
+			maxCtx = m.Nctx
+		}
+		if maxCtx == 0 {
+			maxCtx = m.Meta.Nctx
+		}
+		return externalListingInfo{
+			Provider:   canonicalProviderLabel(m.OwnedBy),
+			MaxContext: maxCtx,
+		}
+	}
+	return externalListingInfo{}
+}
+
+// detectExternalProvider returns only the provider label for a model, keeping
+// the historical single-value signature used by callers and tests.
+func detectExternalProvider(ctx context.Context, normalizedEndpoint, apiKey, modelName string) string {
+	return fetchExternalListingInfo(ctx, normalizedEndpoint, apiKey, modelName).Provider
+}
+
+func (s *externalModelsStore) RefreshProviders(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	type target struct {
+		key string
+		rec ExternalModelRecord
+	}
+	var targets []target
+	now := time.Now()
+	s.mu.Lock()
+	for k, v := range s.models {
+		if v.Provider != "" && v.ContextLength > 0 {
+			continue
+		}
+		if last, ok := s.providerChecked[k]; ok && now.Sub(last) < 5*time.Minute {
+			continue
+		}
+		s.providerChecked[k] = now
+		targets = append(targets, target{key: k, rec: v})
+	}
+	s.mu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, 4)
+	var wg sync.WaitGroup
+	changed := false
+	for _, tgt := range targets {
+		tgt := tgt
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			info := fetchExternalListingInfo(ctx, normalizeOpenAIEndpoint(tgt.rec.URL), tgt.rec.APIKey, tgt.rec.Name)
+			if info.Provider == "" && info.MaxContext <= 0 {
+				return
+			}
+			s.mu.Lock()
+			if cur, ok := s.models[tgt.key]; ok &&
+				cur.Name == tgt.rec.Name && cur.URL == tgt.rec.URL && cur.APIKey == tgt.rec.APIKey {
+				dirty := false
+				if cur.Provider == "" && info.Provider != "" {
+					cur.Provider = info.Provider
+					dirty = true
+				}
+				if cur.ContextLength <= 0 && info.MaxContext > 0 {
+					cur.ContextLength = info.MaxContext
+					dirty = true
+				}
+				if dirty {
+					s.models[tgt.key] = cur
+					changed = true
+				}
+			}
+			s.mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if changed {
+		_ = s.save()
+	}
+}
+
+// ---------- Streaming Chat Client ----------
+
+func (s *Server) chatExternal(ctx context.Context, ext ExternalModelRecord, req ollama.ChatRequest, onChunk func(ollama.ChatChunk) error) error {
+	endpoint := normalizeOpenAIEndpoint(ext.URL)
+
+	// Translate messages
+	var openAIMsgs []openAIMessage
+	for _, m := range req.Messages {
+		var content any = m.Content
+		if len(m.Images) > 0 {
+			var parts []openAIContentPart
+			if m.Content != "" {
+				parts = append(parts, openAIContentPart{Type: "text", Text: m.Content})
+			}
+			for _, img := range m.Images {
+				dataURI := img
+				if !strings.HasPrefix(dataURI, "data:") {
+					dataURI = "data:image/png;base64," + img
+				}
+				parts = append(parts, openAIContentPart{
+					Type:     "image_url",
+					ImageURL: &openAIImageURL{URL: dataURI},
+				})
+			}
+			content = parts
+		}
+
+		var toolCalls []openAIToolCall
+		for idx, tc := range m.ToolCalls {
+			toolCalls = append(toolCalls, openAIToolCall{
+				Index: idx,
+				ID:    tc.Function.Name + fmt.Sprintf("_%d", idx),
+				Type:  "function",
+				Function: openAIFunctionCall{
+					Name:      tc.Function.Name,
+					Arguments: string(tc.Function.Arguments),
+				},
+			})
+		}
+
+		openAIMsgs = append(openAIMsgs, openAIMessage{
+			Role:             m.Role,
+			Content:          content,
+			ReasoningContent: m.Thinking,
+			ToolCalls:        toolCalls,
+		})
+	}
+
+	payload := openAIChatRequest{
+		Model:         ext.Name,
+		Messages:      openAIMsgs,
+		Stream:        true,
+		Tools:         req.Tools,
+		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
+	}
+
+	if req.Think != nil {
+		lvl := string(*req.Think)
+		switch lvl {
+		case "off":
+			disabled := false
+			payload.EnableThinking = &disabled
+			payload.ReasoningEffort = "none"
+			payload.ChatTemplateKwargs = map[string]any{
+				"enable_thinking":  false,
+				"reasoning_effort": "none",
+			}
+			payload.Thinking = map[string]any{
+				"type":          "disabled",
+				"budget_tokens": 0,
+			}
+		case "low":
+			enabled := true
+			payload.EnableThinking = &enabled
+			payload.ReasoningEffort = "low"
+			payload.ChatTemplateKwargs = map[string]any{
+				"enable_thinking":  true,
+				"reasoning_effort": "low",
+			}
+			payload.Thinking = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": 2048,
+			}
+		case "medium":
+			enabled := true
+			payload.EnableThinking = &enabled
+			payload.ReasoningEffort = "medium"
+			payload.ChatTemplateKwargs = map[string]any{
+				"enable_thinking":  true,
+				"reasoning_effort": "medium",
+			}
+			payload.Thinking = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": 8192,
+			}
+		case "high":
+			enabled := true
+			payload.EnableThinking = &enabled
+			payload.ReasoningEffort = "high"
+			payload.ChatTemplateKwargs = map[string]any{
+				"enable_thinking":  true,
+				"reasoning_effort": "high",
+			}
+			payload.Thinking = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": 24576,
+			}
+		case "max":
+			enabled := true
+			payload.EnableThinking = &enabled
+			payload.ReasoningEffort = "high"
+			payload.ChatTemplateKwargs = map[string]any{
+				"enable_thinking":  true,
+				"reasoning_effort": "xhigh",
+			}
+			payload.Thinking = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": 65536,
+			}
+		}
+	}
+
+	if req.Options != nil {
+		if v, ok := req.Options["temperature"].(float64); ok {
+			payload.Temperature = &v
+		}
+		if v, ok := req.Options["top_p"].(float64); ok {
+			payload.TopP = &v
+		}
+		if v, ok := req.Options["top_k"].(float64); ok && v > 0 {
+			vi := int(v)
+			payload.TopK = &vi
+		} else if v, ok := req.Options["top_k"].(int); ok && v > 0 {
+			payload.TopK = &v
+		}
+		if v, ok := req.Options["num_predict"].(float64); ok && v > 0 {
+			vi := int(v)
+			payload.MaxTokens = &vi
+		} else if v, ok := req.Options["max_tokens"].(float64); ok && v > 0 {
+			vi := int(v)
+			payload.MaxTokens = &vi
+		}
+		if v, ok := req.Options["stop"]; ok && v != nil {
+			payload.Stop = v
+		}
+		if v, ok := req.Options["presence_penalty"].(float64); ok {
+			payload.PresencePenalty = &v
+		}
+		if v, ok := req.Options["frequency_penalty"].(float64); ok {
+			payload.FrequencyPenalty = &v
+		} else if v, ok := req.Options["repeat_penalty"].(float64); ok && v > 1.0 {
+			// Convert repeat_penalty (~1.1) to frequency_penalty (~0.1-0.2)
+			fp := (v - 1.0) * 2.0
+			payload.FrequencyPenalty = &fp
+		}
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if ext.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+ext.APIKey)
+	}
+
+	httpClient := &http.Client{}
+	doPost := func(url string, body []byte) (*http.Response, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Accept", "text/event-stream")
+		if ext.APIKey != "" {
+			r.Header.Set("Authorization", "Bearer "+ext.APIKey)
+		}
+		return httpClient.Do(r)
+	}
+	resp, err := doPost(endpoint, bodyBytes)
+	if err != nil {
+		// Try without /v1/ fallback
+		if strings.HasSuffix(endpoint, "/v1/chat/completions") {
+			altEndpoint := strings.TrimSuffix(endpoint, "/v1/chat/completions") + "/chat/completions"
+			if resp2, err3 := doPost(altEndpoint, bodyBytes); err3 == nil {
+				resp = resp2
+				endpoint = altEndpoint
+				err = nil
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("error al conectar con modelo externo (%s): %w", ext.URL, err)
+		}
+	}
+	// Some OpenAI-compatible servers (oMLX, LM Studio, older vLLM) reject
+	// extended thinking/reasoning params with 400. Retry once with a minimal
+	// payload so bench works against strict servers.
+	if resp.StatusCode >= 400 && (payload.EnableThinking != nil || payload.ReasoningEffort != "" || payload.Thinking != nil || payload.ChatTemplateKwargs != nil || payload.TopK != nil || payload.StreamOptions != nil) {
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		minimal := openAIChatRequest{
+			Model:       payload.Model,
+			Messages:    payload.Messages,
+			Stream:      true,
+			Temperature: payload.Temperature,
+			TopP:        payload.TopP,
+			MaxTokens:   payload.MaxTokens,
+			Stop:        payload.Stop,
+			Tools:       payload.Tools,
+		}
+		if minBytes, mErr := json.Marshal(minimal); mErr == nil {
+			if resp2, err2 := doPost(endpoint, minBytes); err2 == nil {
+				resp = resp2
+			}
+		}
+	}
+	if resp.StatusCode >= 400 {
+		errBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		var errObj openAIChatCompletionResponse
+		_ = json.Unmarshal(errBytes, &errObj)
+		if errObj.Error != nil && errObj.Error.Message != "" {
+			return fmt.Errorf("error del modelo externo (%d): %s", resp.StatusCode, errObj.Error.Message)
+		}
+		return fmt.Errorf("error del modelo externo (HTTP %d): %s", resp.StatusCode, string(errBytes))
+	}
+	defer resp.Body.Close()
+
+	// Tool calls aggregation accumulator
+	toolCallsAcc := make(map[int]*ollama.ToolCall)
+
+	scanner := bufio.NewScanner(resp.Body)
+	// Larger buffer for large completions or image responses
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	var lastUsagePromptTokens, lastUsageCompletionTokens int
+	var totalContentLen int
+	var lastFinishReason string
+	var rawFallback strings.Builder
+
+	for scanner.Scan() {
+		rawLine := scanner.Text()
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		if !strings.HasPrefix(line, "data:") {
+			// Keep non-SSE lines: some servers ignore stream:true and
+			// return a single JSON chat-completion object instead.
+			rawFallback.WriteString(rawLine)
+			rawFallback.WriteByte('\n')
+			continue
+		}
+
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk openAIChatCompletionChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		if chunk.Usage != nil {
+			lastUsagePromptTokens = chunk.Usage.PromptTokens
+			lastUsageCompletionTokens = chunk.Usage.CompletionTokens
+		}
+
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		choice := chunk.Choices[0]
+		delta := choice.Delta
+
+		// Parse reasoning delta
+		thinkingDelta := delta.ReasoningContent
+		if thinkingDelta == "" {
+			thinkingDelta = delta.Reasoning
+		}
+		totalContentLen += len(delta.Content) + len(thinkingDelta)
+
+		// Parse tool calls delta
+		var emittedToolCalls []ollama.ToolCall
+		for _, tc := range delta.ToolCalls {
+			idx := tc.Index
+			acc, exists := toolCallsAcc[idx]
+			if !exists {
+				acc = &ollama.ToolCall{
+					Type: "function",
+				}
+				acc.Function.Name = tc.Function.Name
+				acc.Function.Index = idx
+				toolCallsAcc[idx] = acc
+			}
+			if tc.Function.Name != "" {
+				acc.Function.Name = tc.Function.Name
+			}
+			if tc.Function.Arguments != "" {
+				acc.Function.Arguments = append(acc.Function.Arguments, []byte(tc.Function.Arguments)...)
+			}
+			emittedToolCalls = append(emittedToolCalls, *acc)
+		}
+
+		outChunk := ollama.ChatChunk{
+			Model:     req.Model,
+			CreatedAt: time.Now().UTC(),
+			Done:      false,
+			Message: ollama.ChatMessage{
+				Role:      "assistant",
+				Content:   delta.Content,
+				Thinking:  thinkingDelta,
+				ToolCalls: emittedToolCalls,
+			},
+		}
+
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			outChunk.DoneReason = *choice.FinishReason
+			lastFinishReason = *choice.FinishReason
+		}
+
+		if err := onChunk(outChunk); err != nil {
+			return err
+		}
+	}
+
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("error leyendo stream: %w", err)
+	}
+
+	if lastFinishReason == "error" && totalContentLen == 0 {
+		return fmt.Errorf("el servidor del modelo externo (%s) reportó un error al procesar la solicitud (finish_reason: error)", ext.Name)
+	}
+
+	// Fallback: server returned plain JSON instead of SSE (stream ignored).
+	if totalContentLen == 0 && len(toolCallsAcc) == 0 {
+		if raw := strings.TrimSpace(rawFallback.String()); raw != "" {
+			var directResp openAIChatCompletionResponse
+			if err := json.Unmarshal([]byte(raw), &directResp); err == nil && len(directResp.Choices) > 0 {
+				msg := directResp.Choices[0].Message
+				if msg.Content != "" || len(msg.ToolCalls) > 0 || msg.ReasoningContent != "" {
+					var emitted []ollama.ToolCall
+					for idx, tc := range msg.ToolCalls {
+						tc2 := ollama.ToolCall{Type: "function"}
+						tc2.Function.Name = tc.Function.Name
+						tc2.Function.Index = idx
+						tc2.Function.Arguments = json.RawMessage(tc.Function.Arguments)
+						emitted = append(emitted, tc2)
+					}
+					_ = onChunk(ollama.ChatChunk{
+						Model:     req.Model,
+						CreatedAt: time.Now().UTC(),
+						Done:      false,
+						Message: ollama.ChatMessage{
+							Role:      "assistant",
+							Content:   msg.Content,
+							Thinking:  msg.ReasoningContent,
+							ToolCalls: emitted,
+						},
+					})
+					totalContentLen += len(msg.Content) + len(msg.ReasoningContent)
+				}
+			}
+		}
+	}
+
+	// Emit final done chunk
+	finalChunk := ollama.ChatChunk{
+		Model:           req.Model,
+		CreatedAt:       time.Now().UTC(),
+		Done:            true,
+		PromptEvalCount: lastUsagePromptTokens,
+		EvalCount:       lastUsageCompletionTokens,
+	}
+
+	return onChunk(finalChunk)
+}
+
+// chatWithModel dispatches a chat request to either an external model or Ollama.
+func (s *Server) chatWithModel(ctx context.Context, req ollama.ChatRequest, onChunk func(ollama.ChatChunk) error) error {
+	if s.externalModels != nil && s.externalModels.IsExternal(req.Model) {
+		rec, _ := s.externalModels.Get(req.Model)
+		return s.chatExternal(ctx, rec, req, onChunk)
+	}
+	return s.ollama.Chat(ctx, req, onChunk)
+}
+
+// cleanURLDisplay removes credentials/secrets for safe UI display.
+func cleanURLDisplay(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	u.User = nil
+	return u.String()
+}

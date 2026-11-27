@@ -1,0 +1,352 @@
+"use strict";
+
+// ---------- analytics ----------
+
+const ANALYTICS_FILTER_KEY = "ollamaMgr.analyticsFilters";
+let analyticsAllData = [];
+let analyticsFilters = { name: "", device: "current", source: "all", paramsMin: "", paramsMax: "", tpsMin: "", family: "all", type: "all", scope: "all" };
+try {
+  const saved = JSON.parse(localStorage.getItem(ANALYTICS_FILTER_KEY) || "null");
+  if (saved) analyticsFilters = Object.assign(analyticsFilters, saved);
+} catch { }
+
+async function renderAnalytics() {
+  const countEl = $("analytics-count");
+  const charts = ["tps", "size", "efficiency", "coldload"].map((k) => $(`analytics-chart-${k}`));
+  if (charts.every((c) => !c)) return;
+  try {
+    const selectedDevice = analyticsFilters.device || "current";
+    const query = selectedDevice && selectedDevice !== "current" ? "?device=" + encodeURIComponent(selectedDevice) : "";
+    const data = await api("/api/models" + query);
+
+    // Manage device filter: only show when more than 1 distinct device exists
+    populateAnalyticsDeviceFilter(data.devices || [], data.current_device_id || "");
+
+    // Archived, custom, and external models must not influence analytics or comparison filters.
+    // Custom models have their stats attributed directly to their base models.
+    const installed = (data.models || []).filter((m) => !m.archived && !m.is_custom && !m.is_external);
+    const ghosts = (data.ghost_models || []).filter((m) => !m.is_custom && !m.is_external);
+    analyticsAllData = installed.concat(ghosts);
+    if (countEl) {
+      const ghostCount = ghosts.length;
+      countEl.textContent = t("analytics.count", { models: analyticsAllData.length, ghosts: ghostCount });
+    }
+    populateAnalyticsFamilyFilter(analyticsAllData);
+    syncAnalyticsFilterControls();
+    renderAnalyticsFiltered();
+  } catch (e) {
+    if (countEl) countEl.textContent = "";
+    charts.forEach((c) => {
+      if (c) c.innerHTML = `<div class="analytics-empty muted">${escapeHtml(t("toast.error", { msg: e.message }))}</div>`;
+    });
+  }
+}
+
+function populateAnalyticsDeviceFilter(devices, currentDeviceId) {
+  const group = $("analytics-filter-device-group");
+  const sel = $("analytics-filter-device");
+  if (!group || !sel) return;
+
+  // As requested: if there is no info from other different PCs/specs, hide the filter.
+  if (!Array.isArray(devices) || devices.length <= 1) {
+    group.hidden = true;
+    return;
+  }
+
+  group.hidden = false;
+  const currentVal = analyticsFilters.device || "current";
+  sel.innerHTML = "";
+
+  devices.forEach((dev) => {
+    const opt = document.createElement("option");
+    const isCurrent = dev.is_current || dev.id === currentDeviceId;
+    opt.value = dev.id;
+    opt.textContent = isCurrent ? `${dev.name} (${t("analytics.device_current")})` : dev.name;
+    if (currentVal === dev.id || (isCurrent && currentVal === "current")) {
+      opt.selected = true;
+    }
+    sel.appendChild(opt);
+  });
+
+  const allOpt = document.createElement("option");
+  allOpt.value = "all";
+  allOpt.textContent = t("analytics.device_all");
+  if (currentVal === "all") allOpt.selected = true;
+  sel.appendChild(allOpt);
+
+  const matched = [...sel.options].some((o) => o.value === sel.value);
+  if (!matched && sel.options.length > 0) {
+    sel.selectedIndex = 0;
+    analyticsFilters.device = sel.value;
+  }
+}
+
+function populateAnalyticsFamilyFilter(all) {
+  const sel = $("analytics-filter-family");
+  if (!sel) return;
+  const fams = [...new Set(all.map((m) => analyticsPoint(m).family).filter(Boolean))].sort();
+  const current = analyticsFilters.family;
+  sel.innerHTML = `<option value="all">${escapeHtml(t("analytics.family_all"))}</option>`;
+  fams.forEach((f) => {
+    const o = document.createElement("option");
+    o.value = f;
+    o.textContent = f;
+    if (f === current) o.selected = true;
+    sel.appendChild(o);
+  });
+  if (!fams.includes(current) && current !== "all") {
+    analyticsFilters.family = "all";
+    sel.value = "all";
+  }
+}
+
+function syncAnalyticsFilterControls() {
+  const map = { device: "analytics-filter-device", source: "analytics-filter-source", scope: "analytics-filter-scope", family: "analytics-filter-family", type: "analytics-filter-type" };
+  for (const k in map) {
+    const el = $(map[k]);
+    if (el) el.value = analyticsFilters[k];
+  }
+  const text = { name: "analytics-filter-name" };
+  for (const k in text) {
+    const el = $(text[k]);
+    if (el) el.value = analyticsFilters[k] || "";
+  }
+  const num = { paramsMin: "analytics-filter-params-min", paramsMax: "analytics-filter-params-max", tpsMin: "analytics-filter-tps-min" };
+  for (const k in num) {
+    const el = $(num[k]);
+    if (el) el.value = analyticsFilters[k];
+  }
+}
+
+function analyticsFilterMatches(p) {
+  const f = analyticsFilters;
+  if (f.name && !p.name.toLowerCase().includes(f.name.trim().toLowerCase())) return false;
+  if (f.source === "installed" && p.ghost) return false;
+  if (f.source === "ghost" && !p.ghost) return false;
+  if (f.family !== "all" && p.family !== f.family) return false;
+  if (f.type === "dense" && p.isMOE) return false;
+  if (f.type === "moe" && !p.isMOE) return false;
+  if (f.paramsMin !== "" && p.params > 0 && p.params < Number(f.paramsMin) * 1e9) return false;
+  if (f.paramsMax !== "" && p.params > 0 && p.params > Number(f.paramsMax) * 1e9) return false;
+  if (f.tpsMin !== "" && p.tps > 0 && p.tps < Number(f.tpsMin)) return false;
+  if (f.scope && f.scope !== "all" && !p.caps.has(f.scope)) return false;
+  return true;
+}
+
+function bindAnalyticsFilters() {
+  const bind = (id, key) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", () => {
+      analyticsFilters[key] = el.value;
+      persistAnalyticsFilters();
+      renderAnalyticsFiltered();
+    });
+    if (el.tagName === "INPUT") {
+      el.addEventListener("input", () => {
+        analyticsFilters[key] = el.value;
+        persistAnalyticsFilters();
+        renderAnalyticsFiltered();
+      });
+    }
+  };
+  bind("analytics-filter-name", "name");
+  bind("analytics-filter-source", "source");
+  bind("analytics-filter-scope", "scope");
+  bind("analytics-filter-family", "family");
+  bind("analytics-filter-type", "type");
+  bind("analytics-filter-params-min", "paramsMin");
+  bind("analytics-filter-params-max", "paramsMax");
+  bind("analytics-filter-tps-min", "tpsMin");
+
+  const devEl = $("analytics-filter-device");
+  if (devEl) {
+    devEl.addEventListener("change", () => {
+      analyticsFilters.device = devEl.value;
+      persistAnalyticsFilters();
+      renderAnalytics();
+    });
+  }
+
+  const reset = $("analytics-filter-reset");
+  if (reset) {
+    reset.addEventListener("click", () => {
+      analyticsFilters = { name: "", device: "current", source: "all", paramsMin: "", paramsMax: "", tpsMin: "", family: "all", type: "all", scope: "all" };
+      persistAnalyticsFilters();
+      syncAnalyticsFilterControls();
+      renderAnalytics();
+    });
+  }
+}
+
+function persistAnalyticsFilters() {
+  try { localStorage.setItem(ANALYTICS_FILTER_KEY, JSON.stringify(analyticsFilters)); } catch { }
+}
+
+function analyticsPoint(m) {
+  const parameterCount = Number(m.parameter_count) || 0;
+  const paramsRaw = m.parameter_size || (parameterCount ? formatExactParams(parameterCount) : "");
+  const params = parseParamSize(paramsRaw) || parameterCount;
+  const sizeBytes = Number(m.size) || 0;
+  const tps = Number(m.record_tokens_per_sec) || 0;
+  const coldLoadMs = Number(m.min_cold_load_ms) || 0;
+  const totalTokens = Number(m.total_tokens) || 0;
+  const totalCalls = Number(m.total_calls) || 0;
+  const caps = new Set((m.capabilities || []).map((c) => String(c).toLowerCase()));
+  const decisionCalls = Number(m.decision_calls) || 0;
+  const decisionQuestions = Number(m.decision_questions) || 0;
+  const decisionAvgMs = Number(m.decision_avg_ms) || 0;
+  const decisionMinMs = Number(m.decision_min_ms) || 0;
+  const decisionMaxMs = Number(m.decision_max_ms) || 0;
+  const decisionLastMs = Number(m.decision_last_ms) || 0;
+  const decisionQps = Number(m.decision_questions_per_sec) || 0;
+  const decisionColdMs = Number(m.decision_cold_ms) || 0;
+  const decisionInputTokens = Number(m.decision_input_tokens) || 0;
+  const decisionOutputTokens = Number(m.decision_output_tokens) || 0;
+  const speechCalls = Number(m.speech_calls) || 0;
+  const speechInputChars = Number(m.speech_input_chars) || 0;
+  const speechAudioBytes = Number(m.speech_audio_bytes) || 0;
+  const speechAvgMs = Number(m.speech_avg_ms) || 0;
+  const speechMinMs = Number(m.speech_min_ms) || 0;
+  const speechMaxMs = Number(m.speech_max_ms) || 0;
+  const speechLastMs = Number(m.speech_last_ms) || 0;
+  const speechCps = Number(m.speech_chars_per_sec) || 0;
+  const speechColdMs = Number(m.speech_cold_ms) || 0;
+
+  // Derived metrics
+  const sizeGB = sizeBytes > 0 ? sizeBytes / 1e9 : 0;
+  const efficiencyTokPerGB = sizeGB > 0 && tps > 0 ? tps / sizeGB : 0;
+  const loadThroughputMBs = coldLoadMs > 0 && sizeBytes > 0 ? (sizeBytes / 1e6) / (coldLoadMs / 1000) : 0;
+  const paramsB = params > 0 ? params / 1e9 : 0;
+
+  const isLoaded = !!(
+    m.loaded ||
+    (typeof runningModels !== "undefined" && Array.isArray(runningModels) && runningModels.some((r) => r.name === m.name)) ||
+    (typeof models !== "undefined" && Array.isArray(models) && models.some((x) => x.name === m.name && x.loaded))
+  );
+
+  return {
+    raw: m,
+    name: m.name,
+    loaded: isLoaded,
+    ghost: !!m.is_ghost,
+    params,
+    paramsB,
+    paramsLabel: paramsRaw || "—",
+    sizeBytes,
+    sizeGB,
+    quant: m.quantization || "",
+    family: m.family || "other",
+    tps,
+    tpsAt: m.record_tokens_per_sec_at || null,
+    coldLoadMs,
+    loadThroughputMBs,
+    efficiencyTokPerGB,
+    totalTokens,
+    totalCalls,
+    parameterCount,
+    architecture: m.architecture || "",
+    fileType: Number(m.file_type) || 0,
+    sizeLabel: m.size_label || "",
+    isMOE: !!m.is_moe,
+    contextLength: Number(m.context_length) || 0,
+    caps,
+    decisionCalls,
+    decisionQuestions,
+    decisionAvgMs,
+    decisionMinMs,
+    decisionMaxMs,
+    decisionLastMs,
+    decisionQps,
+    decisionColdMs,
+    decisionInputTokens,
+    decisionOutputTokens,
+    speechCalls,
+    speechInputChars,
+    speechAudioBytes,
+    speechAvgMs,
+    speechMinMs,
+    speechMaxMs,
+    speechLastMs,
+    speechCps,
+    speechColdMs,
+  };
+}
+
+const FAMILY_PALETTE = {
+  gemma: "#4f8cff",
+  gemma2: "#4f8cff",
+  gemma3: "#38bdf8",
+  gemma4: "#06b6d4",
+  qwen: "#a855f7",
+  qwen2: "#a855f7",
+  qwen25: "#c084fc",
+  qwen35: "#e879f9",
+  qwen3: "#d946ef",
+  llama: "#2ecc71",
+  llama2: "#2ecc71",
+  llama3: "#10b981",
+  llama31: "#059669",
+  mistral: "#f59e0b",
+  mixtral: "#d97706",
+  phi: "#ec4899",
+  phi3: "#f43f5e",
+  deepseek: "#3b82f6",
+  command: "#8b5cf6",
+  other: "#94a3b8",
+};
+
+const ANALYTICS_COLORS = [
+  "#38bdf8", "#a855f7", "#10b981", "#f59e0b", "#ec4899",
+  "#06b6d4", "#6366f1", "#f97316", "#84cc16", "#14b8a6",
+];
+
+function analyticsColor(i) {
+  return ANALYTICS_COLORS[i % ANALYTICS_COLORS.length];
+}
+
+function modelFamilyColor(family, isGhost) {
+  if (isGhost) return "#94a3b8";
+  if (!family) return "#38bdf8";
+  const norm = family.toLowerCase().replace(/[^a-z0-9]/g, "");
+  for (const k in FAMILY_PALETTE) {
+    if (norm.startsWith(k) || norm.includes(k)) return FAMILY_PALETTE[k];
+  }
+  return "#38bdf8";
+}
+
+function analyticsScopeIsDecision() {
+  return analyticsFilters.scope === "decision";
+}
+
+function analyticsScopeIsSpeech() {
+  return analyticsFilters.scope === "speech";
+}
+
+function setAnalyticsLabel(id, text) {
+  const el = $(id);
+  if (el) el.textContent = text;
+}
+
+function updateAnalyticsChartLabels() {
+  const decision = analyticsScopeIsDecision();
+  const speech = analyticsScopeIsSpeech();
+  setAnalyticsLabel("analytics-tps-title", t(decision ? "analytics.decision_tps_title" : speech ? "analytics.speech_tps_title" : "analytics.tps_title"));
+  setAnalyticsLabel("analytics-tps-sub", t(decision ? "analytics.decision_tps_sub" : speech ? "analytics.speech_tps_sub" : "analytics.tps_sub"));
+  setAnalyticsLabel("analytics-efficiency-title", t(decision ? "analytics.decision_efficiency_title" : speech ? "analytics.speech_efficiency_title" : "analytics.efficiency_title"));
+  setAnalyticsLabel("analytics-efficiency-sub", t(decision ? "analytics.decision_efficiency_sub" : speech ? "analytics.speech_efficiency_sub" : "analytics.efficiency_sub"));
+  setAnalyticsLabel("analytics-coldload-title", t(decision ? "analytics.decision_latency_title" : speech ? "analytics.speech_latency_title" : "analytics.coldload_title"));
+  setAnalyticsLabel("analytics-coldload-sub", t(decision ? "analytics.decision_latency_sub" : speech ? "analytics.speech_latency_sub" : "analytics.coldload_sub"));
+}
+
+function renderAnalyticsFiltered() {
+  const filtered = analyticsAllData.filter((m) => analyticsFilterMatches(analyticsPoint(m)));
+  updateAnalyticsChartLabels();
+  renderAnalyticsKPIs(filtered);
+  renderTpsVsParams(filtered);
+  renderSizeVsParams(filtered);
+  renderEfficiency(filtered);
+  renderColdLoad(filtered);
+  renderMetaTable(filtered);
+}
+

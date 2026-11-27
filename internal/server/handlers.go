@@ -1,0 +1,4337 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"io/fs"
+	"log"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/JulianR87/iAManager/internal/config"
+	"github.com/JulianR87/iAManager/internal/jobs"
+	"github.com/JulianR87/iAManager/internal/ollama"
+	"github.com/JulianR87/iAManager/internal/sysmetrics"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// configIsValidLang is a tiny indirection to avoid importing config in tests.
+func configIsValidLang(lang string) bool { return config.IsValidLanguage(lang) }
+
+// ---------- index / login ----------
+
+// isSPAClientPath reports whether path is a client-side route of the web SPA
+// (driven by history.pushState in web/app-svg.js). These must serve index.html
+// so a browser refresh or direct link lands in the app instead of a 404.
+// Keep in sync with the router in web/app-svg.js.
+func isSPAClientPath(path string) bool {
+	return path == "/" ||
+		path == "/chat" ||
+		path == "/chat/" ||
+		strings.HasPrefix(path, "/chat/") ||
+		path == "/tests" ||
+		path == "/tests/" ||
+		path == "/tests/new" ||
+		strings.HasPrefix(path, "/tests/edit/") ||
+		strings.HasPrefix(path, "/tests/group/") ||
+		strings.HasPrefix(path, "/tests/agent/") ||
+		strings.HasPrefix(path, "/tests/battery/") ||
+		strings.HasPrefix(path, "/tests/history/") ||
+		path == "/leaderboard" ||
+		path == "/leaderboard/" ||
+		path == "/tests/leaderboard" ||
+		path == "/analytics" ||
+		path == "/analytics/" ||
+		path == "/settings" ||
+		strings.HasPrefix(path, "/settings/") ||
+		path == "/opencode" ||
+		path == "/opencode/" ||
+		path == "/archived" ||
+		path == "/archived/" ||
+		path == "/modelfile" ||
+		strings.HasPrefix(path, "/modelfile/") ||
+		path == "/hf" ||
+		strings.HasPrefix(path, "/hf/") ||
+		path == "/huggingface" ||
+		strings.HasPrefix(path, "/huggingface/") ||
+		path == "/rags" ||
+		strings.HasPrefix(path, "/rags/")
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	isSPAPath := isSPAClientPath(r.URL.Path)
+	if !isSPAPath {
+		http.NotFound(w, r)
+		return
+	}
+	s.cfgMu.RLock()
+	hasPwd := s.cfg.HasPassword()
+	s.cfgMu.RUnlock()
+	if hasPwd && !s.isAuthenticated(r) {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	data, err := fs.ReadFile(s.web, "index.html")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
+func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.RLock()
+	hasPwd := s.cfg.HasPassword()
+	lang := s.cfg.Language
+	s.cfgMu.RUnlock()
+	if !hasPwd {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = s.tmpl.ExecuteTemplate(w, "login.html", loginViewData(lang, ""))
+}
+
+func (s *Server) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.RLock()
+	hasPwd := s.cfg.HasPassword()
+	hash := s.cfg.PasswordHash
+	lang := s.cfg.Language
+	s.cfgMu.RUnlock()
+
+	if !hasPwd {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	pass := r.FormValue("password")
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(pass)); err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		errMsg := "Contraseña incorrecta"
+		if lang == "en" {
+			errMsg = "Incorrect password"
+		}
+		_ = s.tmpl.ExecuteTemplate(w, "login.html", loginViewData(lang, errMsg))
+		return
+	}
+	s.cfgMu.RLock()
+	s.setSessionCookie(w)
+	s.cfgMu.RUnlock()
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleAPILogin(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.RLock()
+	hasPwd := s.cfg.HasPassword()
+	hash := s.cfg.PasswordHash
+	s.cfgMu.RUnlock()
+
+	if !hasPwd {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	var body struct {
+		Password string `json:"password"`
+	}
+	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid request body"))
+			return
+		}
+	} else {
+		if err := r.ParseForm(); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("bad form"))
+			return
+		}
+		body.Password = r.FormValue("password")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil {
+		writeError(w, http.StatusUnauthorized, errors.New("incorrect password"))
+		return
+	}
+
+	s.cfgMu.RLock()
+	s.setSessionCookie(w)
+	s.cfgMu.RUnlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// loginViewData builds the data map passed to login.html.
+func loginViewData(lang, errMsg string) map[string]any {
+	t := loginStrings(lang)
+	t["Error"] = errMsg
+	return t
+}
+
+// loginStrings returns translated labels for the login page.
+func loginStrings(lang string) map[string]any {
+	if lang == "es" {
+		return map[string]any{
+			"Title":    "iAManager — Acceder",
+			"Heading":  "iAManager",
+			"Subtitle": "Esta instancia requiere contraseña.",
+			"Label":    "Contraseña",
+			"Submit":   "Entrar",
+		}
+	}
+	return map[string]any{
+		"Title":    "iAManager — Sign in",
+		"Heading":  "iAManager",
+		"Subtitle": "This instance is password protected.",
+		"Label":    "Password",
+		"Submit":   "Sign in",
+	}
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	s.clearSessionCookie(w)
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// ---------- status ----------
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	s.cfgMu.RLock()
+	cfgPath := s.cfg.Path()
+	ollamaURL := s.cfg.OllamaURL
+	exposeNetwork := s.cfg.ExposeNetwork
+	hasPassword := s.cfg.HasPassword()
+	language := s.cfg.Language
+	s.cfgMu.RUnlock()
+
+	diskPath := resolveDiskProbePath(cfgPath)
+	sys := sysmetrics.Collect(ctx, diskPath)
+
+	running, err := s.ollama.PS(ctx)
+	if err != nil {
+		running = nil
+	}
+	runningViews := make([]runningView, 0, len(running))
+	var ramBytes, vramBytes, totalBytes uint64
+	for _, rm := range running {
+		total, vram := normalizeRunningModelSizes(rm.Size, rm.SizeVRAM)
+		ram := total - vram
+		totalBytes += uint64(total)
+		ramBytes += uint64(ram)
+		vramBytes += uint64(vram)
+
+		rv := runningView{
+			Name:     rm.Name,
+			SizeVRAM: vram,
+		}
+		if !rm.ExpiresAt.IsZero() {
+			exp := rm.ExpiresAt
+			rv.ExpiresAt = &exp
+		}
+		runningViews = append(runningViews, rv)
+	}
+
+	resp := map[string]any{
+		"ollama_url":               ollamaURL,
+		"expose_network":           exposeNetwork,
+		"has_password":             hasPassword,
+		"language":                 language,
+		"ollama_reachable":         s.ollama.Ping(ctx) == nil,
+		"disk_probe_path":          diskPath,
+		"disk_total_bytes":         sys.DiskTotal,
+		"disk_free_bytes":          sys.DiskFree,
+		"disk_used_bytes":          sys.DiskUsed,
+		"disk_used_pct":            sys.DiskUsedPct,
+		"cpu_model":                sys.CPUModel,
+		"cpu_used_pct":             sys.CPUUsedPercent,
+		"memory_total":             sys.MemoryTotal,
+		"memory_free":              sys.MemoryFree,
+		"memory_used":              sys.MemoryUsed,
+		"memory_used_pct":          sys.MemoryUsedPct,
+		"vram_total":               sys.VramTotal,
+		"vram_used":                sys.VramUsed,
+		"vram_used_pct":            sys.VramUsedPct,
+		"models_ram_loaded_bytes":  ramBytes,
+		"models_vram_loaded_bytes": vramBytes,
+		"models_loaded_bytes":      totalBytes,
+		"running":                  runningViews,
+	}
+	if s.runner != nil {
+		if activeProg, ok := s.runner.GetActiveProgress(); ok {
+			resp["battery_active"] = true
+			resp["battery_run_id"] = activeProg.RunID
+			resp["battery_started_at_unix_ms"] = activeProg.StartedAtUnixMs
+			resp["battery_group_name"] = activeProg.GroupName
+			resp["battery_group_id"] = activeProg.GroupID
+			resp["battery_test_index"] = activeProg.TestIndex
+			resp["battery_total_tests"] = activeProg.TotalTests
+			resp["battery_models"] = activeProg.Models
+			resp["battery_model"] = activeProg.Model
+			resp["battery_test_name"] = activeProg.TestName
+			resp["battery_waiting_review"] = activeProg.WaitingReview
+			resp["battery_pending_reviews"] = activeProg.PendingReviews
+		} else if s.runnerStore != nil {
+			if run, pending, hasPending := s.runnerStore.GetLatestRunPendingReview(); hasPending {
+				resp["battery_active"] = true
+				resp["battery_run_id"] = run.ID
+				resp["battery_started_at_unix_ms"] = run.Timestamp.UnixMilli()
+				resp["battery_group_name"] = run.GroupName
+				resp["battery_group_id"] = run.GroupID
+				resp["battery_test_index"] = len(run.Results)
+				resp["battery_total_tests"] = len(run.Results)
+				resp["battery_models"] = run.Models
+				resp["battery_waiting_review"] = true
+				resp["battery_pending_reviews"] = pending
+			} else {
+				resp["battery_active"] = false
+			}
+		} else {
+			resp["battery_active"] = false
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func normalizeRunningModelSizes(size, sizeVRAM int64) (int64, int64) {
+	if size < 0 {
+		size = 0
+	}
+	if sizeVRAM < 0 {
+		sizeVRAM = 0
+	}
+	// Some Ollama builds may report size_vram larger than size; clamp for stable UI.
+	if sizeVRAM > size {
+		sizeVRAM = size
+	}
+	return size, sizeVRAM
+}
+
+func resolveDiskProbePath(cfgPath string) string {
+	if p := strings.TrimSpace(os.Getenv("OLLAMA_MODELS")); p != "" {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".ollama", "models")
+	}
+	return cfgPath
+}
+
+// ---------- config ----------
+
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"port":           s.cfg.Port,
+		"expose_network": s.cfg.ExposeNetwork,
+		"language":       s.cfg.Language,
+		"ollama_url":     s.cfg.OllamaURL,
+		"has_password":   s.cfg.HasPassword(),
+		"has_hf_token":   strings.TrimSpace(s.cfg.HFToken) != "",
+		"bind_address":   s.cfg.BindAddress(),
+		"chat_defaults":  s.cfg.ChatDefaults,
+		"chat_sessions": map[string]any{
+			"enabled":         s.cfg.ChatSessions.IsEnabled(),
+			"on_model_delete": s.cfg.ChatSessions.OnModelDelete,
+		},
+		"leaderboard_group_order": s.cfg.LeaderboardGroupOrder,
+		"testing":                 s.cfg.Testing,
+		"gateway":                 s.cfg.Gateway,
+		"comfyui":                 s.cfg.ComfyUI,
+		"rag":                     s.cfg.RAG,
+		"rag_directory":           s.cfg.RAGDirectory(),
+		"skills":                  s.cfg.Skills,
+		"skills_directories":      s.cfg.SkillsDirectories(),
+		"mcp":                     s.cfg.MCP,
+		"version":                 s.versionInfo,
+	})
+}
+
+func (s *Server) handleRevealSecret(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, errors.New("content type must be application/json"))
+		return
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		writeError(w, http.StatusForbidden, errors.New("cross-origin request rejected"))
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" ||
+			(u.Scheme != "http" && u.Scheme != "https") ||
+			!strings.EqualFold(u.Host, r.Host) {
+			writeError(w, http.StatusForbidden, errors.New("cross-origin request rejected"))
+			return
+		}
+	}
+	var body struct {
+		Kind string `json:"kind"`
+		ID   string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	var secret string
+	switch body.Kind {
+	case "hf_token":
+		s.cfgMu.RLock()
+		secret = strings.TrimSpace(s.cfg.HFToken)
+		s.cfgMu.RUnlock()
+		if secret == "" {
+			writeError(w, http.StatusNotFound, errors.New("no secret stored"))
+			return
+		}
+	case "external_api_key":
+		if strings.TrimSpace(body.ID) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("missing id"))
+			return
+		}
+		if s.externalModels == nil {
+			writeError(w, http.StatusNotFound, errors.New("external model not found"))
+			return
+		}
+		rec, ok := s.externalModels.Get(body.ID)
+		if !ok {
+			writeError(w, http.StatusNotFound, errors.New("external model not found"))
+			return
+		}
+		secret = strings.TrimSpace(rec.APIKey)
+		if secret == "" {
+			writeError(w, http.StatusNotFound, errors.New("no secret stored"))
+			return
+		}
+	default:
+		writeError(w, http.StatusBadRequest, errors.New("unsupported kind"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"value": secret})
+}
+
+// patchGatewayBody uses pointers so callers can update only the gateway
+// fields they care about (PATCH semantics nested under "gateway").
+type patchGatewayBody struct {
+	Enabled       *bool     `json:"enabled"`
+	Port          *int      `json:"port"`
+	ExposeNetwork *bool     `json:"expose_network"`
+	Models        *[]string `json:"models"`
+	RequireAuth   *bool     `json:"require_auth"`
+}
+
+// patchConfigBody uses pointers so callers can update only the fields they
+// care about (PATCH semantics).
+type patchConfigBody struct {
+	Port                  *int                   `json:"port"`
+	ExposeNetwork         *bool                  `json:"expose_network"`
+	Language              *string                `json:"language"`
+	OllamaURL             *string                `json:"ollama_url"`
+	HFToken               *string                `json:"hf_token"`
+	ChatDefaults          *config.ChatDefaults   `json:"chat_defaults"`
+	ChatSessions          *patchChatSessionsBody `json:"chat_sessions"`
+	LeaderboardGroupOrder *[]string              `json:"leaderboard_group_order"`
+	Testing               *config.TestingLimits  `json:"testing"`
+	Gateway               *patchGatewayBody      `json:"gateway"`
+	ComfyUI               *config.ComfyUIConfig  `json:"comfyui"`
+	RAG                   *patchRAGBody          `json:"rag"`
+	Skills                *patchSkillsBody       `json:"skills"`
+	MCP                   *config.MCPConfig      `json:"mcp"`
+}
+
+type patchSkillsBody struct {
+	Directories *[]string `json:"directories"`
+}
+
+type patchRAGBody struct {
+	DefaultEmbedding *string `json:"default_embedding"`
+	Directory        *string `json:"directory"`
+}
+
+// patchChatSessionsBody is the PATCH /api/config payload for the persistent
+// chat sessions feature. Every field is optional; a nil field keeps the current
+// value.
+type patchChatSessionsBody struct {
+	Enabled       *bool   `json:"enabled"`
+	OnModelDelete *string `json:"on_model_delete"`
+}
+
+func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
+	var body patchConfigBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	needsRestart := false
+	if body.Port != nil {
+		if *body.Port < 1 || *body.Port > 65535 {
+			writeError(w, http.StatusBadRequest, errors.New("port must be 1..65535"))
+			return
+		}
+		if s.cfg.Gateway.Enabled {
+			effGwPort := s.cfg.Gateway.Port
+			if effGwPort == 0 {
+				effGwPort = config.DefaultGatewayPort
+			}
+			if effGwPort == *body.Port {
+				writeError(w, http.StatusBadRequest, errors.New("main port must differ from the enabled gateway port"))
+				return
+			}
+		}
+		if *body.Port != s.cfg.Port {
+			s.cfg.Port = *body.Port
+			needsRestart = true
+		}
+	}
+	if body.ExposeNetwork != nil && *body.ExposeNetwork != s.cfg.ExposeNetwork {
+		s.cfg.ExposeNetwork = *body.ExposeNetwork
+		needsRestart = true
+	}
+	if body.Language != nil {
+		if !configIsValidLang(*body.Language) {
+			writeError(w, http.StatusBadRequest, errors.New("unsupported language"))
+			return
+		}
+		s.cfg.Language = *body.Language
+	}
+	if body.OllamaURL != nil {
+		u := strings.TrimSpace(*body.OllamaURL)
+		if u == "" {
+			writeError(w, http.StatusBadRequest, errors.New("ollama_url cannot be empty"))
+			return
+		}
+		s.cfg.OllamaURL = u
+		// Note: this won't change the running client; takes effect on restart.
+		needsRestart = true
+	}
+	if body.HFToken != nil {
+		// Empty string clears the token. It is read live on every HF request,
+		// so no restart is needed.
+		s.cfg.HFToken = strings.TrimSpace(*body.HFToken)
+	}
+	if body.ChatDefaults != nil {
+		if !config.IsValidThinkLevel(body.ChatDefaults.ThinkLevel) {
+			writeError(w, http.StatusBadRequest, errors.New("invalid think_level (use auto, off, low, medium, high or max)"))
+			return
+		}
+		prevSkills := s.cfg.ChatDefaults.Skills
+		s.cfg.ChatDefaults = *body.ChatDefaults
+		if s.cfg.ChatDefaults.Skills == nil {
+			s.cfg.ChatDefaults.Skills = prevSkills
+		}
+	}
+	if body.ChatSessions != nil {
+		if body.ChatSessions.OnModelDelete != nil {
+			v := strings.TrimSpace(*body.ChatSessions.OnModelDelete)
+			if v != "delete" && v != "keep" {
+				writeError(w, http.StatusBadRequest, errors.New("chat_sessions.on_model_delete must be delete or keep"))
+				return
+			}
+			s.cfg.ChatSessions.OnModelDelete = v
+		}
+		if body.ChatSessions.Enabled != nil {
+			enabled := *body.ChatSessions.Enabled
+			if !enabled && s.chatSessions.HasBusy() {
+				// Turning the feature off while turns are in flight would strand
+				// them: the pages feeding them lose their event stream and the
+				// runs would finish with nowhere to report. Stop them first so
+				// every one settles into a visible "stopped" state.
+				s.chatSessions.CancelAll()
+			}
+			s.cfg.ChatSessions.Enabled = &enabled
+		}
+	}
+	if body.LeaderboardGroupOrder != nil {
+		s.cfg.LeaderboardGroupOrder = *body.LeaderboardGroupOrder
+	}
+	if body.Testing != nil {
+		if body.Testing.MaxStageTokens < 0 || body.Testing.MaxStageTokens > 10000000 {
+			writeError(w, http.StatusBadRequest, errors.New("testing.max_stage_tokens must be 0..10000000 (0 = disabled)"))
+			return
+		}
+		if body.Testing.MaxStageSeconds < 0 || body.Testing.MaxStageSeconds > 86400 {
+			writeError(w, http.StatusBadRequest, errors.New("testing.max_stage_seconds must be 0..86400 (0 = disabled)"))
+			return
+		}
+		if body.Testing.Mode != "" && body.Testing.Mode != config.TestingModeAny && body.Testing.Mode != config.TestingModeAll {
+			writeError(w, http.StatusBadRequest, errors.New("testing.mode must be \"any\" or \"all\""))
+			return
+		}
+		for i, r := range body.Testing.SkipRules {
+			if r.MinTPS < 0 || r.MaxTPS < 0 {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules speed bounds must be >= 0"))
+				return
+			}
+			if r.MaxTPS > 0 && r.MaxTPS <= r.MinTPS {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules max_tps must exceed min_tps (or be 0 for unbounded)"))
+				return
+			}
+			if r.MaxTokens < 0 || r.MaxTokens > 10000000 {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules max_tokens must be 0..10000000 (0 = disabled)"))
+				return
+			}
+			if r.MaxSeconds < 0 || r.MaxSeconds > 86400 {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules max_seconds must be 0..86400 (0 = disabled)"))
+				return
+			}
+			if r.Mode != "" && r.Mode != config.TestingModeAny && r.Mode != config.TestingModeAll {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules mode must be \"any\" or \"all\""))
+				return
+			}
+			nr, ok := config.NormalizeSkipRule(r)
+			if !ok {
+				writeError(w, http.StatusBadRequest, errors.New("testing.skip_rules entries need at least one cut (max_tokens or max_seconds)"))
+				return
+			}
+			body.Testing.SkipRules[i] = nr
+		}
+		body.Testing.Mode = config.NormalizeTestingMode(body.Testing.Mode)
+		s.cfg.Testing = *body.Testing
+	}
+	if body.Gateway != nil {
+		gw := body.Gateway
+		newGw := s.cfg.Gateway
+		if gw.Port != nil {
+			// 0 means "use the default gateway port".
+			if *gw.Port < 0 || *gw.Port > 65535 {
+				writeError(w, http.StatusBadRequest, errors.New("gateway port must be 0..65535 (0 = default)"))
+				return
+			}
+			newGw.Port = *gw.Port
+		}
+		if gw.Enabled != nil {
+			newGw.Enabled = *gw.Enabled
+		}
+		if gw.ExposeNetwork != nil {
+			newGw.ExposeNetwork = *gw.ExposeNetwork
+		}
+		if gw.Models != nil {
+			newGw.Models = *gw.Models
+			if newGw.Models == nil {
+				newGw.Models = []string{}
+			}
+		}
+		if gw.RequireAuth != nil {
+			newGw.RequireAuth = *gw.RequireAuth
+		}
+		// The gateway runs on its own listener: refuse a port clash with
+		// the main server while the gateway is (or stays) enabled.
+		if newGw.Enabled {
+			effGwPort := newGw.Port
+			if effGwPort == 0 {
+				effGwPort = config.DefaultGatewayPort
+			}
+			if effGwPort == s.cfg.Port {
+				writeError(w, http.StatusBadRequest, errors.New("gateway port must differ from the main server port"))
+				return
+			}
+		}
+		// The gateway listener is managed (hot-applied below): listener
+		// field changes take effect immediately, so unlike the main
+		// server port they don't need a full process restart. Models and
+		// require_auth were already live (read per request).
+		gwListenerChanged := newGw.Port != s.cfg.Gateway.Port ||
+			newGw.Enabled != s.cfg.Gateway.Enabled ||
+			newGw.ExposeNetwork != s.cfg.Gateway.ExposeNetwork
+		s.cfg.Gateway = newGw
+		if gwListenerChanged {
+			// Hot-apply the listener change without a full process
+			// restart. SyncGateway takes cfgMu itself, so run it in a
+			// goroutine: it blocks until this handler's cfgMu.Unlock
+			// (deferred at the top) runs, then reconciles the listener.
+			// Models/require_auth need no sync (read live per request).
+			go func() { _ = s.SyncGateway() }()
+		}
+	}
+	// ComfyUI is read live on every tool call, so a new URL takes effect on the
+	// next message without a restart. Normalize rather than reject: an empty URL
+	// is how the user turns the integration off.
+	if body.ComfyUI != nil {
+		s.cfg.ComfyUI = body.ComfyUI.Normalize()
+	}
+	var oldRAG config.RAGConfig
+	ragTouched := false
+	if body.RAG != nil {
+		oldRAG = s.cfg.RAG
+		ragTouched = true
+		newRAG := s.cfg.RAG
+		if body.RAG.DefaultEmbedding != nil {
+			newRAG.DefaultEmbedding = strings.TrimSpace(*body.RAG.DefaultEmbedding)
+		}
+		if body.RAG.Directory != nil {
+			newRAG.Directory = strings.TrimSpace(*body.RAG.Directory)
+		}
+		s.cfg.RAG = newRAG
+	}
+	var oldSkills config.SkillsConfig
+	skillsTouched := false
+	if body.Skills != nil {
+		oldSkills = s.cfg.Skills
+		skillsTouched = true
+		if body.Skills.Directories != nil {
+			s.cfg.Skills.Directories = config.NormalizeSkillDirectories(*body.Skills.Directories)
+		}
+	}
+	var oldMCP config.MCPConfig
+	mcpTouched := false
+	if body.MCP != nil {
+		oldMCP = s.cfg.MCP
+		mcpTouched = true
+		nextMCP := *body.MCP
+		config.NormalizeMCPConfig(&nextMCP)
+		s.cfg.MCP = nextMCP
+	}
+
+	if err := s.cfg.Save(); err != nil {
+		if ragTouched {
+			s.cfg.RAG = oldRAG
+		}
+		if skillsTouched {
+			s.cfg.Skills = oldSkills
+		}
+		if mcpTouched {
+			s.cfg.MCP = oldMCP
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if mcpTouched {
+		s.pruneMCPStatusCache(s.cfg.MCP.MCPServers)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":             true,
+		"needs_restart":  needsRestart,
+		"port":           s.cfg.Port,
+		"expose_network": s.cfg.ExposeNetwork,
+		"language":       s.cfg.Language,
+		"ollama_url":     s.cfg.OllamaURL,
+		"has_hf_token":   strings.TrimSpace(s.cfg.HFToken) != "",
+		"chat_defaults":  s.cfg.ChatDefaults,
+		"chat_sessions": map[string]any{
+			"enabled":         s.cfg.ChatSessions.IsEnabled(),
+			"on_model_delete": s.cfg.ChatSessions.OnModelDelete,
+		},
+		"leaderboard_group_order": s.cfg.LeaderboardGroupOrder,
+		"testing":                 s.cfg.Testing,
+		"gateway":                 s.cfg.Gateway,
+		"comfyui":                 s.cfg.ComfyUI,
+		"rag":                     s.cfg.RAG,
+		"rag_directory":           s.cfg.RAGDirectory(),
+		"skills":                  s.cfg.Skills,
+		"skills_directories":      s.cfg.SkillsDirectories(),
+		"mcp":                     s.cfg.MCP,
+	})
+}
+
+// passwordBody is the payload of POST /api/config/password.
+// An empty Password clears authentication.
+type passwordBody struct {
+	Password string `json:"password"`
+}
+
+func (s *Server) handleSetPassword(w http.ResponseWriter, r *http.Request) {
+	var body passwordBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+
+	if body.Password == "" {
+		s.cfg.PasswordHash = ""
+		s.clearSessionCookie(w)
+	} else {
+		hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.cfg.PasswordHash = string(hash)
+		// Issue a fresh session cookie so the caller stays logged in.
+		s.setSessionCookie(w)
+	}
+	if err := s.cfg.Save(); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"has_password": s.cfg.HasPassword(),
+	})
+}
+
+// ---------- models ----------
+
+// modelView is what the frontend consumes.
+type modelView struct {
+	Name                 string     `json:"name"`
+	Size                 int64      `json:"size"`
+	ModifiedAt           time.Time  `json:"modified_at"`
+	LastUsedAt           *time.Time `json:"last_used_at,omitempty"`
+	RecordTokensPerSec   float64    `json:"record_tokens_per_sec,omitempty"`
+	RecordTokensPerSecAt *time.Time `json:"record_tokens_per_sec_at,omitempty"`
+	RecordCharsPerSec    float64    `json:"record_chars_per_sec,omitempty"`
+	RecordCharsPerSecAt  *time.Time `json:"record_chars_per_sec_at,omitempty"`
+	MinColdLoadMs        int64      `json:"min_cold_load_ms,omitempty"`
+	MinColdLoadAt        *time.Time `json:"min_cold_load_at,omitempty"`
+	TotalTokens          int64      `json:"total_tokens,omitempty"`
+	TotalCalls           int64      `json:"total_calls,omitempty"`
+	// Decision (System One) metrics.
+	DecisionCalls           int64      `json:"decision_calls,omitempty"`
+	DecisionQuestions       int64      `json:"decision_questions,omitempty"`
+	DecisionInputTokens     int64      `json:"decision_input_tokens,omitempty"`
+	DecisionOutputTokens    int64      `json:"decision_output_tokens,omitempty"`
+	DecisionAvgMs           int64      `json:"decision_avg_ms,omitempty"`
+	DecisionMinMs           int64      `json:"decision_min_ms,omitempty"`
+	DecisionMaxMs           int64      `json:"decision_max_ms,omitempty"`
+	DecisionLastMs          int64      `json:"decision_last_ms,omitempty"`
+	DecisionQuestionsPerSec float64    `json:"decision_questions_per_sec,omitempty"`
+	DecisionColdMs          int64      `json:"decision_cold_ms,omitempty"`
+	DecisionColdAt          *time.Time `json:"decision_cold_at,omitempty"`
+	// Speech (text-to-speech) metrics.
+	SpeechCalls       int64      `json:"speech_calls,omitempty"`
+	SpeechInputChars  int64      `json:"speech_input_chars,omitempty"`
+	SpeechAudioBytes  int64      `json:"speech_audio_bytes,omitempty"`
+	SpeechAvgMs       int64      `json:"speech_avg_ms,omitempty"`
+	SpeechMinMs       int64      `json:"speech_min_ms,omitempty"`
+	SpeechMaxMs       int64      `json:"speech_max_ms,omitempty"`
+	SpeechLastMs      int64      `json:"speech_last_ms,omitempty"`
+	SpeechCharsPerSec float64    `json:"speech_chars_per_sec,omitempty"`
+	SpeechColdMs      int64      `json:"speech_cold_ms,omitempty"`
+	SpeechColdAt      *time.Time `json:"speech_cold_at,omitempty"`
+	Digest            string     `json:"digest"`
+	Family            string     `json:"family"`
+	Families          []string   `json:"families"`
+	Format            string     `json:"format"`
+	ParameterSize     string     `json:"parameter_size"`
+	Quantization      string     `json:"quantization"`
+	ContextLength     int64      `json:"context_length,omitempty"`
+	Capabilities      []string   `json:"capabilities,omitempty"`
+	ParameterCount    int64      `json:"parameter_count,omitempty"`
+	Architecture      string     `json:"architecture,omitempty"`
+	FileType          int64      `json:"file_type,omitempty"`
+	SizeLabel         string     `json:"size_label,omitempty"`
+	IsMOE             bool       `json:"is_moe,omitempty"`
+	Loaded            bool       `json:"loaded"`
+	SizeVRAM          int64      `json:"size_vram,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	Archived          bool       `json:"archived"`
+	IsGhost           bool       `json:"is_ghost,omitempty"`
+	UninstallReason   string     `json:"uninstall_reason,omitempty"`
+	UninstallAt       *time.Time `json:"uninstall_at,omitempty"`
+	IsCustom          bool       `json:"is_custom,omitempty"`
+	IsExternal        bool       `json:"is_external,omitempty"`
+	Disabled          bool       `json:"disabled,omitempty"`
+	URL               string     `json:"url,omitempty"`
+	RemoteName        string     `json:"remote_name,omitempty"`
+	Provider          string     `json:"provider,omitempty"`
+	BaseModel         string     `json:"base_model,omitempty"`
+	BenchOverall      *float64   `json:"bench_overall,omitempty"`
+	BenchTested       bool       `json:"bench_tested,omitempty"`
+	BenchComplete     bool       `json:"bench_complete,omitempty"`
+	BenchMissing      []string   `json:"bench_missing,omitempty"`
+	BenchPossible     []string   `json:"bench_possible,omitempty"`
+}
+
+// applyUsageRecord copies a persisted usage/metrics record onto a model view.
+func applyUsageRecord(v *modelView, rec ModelUsageRecord) {
+	v.LastUsedAt = rec.LastUsedAt
+	v.RecordTokensPerSec = rec.RecordTokensPerSec
+	v.RecordTokensPerSecAt = rec.RecordTokensPerSecAt
+	v.RecordCharsPerSec = rec.RecordCharsPerSec
+	v.RecordCharsPerSecAt = rec.RecordCharsPerSecAt
+	v.MinColdLoadMs = rec.MinColdLoadMs
+	v.MinColdLoadAt = rec.MinColdLoadAt
+	v.TotalTokens = rec.TotalTokens
+	v.TotalCalls = rec.TotalCalls
+	v.DecisionCalls = rec.DecisionCalls
+	v.DecisionQuestions = rec.DecisionQuestions
+	v.DecisionInputTokens = rec.DecisionInputTokens
+	v.DecisionOutputTokens = rec.DecisionOutputTokens
+	v.DecisionAvgMs = rec.DecisionAvgMs()
+	v.DecisionMinMs = rec.DecisionMinMs
+	v.DecisionMaxMs = rec.DecisionMaxMs
+	v.DecisionLastMs = rec.DecisionLastMs
+	v.DecisionQuestionsPerSec = rec.DecisionQuestionsPerSec()
+	v.DecisionColdMs = rec.DecisionColdMs
+	v.DecisionColdAt = rec.DecisionColdAt
+	v.SpeechCalls = rec.SpeechCalls
+	v.SpeechInputChars = rec.SpeechInputChars
+	v.SpeechAudioBytes = rec.SpeechAudioBytes
+	v.SpeechAvgMs = rec.SpeechAvgMs()
+	v.SpeechMinMs = rec.SpeechMinMs
+	v.SpeechMaxMs = rec.SpeechMaxMs
+	v.SpeechLastMs = rec.SpeechLastMs
+	v.SpeechCharsPerSec = rec.SpeechCharsPerSec()
+	v.SpeechColdMs = rec.SpeechColdMs
+	v.SpeechColdAt = rec.SpeechColdAt
+}
+
+func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	models, err := s.ollama.List(ctx)
+	if err != nil {
+		log.Printf("list failed: %v", err)
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	running, err := s.ollama.PS(ctx)
+	if err != nil {
+		// Non-fatal: just report nothing as loaded.
+		log.Printf("ps failed: %v", err)
+		running = nil
+	}
+	loaded := make(map[string]ollama.RunningModel, len(running))
+	for _, rm := range running {
+		loaded[rm.Name] = rm
+	}
+
+	requestedDevice := strings.TrimSpace(r.URL.Query().Get("device"))
+	if requestedDevice == "" {
+		requestedDevice = strings.TrimSpace(r.URL.Query().Get("spec"))
+	}
+	isCurrentDevice := requestedDevice == "" || requestedDevice == "current" || (s.usage != nil && requestedDevice == s.usage.CurrentDeviceID())
+
+	var deviceUsage map[string]ModelUsageRecord
+	if s.usage != nil && !isCurrentDevice {
+		deviceUsage, _ = s.usage.GetDeviceModels(requestedDevice)
+	}
+
+	modelMeta := s.fetchModelMeta(ctx, models)
+
+	s.syncAllModelUsageFamilies()
+	out := make([]modelView, 0, len(models))
+	for _, m := range models {
+		isCustom := false
+		baseModel := ""
+		if s.customModels != nil && s.customModels.IsCustom(m.Name) {
+			isCustom = true
+			baseModel = s.customModels.GetBase(m.Name)
+		} else if isFixedModelName(m.Name) {
+			isCustom = true
+			baseModel = fixedBaseName(m.Name)
+		}
+
+		if isCustom {
+			if baseModel == "" || !strings.Contains(baseModel, ":") || strings.HasSuffix(baseModel, ":latest") {
+				prefix := baseModel
+				if prefix == "" && isFixedModelName(m.Name) {
+					prefix = fixedBaseName(m.Name)
+				}
+				if prefix != "" {
+					cleanPrefix := strings.TrimSuffix(prefix, ":latest")
+					for _, other := range models {
+						if other.Name != m.Name {
+							if other.Name == cleanPrefix || other.Name == cleanPrefix+":latest" {
+								baseModel = other.Name
+								if s.customModels != nil {
+									_ = s.customModels.Register(m.Name, baseModel)
+								}
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+
+		v := modelView{
+			Name:           m.Name,
+			Size:           m.Size,
+			ModifiedAt:     m.ModifiedAt,
+			Digest:         m.Digest,
+			Family:         m.Details.Family,
+			Families:       m.Details.Families,
+			Format:         m.Details.Format,
+			ParameterSize:  m.Details.ParameterSize,
+			Quantization:   m.Details.QuantizationLevel,
+			ContextLength:  modelMeta[m.Digest].ContextLength,
+			Capabilities:   modelMeta[m.Digest].Capabilities,
+			ParameterCount: modelMeta[m.Digest].ParameterCount,
+			Architecture:   modelMeta[m.Digest].Architecture,
+			FileType:       modelMeta[m.Digest].FileType,
+			SizeLabel:      modelMeta[m.Digest].SizeLabel,
+			IsMOE:          modelMeta[m.Digest].IsMOE,
+			Archived:       s.archived.IsArchived(m.Name),
+			IsCustom:       isCustom,
+			BaseModel:      baseModel,
+		}
+		if s.usage != nil {
+			if isCurrentDevice {
+				if rec, ok := s.getModelUsage(m.Name); ok {
+					applyUsageRecord(&v, rec)
+				}
+			} else if deviceUsage != nil {
+				if rec, ok := deviceUsage[m.Name]; ok {
+					applyUsageRecord(&v, rec)
+				} else if rec, ok := deviceUsage[strings.TrimSuffix(m.Name, ":latest")]; ok {
+					applyUsageRecord(&v, rec)
+				}
+			}
+		}
+		if rm, ok := loaded[m.Name]; ok {
+			_, vram := normalizeRunningModelSizes(rm.Size, rm.SizeVRAM)
+			v.Loaded = true
+			v.SizeVRAM = vram
+			exp := rm.ExpiresAt
+			v.ExpiresAt = &exp
+		}
+		if s.usage != nil && isCurrentDevice {
+			meta := modelMeta[m.Digest]
+			if err := s.usage.SetMeta(m.Name, modelUsageMeta{
+				ParameterSize:  m.Details.ParameterSize,
+				Size:           m.Size,
+				Quantization:   m.Details.QuantizationLevel,
+				Family:         m.Details.Family,
+				ParameterCount: meta.ParameterCount,
+				Architecture:   meta.Architecture,
+				FileType:       meta.FileType,
+				SizeLabel:      meta.SizeLabel,
+				IsMOE:          meta.IsMOE,
+				ContextLength:  meta.ContextLength,
+			}); err != nil {
+				log.Printf("usage: SetMeta failed for %q: %v", m.Name, err)
+			}
+		}
+		out = append(out, v)
+	}
+
+	if s.externalModels != nil {
+		// Best-effort refresh of provider labels and context windows so external
+		// rows expose a context_length even before the first chat.
+		s.externalModels.RefreshProviders(r.Context())
+		for extID, ext := range s.externalModels.All() {
+			if ext.Disabled {
+				continue
+			}
+			caps := ext.Capabilities
+			if len(caps) == 0 {
+				caps = []string{"completion", "tools", "thinking"}
+			}
+			ev := modelView{
+				Name:          extID,
+				Family:        "external",
+				Format:        "external",
+				Capabilities:  caps,
+				IsExternal:    true,
+				Disabled:      ext.Disabled,
+				URL:           cleanURLDisplay(ext.URL),
+				RemoteName:    ext.Name,
+				Provider:      ext.Provider,
+				ContextLength: ext.ContextLength,
+				ModifiedAt:    ext.CreatedAt,
+			}
+			if s.usage != nil {
+				if rec, ok := s.usage.Get(extID); ok {
+					ev.LastUsedAt = rec.LastUsedAt
+					ev.RecordTokensPerSec = rec.RecordTokensPerSec
+					ev.RecordTokensPerSecAt = rec.RecordTokensPerSecAt
+					ev.TotalTokens = rec.TotalTokens
+					ev.TotalCalls = rec.TotalCalls
+				}
+			}
+			out = append(out, ev)
+		}
+	}
+
+	var ghostOut []modelView
+	if s.usage != nil {
+		installedSet := make(map[string]struct{}, len(models)*2)
+		for _, m := range models {
+			installedSet[m.Name] = struct{}{}
+			installedSet[strings.TrimSuffix(m.Name, ":latest")] = struct{}{}
+		}
+		sourceUsage := s.usage.All()
+		if !isCurrentDevice && deviceUsage != nil {
+			sourceUsage = deviceUsage
+		}
+		for name, rec := range sourceUsage {
+			if s.externalModels != nil && s.externalModels.IsExternal(name) {
+				continue
+			}
+			if s.customModels != nil && s.customModels.IsCustom(name) {
+				continue
+			}
+			if isFixedModelName(name) {
+				continue
+			}
+			if _, ok := installedSet[name]; ok {
+				continue
+			}
+			if _, ok := installedSet[strings.TrimSuffix(name, ":latest")]; ok {
+				continue
+			}
+			gv := modelView{
+				Name:                 name,
+				IsGhost:              true,
+				RecordTokensPerSec:   rec.RecordTokensPerSec,
+				RecordTokensPerSecAt: rec.RecordTokensPerSecAt,
+				MinColdLoadMs:        rec.MinColdLoadMs,
+				MinColdLoadAt:        rec.MinColdLoadAt,
+				LastUsedAt:           rec.LastUsedAt,
+				TotalTokens:          rec.TotalTokens,
+				TotalCalls:           rec.TotalCalls,
+				ParameterSize:        rec.ParameterSize,
+				Size:                 rec.Size,
+				Quantization:         rec.Quantization,
+				Family:               rec.Family,
+				ParameterCount:       rec.ParameterCount,
+				Architecture:         rec.Architecture,
+				FileType:             rec.FileType,
+				SizeLabel:            rec.SizeLabel,
+				IsMOE:                rec.IsMOE,
+				ContextLength:        rec.ContextLength,
+			}
+			if rec.LastUsedAt != nil {
+				gv.ModifiedAt = *rec.LastUsedAt
+			}
+			// Why the model was removed is often the only thing worth showing
+			// for a ghost that never ran well enough to record any usage.
+			if s.uninst != nil {
+				if u, ok := s.uninst.Get(name); ok && u.LastReason != "" {
+					gv.UninstallReason = u.LastReason
+					if !u.LastUninstallAt.IsZero() {
+						at := u.LastUninstallAt
+						gv.UninstallAt = &at
+					}
+				}
+			}
+			ghostOut = append(ghostOut, gv)
+		}
+	}
+
+	// Bench digest for the BENCH column: one BuildLeaderboardData for all
+	// rows (installed, external and ghosts) so the list needs no extra
+	// requests. Ghosts are passed without caps (unknown) and are always
+	// rendered grey/read-only via summarizeBench.
+	capsByModel := make(map[string][]string, len(out))
+	for _, m := range models {
+		if caps, ok := modelMeta[m.Digest]; ok && len(caps.Capabilities) > 0 {
+			capsByModel[m.Name] = caps.Capabilities
+		} else {
+			capsByModel[m.Name] = nil
+		}
+	}
+	if s.externalModels != nil {
+		for extID, ext := range s.externalModels.All() {
+			if ext.Disabled {
+				continue
+			}
+			caps := ext.Capabilities
+			if len(caps) == 0 {
+				caps = []string{"completion", "tools", "thinking"}
+			}
+			capsByModel[extID] = caps
+		}
+	}
+	ghostSet := make(map[string]bool, len(ghostOut))
+	for _, g := range ghostOut {
+		ghostSet[g.Name] = true
+	}
+	var lbData *LeaderboardData
+	if data, err := s.cachedLeaderboardData(); err == nil {
+		lbData = data
+	}
+	benchByModel := summarizeBench(lbData, capsByModel, ghostSet)
+	for i := range out {
+		if sum, ok := benchByModel[out[i].Name]; ok {
+			out[i].BenchOverall = sum.Overall
+			out[i].BenchTested = sum.Tested
+			out[i].BenchComplete = sum.Complete
+			out[i].BenchMissing = sum.Missing
+			out[i].BenchPossible = sum.Possible
+		}
+	}
+	for i := range ghostOut {
+		if sum, ok := benchByModel[ghostOut[i].Name]; ok {
+			ghostOut[i].BenchOverall = sum.Overall
+			ghostOut[i].BenchTested = sum.Tested
+		}
+	}
+
+	resp := map[string]any{
+		"models":       out,
+		"ghost_models": ghostOut,
+	}
+	if s.usage != nil {
+		resp["current_device_id"] = s.usage.CurrentDeviceID()
+		resp["devices"] = s.usage.Devices()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// runningView is a slim row for GET /api/running (Ollama /api/ps only, no list/show).
+type runningView struct {
+	Name      string     `json:"name"`
+	SizeVRAM  int64      `json:"size_vram"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+func (s *Server) handleListRunning(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	running, err := s.ollama.PS(ctx)
+	if err != nil {
+		log.Printf("ps failed: %v", err)
+		writeJSON(w, http.StatusOK, map[string]any{"running": []runningView{}})
+		return
+	}
+	out := make([]runningView, 0, len(running))
+	for _, rm := range running {
+		_, vram := normalizeRunningModelSizes(rm.Size, rm.SizeVRAM)
+		v := runningView{
+			Name:     rm.Name,
+			SizeVRAM: vram,
+		}
+		if !rm.ExpiresAt.IsZero() {
+			exp := rm.ExpiresAt
+			v.ExpiresAt = &exp
+		}
+		out = append(out, v)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"running": out})
+}
+
+func (s *Server) handleUnloadModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if err := s.ollama.Unload(r.Context(), name); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"unloaded": name,
+	})
+}
+
+func (s *Server) handleArchiveModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.externalModels != nil && s.externalModels.IsExternal(name) {
+		writeError(w, http.StatusBadRequest, errors.New("cannot archive external model"))
+		return
+	}
+	if err := s.archived.Archive(name); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"archived": name,
+	})
+}
+
+func (s *Server) handleUnarchiveModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if err := s.archived.Unarchive(name); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"unarchived": name,
+	})
+}
+
+func (s *Server) handleUnloadAllRunning(w http.ResponseWriter, r *http.Request) {
+	running, err := s.ollama.PS(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	unloaded := make([]string, 0, len(running))
+	failed := make(map[string]string)
+	for _, rm := range running {
+		name := strings.TrimSpace(rm.Name)
+		if name == "" {
+			continue
+		}
+		if err := s.ollama.Unload(r.Context(), name); err != nil {
+			failed[name] = err.Error()
+			continue
+		}
+		unloaded = append(unloaded, name)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       len(failed) == 0,
+		"unloaded": unloaded,
+		"failed":   failed,
+	})
+}
+
+type modelMetaCache struct {
+	ContextLength  int64
+	Capabilities   []string
+	ParameterCount int64
+	Architecture   string
+	FileType       int64
+	SizeLabel      string
+	IsMOE          bool
+}
+
+// projectorCaps are the capabilities that only work when a vision/audio
+// projector (mmproj) is attached.
+var projectorCaps = map[string]bool{"vision": true, "audio": true}
+
+// withoutProjectorCaps drops vision/audio from caps when no projector is
+// attached. Ollama's /api/show reports them from the GGUF architecture
+// metadata even for community imports that ship no projector, which would
+// otherwise mark a text-only model as vision-capable and force it through
+// vision tests it cannot run. A present projector_info means a real mmproj
+// blob exists, so its capabilities are kept as-is.
+//
+// The strip only applies to GGUF imports. Native multimodal models loaded from
+// safetensors (and embedding models, which carry their image/audio encoders in
+// the weights) report no projector_info yet genuinely support the modalities,
+// so their capabilities are kept. An unknown format keeps the old protective
+// behavior and is stripped.
+func withoutProjectorCaps(caps []string, hasProjector bool, format string) []string {
+	if hasProjector {
+		return caps
+	}
+	normFormat := strings.ToLower(strings.TrimSpace(format))
+	nativeMultimodal := normFormat != "" && normFormat != "gguf"
+	if nativeMultimodal || hasCapability(caps, "embedding") {
+		return caps
+	}
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		if projectorCaps[strings.ToLower(strings.TrimSpace(c))] {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// hasCapability reports whether caps contains name, case-insensitively.
+func hasCapability(caps []string, name string) bool {
+	for _, c := range caps {
+		if strings.EqualFold(strings.TrimSpace(c), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchModelMeta returns digest-keyed model metadata for list rendering,
+// using an in-memory cache. Cache misses are resolved in parallel via
+// /api/show. Failed lookups are NOT cached (values stay zero/empty for that
+// call only) so they are retried on the next refresh instead of sticking
+// as permanently blank capabilities.
+func (s *Server) fetchModelMeta(ctx context.Context, models []ollama.Model) map[string]modelMetaCache {
+	result := make(map[string]modelMetaCache, len(models))
+
+	// First pass: serve from cache.
+	s.ctxMu.RLock()
+	missing := make([]ollama.Model, 0)
+	for _, m := range models {
+		ctxLen, okCtx := s.ctxCache[m.Digest]
+		caps, okCaps := s.capsCache[m.Digest]
+		meta, okMeta := s.metaCache[m.Digest]
+		if okCtx && okCaps && okMeta {
+			result[m.Digest] = modelMetaCache{
+				ContextLength:  ctxLen,
+				Capabilities:   append([]string(nil), caps...),
+				ParameterCount: meta.ParameterCount,
+				Architecture:   meta.Architecture,
+				FileType:       meta.FileType,
+				SizeLabel:      meta.SizeLabel,
+				IsMOE:          meta.IsMOE,
+			}
+		} else {
+			missing = append(missing, m)
+		}
+	}
+	s.ctxMu.RUnlock()
+
+	if len(missing) == 0 {
+		return result
+	}
+
+	// Second pass: bounded parallel /api/show.
+	type item struct {
+		digest         string
+		ok             bool // false when /api/show failed; never cached, retried next time
+		contextLen     int64
+		capabilities   []string
+		parameterCount int64
+		architecture   string
+		fileType       int64
+		sizeLabel      string
+		isMOE          bool
+	}
+	out := make(chan item, len(missing))
+	const concurrency = 6
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, m := range missing {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(m ollama.Model) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			showCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+			defer cancel()
+			show, err := s.ollama.Show(showCtx, m.Name)
+			if err != nil {
+				out <- item{digest: m.Digest}
+				return
+			}
+			if show != nil && show.Modelfile != "" && s.customModels != nil {
+				from := extractLineDirective(show.Modelfile, "FROM")
+				if from != "" && !isLocalFilePathOrDigest(from) && from != m.Name {
+					_ = s.customModels.Register(m.Name, from)
+				}
+			}
+			out <- item{
+				digest:         m.Digest,
+				ok:             true,
+				contextLen:     extractContextLength(show),
+				capabilities:   withoutProjectorCaps(append([]string(nil), show.Capabilities...), len(show.ProjectorInfo) > 0, show.Details.Format),
+				parameterCount: extractParameterCount(show),
+				architecture:   extractArchitecture(show),
+				fileType:       extractFileType(show),
+				sizeLabel:      extractSizeLabel(show),
+				isMOE:          extractIsMOE(show),
+			}
+		}(m)
+	}
+	wg.Wait()
+	close(out)
+
+	s.ctxMu.Lock()
+	if s.ctxCache == nil {
+		s.ctxCache = make(map[string]int64)
+	}
+	if s.capsCache == nil {
+		s.capsCache = make(map[string][]string)
+	}
+	if s.metaCache == nil {
+		s.metaCache = make(map[string]modelMetaCache)
+	}
+	for it := range out {
+		// Never cache a failed /api/show: an error (timeout, Ollama busy,
+		// restart mid-flight) must not poison the entry as "no
+		// capabilities" forever. It is retried on the next list refresh.
+		if it.ok {
+			s.ctxCache[it.digest] = it.contextLen
+			s.capsCache[it.digest] = append([]string(nil), it.capabilities...)
+			s.metaCache[it.digest] = modelMetaCache{
+				ParameterCount: it.parameterCount,
+				Architecture:   it.architecture,
+				FileType:       it.fileType,
+				SizeLabel:      it.sizeLabel,
+				IsMOE:          it.isMOE,
+			}
+		}
+		result[it.digest] = modelMetaCache{
+			ContextLength:  it.contextLen,
+			Capabilities:   append([]string(nil), it.capabilities...),
+			ParameterCount: it.parameterCount,
+			Architecture:   it.architecture,
+			FileType:       it.fileType,
+			SizeLabel:      it.sizeLabel,
+			IsMOE:          it.isMOE,
+		}
+	}
+	s.ctxMu.Unlock()
+	return result
+}
+
+// extractModelInfoString reads a string-valued key from a ShowResponse model_info.
+func extractModelInfoString(show *ollama.ShowResponse, key string) string {
+	if show == nil || show.ModelInfo == nil {
+		return ""
+	}
+	raw, ok := show.ModelInfo[key]
+	if !ok {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return ""
+}
+
+// extractModelInfoInt reads an int-valued key from a ShowResponse model_info.
+func extractModelInfoInt(show *ollama.ShowResponse, key string) int64 {
+	if show == nil || show.ModelInfo == nil {
+		return 0
+	}
+	raw, ok := show.ModelInfo[key]
+	if !ok {
+		return 0
+	}
+	var n float64
+	if json.Unmarshal(raw, &n) == nil && n > 0 {
+		return int64(n)
+	}
+	return 0
+}
+
+// extractArchitecture reads the architecture from a ShowResponse model_info.
+// (Defined in model_repair.go; kept as a thin alias for clarity.)
+
+func extractParameterCount(show *ollama.ShowResponse) int64 {
+	return extractModelInfoInt(show, "general.parameter_count")
+}
+
+func extractFileType(show *ollama.ShowResponse) int64 {
+	return extractModelInfoInt(show, "general.file_type")
+}
+
+func extractSizeLabel(show *ollama.ShowResponse) string {
+	return extractModelInfoString(show, "general.size_label")
+}
+
+// extractIsMOE reports whether a model is a Mixture-of-Experts (MoE) by checking
+// for a positive "<arch>.expert_count" in its GGUF model_info.
+func extractIsMOE(show *ollama.ShowResponse) bool {
+	if show == nil || show.ModelInfo == nil {
+		return false
+	}
+	if arch := extractArchitecture(show); arch != "" {
+		if n := extractModelInfoInt(show, arch+".expert_count"); n > 0 {
+			return true
+		}
+	}
+	for k, raw := range show.ModelInfo {
+		if strings.HasSuffix(k, ".expert_count") {
+			var n float64
+			if json.Unmarshal(raw, &n) == nil && n > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// extractContextLength scans a ShowResponse for a "<arch>.context_length" key.
+func extractContextLength(show *ollama.ShowResponse) int64 {
+	if show == nil || show.ModelInfo == nil {
+		return 0
+	}
+	var arch string
+	if raw, ok := show.ModelInfo["general.architecture"]; ok {
+		_ = json.Unmarshal(raw, &arch)
+	}
+	if arch != "" {
+		if raw, ok := show.ModelInfo[arch+".context_length"]; ok {
+			var n float64
+			if json.Unmarshal(raw, &n) == nil && n > 0 {
+				return int64(n)
+			}
+		}
+	}
+	for k, raw := range show.ModelInfo {
+		if strings.HasSuffix(k, ".context_length") {
+			var n float64
+			if json.Unmarshal(raw, &n) == nil && n > 0 {
+				return int64(n)
+			}
+		}
+	}
+	return 0
+}
+
+// modelDetail is the response of GET /api/models/{name}.
+type modelDetail struct {
+	Name                 string              `json:"name"`
+	License              string              `json:"license,omitempty"`
+	Modelfile            string              `json:"modelfile,omitempty"`
+	Parameters           string              `json:"parameters,omitempty"`
+	Template             string              `json:"template,omitempty"`
+	System               string              `json:"system,omitempty"`
+	Details              ollama.ModelDetails `json:"details"`
+	Capabilities         []string            `json:"capabilities,omitempty"`
+	ContextLength        int64               `json:"context_length,omitempty"`
+	Architecture         string              `json:"architecture,omitempty"`
+	ParameterCount       int64               `json:"parameter_count,omitempty"`
+	ModelInfo            map[string]any      `json:"model_info,omitempty"`
+	ArtifactCount        int                 `json:"artifact_count,omitempty"`
+	ArtifactBytes        int64               `json:"artifact_bytes,omitempty"`
+	ModifiedAt           time.Time           `json:"modified_at"`
+	LastUsedAt           *time.Time          `json:"last_used_at,omitempty"`
+	RecordTokensPerSec   float64             `json:"record_tokens_per_sec,omitempty"`
+	RecordTokensPerSecAt *time.Time          `json:"record_tokens_per_sec_at,omitempty"`
+	MinColdLoadMs        int64               `json:"min_cold_load_ms,omitempty"`
+	MinColdLoadAt        *time.Time          `json:"min_cold_load_at,omitempty"`
+	SpeechCalls          int64               `json:"speech_calls,omitempty"`
+	SpeechInputChars     int64               `json:"speech_input_chars,omitempty"`
+	SpeechAudioBytes     int64               `json:"speech_audio_bytes,omitempty"`
+	SpeechAvgMs          int64               `json:"speech_avg_ms,omitempty"`
+	SpeechMinMs          int64               `json:"speech_min_ms,omitempty"`
+	SpeechMaxMs          int64               `json:"speech_max_ms,omitempty"`
+	SpeechLastMs         int64               `json:"speech_last_ms,omitempty"`
+	SpeechCharsPerSec    float64             `json:"speech_chars_per_sec,omitempty"`
+	SpeechColdMs         int64               `json:"speech_cold_ms,omitempty"`
+	SpeechColdAt         *time.Time          `json:"speech_cold_at,omitempty"`
+	RecordCharsPerSec    float64             `json:"record_chars_per_sec,omitempty"`
+	RecordCharsPerSecAt  *time.Time          `json:"record_chars_per_sec_at,omitempty"`
+	// Voices lists the voice profiles the speech checkpoint ships with. Ollama
+	// reports them in /api/show; "default" is always usable and is added here.
+	Voices     []string `json:"voices,omitempty"`
+	IsCustom   bool     `json:"is_custom,omitempty"`
+	IsExternal bool     `json:"is_external,omitempty"`
+	Disabled   bool     `json:"disabled,omitempty"`
+	URL        string   `json:"url,omitempty"`
+	RemoteName string   `json:"remote_name,omitempty"`
+	Provider   string   `json:"provider,omitempty"`
+	BaseModel  string   `json:"base_model,omitempty"`
+}
+
+func (s *Server) handleShowModel(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.externalModels != nil && s.externalModels.IsExternal(name) {
+		rec, _ := s.externalModels.Get(name)
+		caps := rec.Capabilities
+		if len(caps) == 0 {
+			caps = []string{"completion", "tools", "thinking"}
+		}
+		detailID := rec.ID
+		if detailID == "" {
+			detailID = name
+		}
+		detail := modelDetail{
+			Name:         detailID,
+			IsExternal:   true,
+			Disabled:     rec.Disabled,
+			URL:          cleanURLDisplay(rec.URL),
+			RemoteName:   rec.Name,
+			Provider:     rec.Provider,
+			Capabilities: caps,
+			Details: ollama.ModelDetails{
+				Format: "external",
+				Family: "external",
+			},
+			ModifiedAt: rec.CreatedAt,
+		}
+		if s.usage != nil {
+			if urec, ok := s.getModelUsage(name); ok {
+				detail.LastUsedAt = urec.LastUsedAt
+				detail.RecordTokensPerSec = urec.RecordTokensPerSec
+				detail.RecordTokensPerSecAt = urec.RecordTokensPerSecAt
+			}
+		}
+		detail.ArtifactCount, detail.ArtifactBytes = s.artifactInfoForModel(r.Context(), name)
+		writeJSON(w, http.StatusOK, detail)
+		return
+	}
+	show, err := s.ollama.Show(r.Context(), name)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	isCustom := false
+	baseModel := ""
+	if s.customModels != nil && s.customModels.IsCustom(name) {
+		isCustom = true
+		baseModel = s.customModels.GetBase(name)
+	} else if isFixedModelName(name) {
+		isCustom = true
+		baseModel = fixedBaseName(name)
+	}
+	if show.Modelfile != "" {
+		from := extractLineDirective(show.Modelfile, "FROM")
+		if from != "" && !isLocalFilePathOrDigest(from) && from != name {
+			isCustom = true
+			baseModel = from
+			if s.customModels != nil {
+				_ = s.customModels.Register(name, baseModel)
+			}
+		}
+	}
+
+	detail := modelDetail{
+		Name:         name,
+		License:      show.License,
+		Modelfile:    show.Modelfile,
+		Parameters:   show.Parameters,
+		Template:     show.Template,
+		System:       show.System,
+		Details:      show.Details,
+		Capabilities: withoutProjectorCaps(append([]string(nil), show.Capabilities...), len(show.ProjectorInfo) > 0, show.Details.Format),
+		Voices:       speechVoiceList(show.Voices),
+		ModifiedAt:   show.ModifiedAt,
+		IsCustom:     isCustom,
+		BaseModel:    baseModel,
+	}
+	if detail.System == "" {
+		// Older Ollama versions do not return a resolved system prompt in
+		// /api/show; fall back to the SYSTEM directive in the modelfile,
+		// mirroring "ollama show --system".
+		detail.System = extractModelfileSystem(show.Modelfile)
+	}
+	if s.usage != nil {
+		if rec, ok := s.getModelUsage(name); ok {
+			detail.LastUsedAt = rec.LastUsedAt
+			detail.RecordTokensPerSec = rec.RecordTokensPerSec
+			detail.RecordTokensPerSecAt = rec.RecordTokensPerSecAt
+			detail.RecordCharsPerSec = rec.RecordCharsPerSec
+			detail.RecordCharsPerSecAt = rec.RecordCharsPerSecAt
+			detail.MinColdLoadMs = rec.MinColdLoadMs
+			detail.MinColdLoadAt = rec.MinColdLoadAt
+			detail.SpeechCalls = rec.SpeechCalls
+			detail.SpeechInputChars = rec.SpeechInputChars
+			detail.SpeechAudioBytes = rec.SpeechAudioBytes
+			detail.SpeechAvgMs = rec.SpeechAvgMs()
+			detail.SpeechMinMs = rec.SpeechMinMs
+			detail.SpeechMaxMs = rec.SpeechMaxMs
+			detail.SpeechLastMs = rec.SpeechLastMs
+			detail.SpeechCharsPerSec = rec.SpeechCharsPerSec()
+			detail.SpeechColdMs = rec.SpeechColdMs
+			detail.SpeechColdAt = rec.SpeechColdAt
+		}
+	}
+	detail.ArtifactCount, detail.ArtifactBytes = s.artifactInfoForModel(r.Context(), name)
+	flat := make(map[string]any, len(show.ModelInfo))
+	for k, raw := range show.ModelInfo {
+		var v any
+		_ = json.Unmarshal(raw, &v)
+		flat[k] = v
+	}
+	detail.ModelInfo = flat
+	if v, ok := flat["general.architecture"].(string); ok {
+		detail.Architecture = v
+	}
+	if v, ok := flat["general.parameter_count"].(float64); ok {
+		detail.ParameterCount = int64(v)
+	}
+	if detail.Architecture != "" {
+		key := detail.Architecture + ".context_length"
+		if v, ok := flat[key].(float64); ok {
+			detail.ContextLength = int64(v)
+		}
+	}
+	if detail.ContextLength == 0 {
+		// Fallback: scan any *.context_length value.
+		for k, v := range flat {
+			if strings.HasSuffix(k, ".context_length") {
+				if f, ok := v.(float64); ok {
+					detail.ContextLength = int64(f)
+					break
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// dropSessionsForModel removes the chat sessions bound to a model that is going
+// away, but only when settings ask for it. With "keep" the transcripts stay
+// readable in case the same model is pulled back, and the UI flags them as
+// missing their model instead.
+func (s *Server) dropSessionsForModel(name string) int {
+	if s.chatSessions == nil || name == "" {
+		return 0
+	}
+	s.cfgMu.RLock()
+	drop := s.cfg.ChatSessions.DeleteSessionsOnModelUninstall()
+	s.cfgMu.RUnlock()
+	if !drop {
+		return 0
+	}
+	return s.chatSessions.DeleteByModel(name)
+}
+
+func (s *Server) handleDeleteModel(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.externalModels != nil && s.externalModels.IsExternal(name) {
+		_ = s.externalModels.Unregister(name)
+		resp := map[string]any{"status": "deleted", "external": true}
+		if n := s.dropSessionsForModel(name); n > 0 {
+			resp["deleted_sessions"] = n
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if r.Body != nil {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+			return
+		}
+	}
+	reason := strings.TrimSpace(body.Reason)
+	if reason != "" && !allowedUninstallReasons[reason] {
+		writeError(w, http.StatusBadRequest, errors.New("invalid uninstall reason"))
+		return
+	}
+	// Capture the model's metadata before deletion so the "ghost" record keeps
+	// enough context for analytics charts (params, size, quant, family, etc.).
+	if s.usage != nil {
+		models, _ := s.ollama.List(r.Context())
+		for _, m := range models {
+			if m.Name == name {
+				meta := s.fetchModelMeta(r.Context(), []ollama.Model{m})[m.Digest]
+				_ = s.usage.SetMeta(m.Name, modelUsageMeta{
+					ParameterSize:  m.Details.ParameterSize,
+					Size:           m.Size,
+					Quantization:   m.Details.QuantizationLevel,
+					Family:         m.Details.Family,
+					ParameterCount: meta.ParameterCount,
+					Architecture:   meta.Architecture,
+					FileType:       meta.FileType,
+					SizeLabel:      meta.SizeLabel,
+					IsMOE:          meta.IsMOE,
+				})
+				break
+			}
+		}
+	}
+	if err := s.ollama.Delete(r.Context(), name); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	if s.uninst != nil {
+		if err := s.uninst.Record(name, reason, time.Now().UTC()); err != nil {
+			log.Printf("uninstall-history: save failed for %q: %v", name, err)
+		}
+	}
+	if s.customModels != nil {
+		_ = s.customModels.Unregister(name)
+	}
+	resp := map[string]any{"deleted": name}
+	deletedSessions := s.dropSessionsForModel(name)
+	deletedArtifacts := s.deleteArtifactsForModel(r.Context(), name)
+	if !isFixedModelName(name) {
+		fixed := fixedModelName(name)
+		isLinkedFixed := false
+		if s.customModels != nil {
+			base := s.customModels.GetBase(fixed)
+			if base == name || (strings.HasSuffix(name, ":latest") && base == strings.TrimSuffix(name, ":latest")) || (!strings.Contains(name, ":") && base == name+":latest") {
+				isLinkedFixed = true
+			}
+		}
+		if isLinkedFixed && s.modelExists(r.Context(), fixed) {
+			if err := s.ollama.Delete(r.Context(), fixed); err != nil {
+				resp["warning"] = "base model deleted, but fixed model could not be deleted: " + err.Error()
+			} else {
+				resp["deleted_fixed"] = fixed
+			}
+		}
+		if isLinkedFixed && s.customModels != nil {
+			_ = s.customModels.Unregister(fixed)
+		}
+		if isLinkedFixed {
+			deletedArtifacts += s.deleteArtifactsForModel(r.Context(), fixed)
+			deletedSessions += s.dropSessionsForModel(fixed)
+		}
+	}
+	if deletedArtifacts > 0 {
+		resp["deleted_artifacts"] = deletedArtifacts
+	}
+	if deletedSessions > 0 {
+		resp["deleted_sessions"] = deletedSessions
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDeleteGhost removes a model's persistent usage/metadata record so it
+// no longer appears as a ghost in stats/charts. The uninstall-history record
+// (deletion reason) is preserved.
+func (s *Server) handleDeleteGhost(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.usage == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("usage store unavailable"))
+		return
+	}
+	// Guard: refuse to remove a model that is still installed; use the normal
+	// delete flow for those instead.
+	installed, _ := s.ollama.List(r.Context())
+	for _, m := range installed {
+		if m.Name == name || m.Name == strings.TrimSuffix(name, ":latest") || name == strings.TrimSuffix(m.Name, ":latest") {
+			writeError(w, http.StatusBadRequest, errors.New("model is installed; delete it from the models list instead"))
+			return
+		}
+	}
+	removed, err := s.usage.Delete(name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "name": name})
+}
+
+// handleResetModelAnalytics clears the persistent usage analytics (tokens/sec, load time, calls, tokens)
+// for a given model.
+func (s *Server) handleResetModelAnalytics(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.usage == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("usage store unavailable"))
+		return
+	}
+	if err := s.usage.ResetAnalytics(name); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reset": true, "name": name})
+}
+
+func (s *Server) handleGetModelUsage(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	requestedDevice := strings.TrimSpace(r.URL.Query().Get("device"))
+	if requestedDevice == "" {
+		requestedDevice = strings.TrimSpace(r.URL.Query().Get("spec"))
+	}
+	var rec ModelUsageRecord
+	var found bool
+	if s.usage != nil {
+		if requestedDevice != "" && requestedDevice != "current" && requestedDevice != s.usage.CurrentDeviceID() {
+			if devModels, ok := s.usage.GetDeviceModels(requestedDevice); ok {
+				rec, found = devModels[name]
+				if !found {
+					if strings.HasSuffix(name, ":latest") {
+						rec, found = devModels[strings.TrimSuffix(name, ":latest")]
+					} else {
+						rec, found = devModels[name+":latest"]
+					}
+				}
+			}
+		} else {
+			rec, found = s.usage.Get(name)
+			if !found {
+				if strings.HasSuffix(name, ":latest") {
+					rec, found = s.usage.Get(strings.TrimSuffix(name, ":latest"))
+				} else {
+					rec, found = s.usage.Get(name + ":latest")
+				}
+			}
+		}
+	}
+	var uninstRec any
+	if s.uninst != nil {
+		if u, uok := s.uninst.Get(name); uok {
+			uninstRec = u
+		}
+	}
+	resp := map[string]any{
+		"name":      name,
+		"found":     found,
+		"usage":     rec,
+		"uninstall": uninstRec,
+	}
+	if s.usage != nil {
+		resp["current_device_id"] = s.usage.CurrentDeviceID()
+		resp["specs"] = s.usage.CurrentSpecs()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleGetUsageDevices(w http.ResponseWriter, r *http.Request) {
+	if s.usage == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current_device_id": "",
+			"devices":           []DeviceUsageSummary{},
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"current_device_id": s.usage.CurrentDeviceID(),
+		"devices":           s.usage.Devices(),
+	})
+}
+
+func (s *Server) handleRepairPreview(w http.ResponseWriter, r *http.Request) {
+	var body modelRepairRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Model)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if isFixedModelName(name) {
+		writeError(w, http.StatusBadRequest, errors.New("fixed models cannot be repaired; open the base model and apply a new fix"))
+		return
+	}
+	show, err := s.ollama.Show(r.Context(), name)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	preview, err := buildModelRepairPreview(name, show, body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if preview.Projector != "" {
+		s.checkRepairProjectorDisk(r.Context(), preview)
+	}
+	writeJSON(w, http.StatusOK, preview)
+}
+
+func (s *Server) handleRepairApply(w http.ResponseWriter, r *http.Request) {
+	var body modelRepairRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Model)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if isFixedModelName(name) {
+		writeError(w, http.StatusBadRequest, errors.New("fixed models cannot be repaired; open the base model and apply a new fix"))
+		return
+	}
+	if !body.Confirm {
+		writeError(w, http.StatusBadRequest, errors.New("confirmation is required before applying a repair"))
+		return
+	}
+	show, err := s.ollama.Show(r.Context(), name)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	preview, err := buildModelRepairPreview(name, show, body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	modelfile := strings.TrimSpace(body.Modelfile)
+	from, system, template, parameters, err := parseRepairModelfile(modelfile, preview.BaseName, preview)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	renderer := extractLineDirective(modelfile, "RENDERER")
+	parser := extractLineDirective(modelfile, "PARSER")
+	createReq := ollama.CreateRequest{
+		Model:      preview.TargetName,
+		From:       from,
+		System:     system,
+		Template:   template,
+		Parameters: parameters,
+		Renderer:   renderer,
+		Parser:     parser,
+		Modelfile:  modelfile,
+		Stream:     false,
+	}
+	if digest := blobDigest(from); digest != "" {
+		createReq.From = ""
+		createReq.Files = map[string]string{"model.gguf": digest}
+	}
+	isStream := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	var flusher http.Flusher
+	if isStream {
+		if f, ok := w.(http.Flusher); ok {
+			flusher = f
+		} else {
+			isStream = false
+		}
+	}
+	if isStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
+
+	sendSSE := func(event string, payload any) {
+		if !isStream {
+			return
+		}
+		buf, _ := json.Marshal(payload)
+		if event != "" {
+			fmt.Fprintf(w, "event: %s\n", event)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", buf)
+		flusher.Flush()
+	}
+
+	projector := strings.TrimSpace(body.Projector)
+	if projector != "" {
+		modelDigest := blobDigest(from)
+		if modelDigest == "" {
+			if isStream {
+				sendSSE("error", map[string]any{"error": "cannot attach a vision projector without a GGUF model blob"})
+			} else {
+				writeError(w, http.StatusBadRequest, errors.New("cannot attach a vision projector without a GGUF model blob"))
+			}
+			return
+		}
+		sendSSE("progress", map[string]any{
+			"stage":   "downloading_projector",
+			"percent": 0,
+		})
+		projHex, err := s.downloadProjector(r.Context(), projector, func(completed, total int64) {
+			pct := float64(0)
+			if total > 0 {
+				pct = float64(completed) / float64(total) * 100
+			}
+			sendSSE("progress", map[string]any{
+				"stage":     "downloading_projector",
+				"completed": completed,
+				"total":     total,
+				"percent":   pct,
+			})
+		})
+		if err != nil {
+			if isStream {
+				sendSSE("error", map[string]any{"error": err.Error()})
+			} else {
+				writeError(w, http.StatusBadGateway, err)
+			}
+			return
+		}
+		createReq.From = ""
+		createReq.Files = map[string]string{
+			"model.gguf":  modelDigest,
+			"mmproj.gguf": "sha256:" + projHex,
+		}
+	}
+	replacing := s.modelExists(r.Context(), preview.TargetName)
+	if isStream {
+		sendSSE("progress", map[string]any{
+			"stage":   "creating_model",
+			"percent": 0,
+		})
+		err = s.ollama.CreateStream(r.Context(), createReq, func(ev ollama.CreateProgress) error {
+			pct := float64(0)
+			if ev.Total > 0 {
+				pct = float64(ev.Completed) / float64(ev.Total) * 100
+			}
+			sendSSE("progress", map[string]any{
+				"stage":     "creating_model",
+				"status":    ev.Status,
+				"completed": ev.Completed,
+				"total":     ev.Total,
+				"percent":   pct,
+			})
+			return nil
+		})
+	} else {
+		err = s.ollama.Create(r.Context(), createReq)
+	}
+	if err != nil {
+		if isStream {
+			sendSSE("error", map[string]any{"error": err.Error()})
+		} else {
+			writeError(w, http.StatusBadGateway, err)
+		}
+		return
+	}
+	if s.customModels != nil {
+		_ = s.customModels.Register(preview.TargetName, preview.BaseName)
+	}
+	if s.usage != nil {
+		_ = s.usage.InheritUsage(preview.BaseName, preview.TargetName)
+	}
+	resPayload := map[string]any{
+		"base_name":   preview.BaseName,
+		"target_name": preview.TargetName,
+		"replaced":    replacing,
+		"warnings":    preview.Warnings,
+	}
+	if isStream {
+		sendSSE("done", resPayload)
+	} else {
+		writeJSON(w, http.StatusOK, resPayload)
+	}
+}
+
+// maxProjectorBytes caps the size of a downloaded mmproj file (8 GiB) to avoid
+// pathological downloads from a user-provided URL.
+const maxProjectorBytes = 8 << 30
+
+// projectorHTTPClient is the HTTP client used to download mmproj files. It is a
+// package variable so tests can replace it with a stub transport.
+var projectorHTTPClient = http.DefaultClient
+
+func formatBytesInt64(b int64) string {
+	if b <= 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func (s *Server) fetchProjectorSize(ctx context.Context, ref string) (int64, error) {
+	u, err := resolveProjectorURL(ref)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("User-Agent", "iamanager")
+	resp, err := projectorHTTPClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.ContentLength, nil
+}
+
+func (s *Server) checkRepairProjectorDisk(ctx context.Context, preview *modelRepairPreview) {
+	if preview == nil || preview.Projector == "" {
+		return
+	}
+	headCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	projBytes, err := s.fetchProjectorSize(headCtx, preview.Projector)
+	if err != nil || projBytes <= 0 {
+		projBytes = 850 * 1024 * 1024 // fallback estimate ~850MB
+	}
+	preview.ProjectorBytes = projBytes
+
+	s.cfgMu.RLock()
+	cfgPath := s.cfg.Path()
+	lang := s.cfg.Language
+	s.cfgMu.RUnlock()
+
+	diskPath := resolveDiskProbePath(cfgPath)
+	sys := sysmetrics.Collect(ctx, diskPath)
+	if sys.DiskFree > 0 {
+		preview.FreeDiskBytes = sys.DiskFree
+		// Required space: projector download in temp (%TEMP%) + blob in Ollama (~/.ollama/models/blobs) + 512 MB safety buffer
+		required := uint64(projBytes)*2 + 512*1024*1024
+		preview.RequiredDiskBytes = required
+		if sys.DiskFree < required {
+			preview.DiskSpaceWarning = true
+			if lang == "es" {
+				preview.Warnings = append(preview.Warnings, fmt.Sprintf(
+					"⚠️ Advertencia de espacio en disco: Instalar este proyector de visión requiere aproximadamente %s libres en disco (%s de descarga + almacenamiento temporal), pero solo dispones de %s libres.",
+					formatBytesInt64(int64(required)),
+					formatBytesInt64(projBytes),
+					formatBytesInt64(int64(sys.DiskFree)),
+				))
+			} else {
+				preview.Warnings = append(preview.Warnings, fmt.Sprintf(
+					"⚠️ Low disk space warning: Installing this vision projector requires approximately %s of free disk space (%s download + temporary storage), but only %s is available.",
+					formatBytesInt64(int64(required)),
+					formatBytesInt64(projBytes),
+					formatBytesInt64(int64(sys.DiskFree)),
+				))
+			}
+		}
+	}
+}
+
+type progressReader struct {
+	r         io.Reader
+	total     int64
+	completed int64
+	onProg    func(completed, total int64)
+	lastTime  time.Time
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	if n > 0 {
+		pr.completed += int64(n)
+		if pr.onProg != nil && (time.Since(pr.lastTime) > 100*time.Millisecond || err != nil) {
+			pr.lastTime = time.Now()
+			pr.onProg(pr.completed, pr.total)
+		}
+	}
+	return n, err
+}
+
+// downloadProjector downloads a vision projector (mmproj) GGUF from Hugging Face,
+// computes its SHA-256 digest and pushes the blob into Ollama's store if it is
+// not already present. It returns the hex digest (without the "sha256:" prefix).
+func (s *Server) downloadProjector(ctx context.Context, ref string, onProgress func(completed, total int64)) (string, error) {
+	u, err := resolveProjectorURL(ref)
+	if err != nil {
+		return "", err
+	}
+	return s.downloadBlob(ctx, u, onProgress)
+}
+
+// downloadBlob fetches a blob from u, hashes it and ensures it is stored in
+// Ollama under its content digest.
+func (s *Server) downloadBlob(ctx context.Context, u string, onProgress func(completed, total int64)) (string, error) {
+	s.projectorCacheMu.RLock()
+	cachedHex := s.projectorCache[u]
+	s.projectorCacheMu.RUnlock()
+
+	if cachedHex != "" {
+		digest := "sha256:" + cachedHex
+		if exists, err := s.ollama.HeadBlob(ctx, digest); err == nil && exists {
+			if onProgress != nil {
+				onProgress(1, 1)
+			}
+			return cachedHex, nil
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "iamanager")
+	resp, err := projectorHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("downloading projector failed: %s", resp.Status)
+	}
+
+	contentLength := resp.ContentLength
+	if onProgress != nil && contentLength > 0 {
+		onProgress(0, contentLength)
+	}
+
+	tmp, err := os.CreateTemp("", "iamanager-mmproj-*")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	defer tmp.Close()
+
+	h := sha256.New()
+	var pr io.Reader = resp.Body
+	if onProgress != nil {
+		pr = &progressReader{
+			r:        resp.Body,
+			total:    contentLength,
+			onProg:   onProgress,
+			lastTime: time.Now(),
+		}
+	}
+	n, err := io.Copy(tmp, io.TeeReader(io.LimitReader(pr, maxProjectorBytes+1), h))
+	if err != nil {
+		return "", err
+	}
+	if n > maxProjectorBytes {
+		return "", errors.New("projector file is too large")
+	}
+	if onProgress != nil && contentLength > 0 {
+		onProgress(n, contentLength)
+	}
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+
+	hexSum := hex.EncodeToString(h.Sum(nil))
+	digest := "sha256:" + hexSum
+
+	exists, err := s.ollama.HeadBlob(ctx, digest)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		if err := s.ollama.CreateBlob(ctx, digest, tmp); err != nil {
+			return "", err
+		}
+	}
+
+	s.projectorCacheMu.Lock()
+	if s.projectorCache == nil {
+		s.projectorCache = make(map[string]string)
+	}
+	s.projectorCache[u] = hexSum
+	s.projectorCacheMu.Unlock()
+
+	return hexSum, nil
+}
+
+func (s *Server) modelExists(ctx context.Context, name string) bool {
+	models, err := s.ollama.List(ctx)
+	if err != nil {
+		return false
+	}
+	for _, m := range models {
+		if m.Name == name || m.Model == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ---------- model create (modelfile studio) ----------
+
+type modelCreateRequestBody struct {
+	Name       string            `json:"name"`
+	From       string            `json:"from,omitempty"`
+	Modelfile  string            `json:"modelfile,omitempty"`
+	System     string            `json:"system,omitempty"`
+	Template   string            `json:"template,omitempty"`
+	Parameters map[string]any    `json:"parameters,omitempty"`
+	Files      map[string]string `json:"files,omitempty"`
+}
+
+func (s *Server) handleCreateModel(w http.ResponseWriter, r *http.Request) {
+	var body modelCreateRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+
+	createReq := ollama.CreateRequest{
+		Model:      name,
+		From:       strings.TrimSpace(body.From),
+		System:     strings.TrimSpace(body.System),
+		Template:   strings.TrimSpace(body.Template),
+		Parameters: body.Parameters,
+		Modelfile:  strings.TrimSpace(body.Modelfile),
+		Files:      body.Files,
+	}
+
+	isStream := strings.Contains(r.Header.Get("Accept"), "text/event-stream")
+	var flusher http.Flusher
+	if isStream {
+		if f, ok := w.(http.Flusher); ok {
+			flusher = f
+		} else {
+			isStream = false
+		}
+	}
+	if isStream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+	}
+
+	sendSSE := func(event string, payload any) {
+		if !isStream {
+			return
+		}
+		buf, _ := json.Marshal(payload)
+		if event != "" {
+			fmt.Fprintf(w, "event: %s\n", event)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", buf)
+		flusher.Flush()
+	}
+
+	onSuccess := func() {
+		baseModel := strings.TrimSpace(body.From)
+		if baseModel == "" && body.Modelfile != "" {
+			baseModel = extractLineDirective(body.Modelfile, "FROM")
+		}
+		if baseModel != "" && isLocalFilePathOrDigest(baseModel) {
+			baseModel = ""
+		}
+		if s.customModels != nil {
+			_ = s.customModels.Register(name, baseModel)
+		}
+		if s.usage != nil && baseModel != "" {
+			_ = s.usage.InheritUsage(baseModel, name)
+		}
+	}
+
+	if isStream {
+		sendSSE("status", map[string]any{
+			"status": "starting",
+			"model":  name,
+		})
+		err := s.ollama.CreateStream(r.Context(), createReq, func(ev ollama.CreateProgress) error {
+			sendSSE("progress", ev)
+			return nil
+		})
+		if err != nil {
+			sendSSE("error", map[string]any{"error": err.Error()})
+			return
+		}
+		onSuccess()
+		sendSSE("done", map[string]any{"model": name, "success": true})
+		return
+	}
+
+	if err := s.ollama.Create(r.Context(), createReq); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	onSuccess()
+	writeJSON(w, http.StatusOK, map[string]any{"model": name, "success": true})
+}
+
+// ---------- chat ----------
+
+type chatRequestBody struct {
+	Model       string               `json:"model"`
+	Messages    []ollama.ChatMessage `json:"messages"`
+	Think       *ollama.ThinkLevel   `json:"think,omitempty"`
+	Options     map[string]any       `json:"options,omitempty"`
+	WebTools    *bool                `json:"web_tools,omitempty"`
+	Artifacts   *bool                `json:"artifacts,omitempty"`
+	Skills         *bool                `json:"skills,omitempty"`
+	SelectedSkills *[]string            `json:"selected_skills"`
+	MCP            *bool                `json:"mcp,omitempty"`
+	MCPServers  []string             `json:"mcp_servers,omitempty"`
+	ArtifactDir string               `json:"artifact_dir,omitempty"`
+	Width       int                  `json:"width,omitempty"`
+	Height      int                  `json:"height,omitempty"`
+	Steps       int                  `json:"steps,omitempty"`
+	// Comfy turns on the ComfyUI tool, and ComfyWorkflow names the workflow a
+	// bare call should use. Both are independent of Artifacts and WebTools: a
+	// plain vision chat can generate images without an artifact workspace.
+	Comfy         *bool    `json:"comfy,omitempty"`
+	ComfyWorkflow string   `json:"comfy_workflow,omitempty"`
+	RAGEnabled    bool     `json:"rag_enabled,omitempty"`
+	RAGPaths      []string `json:"rag_paths,omitempty"`
+	RAGEditable   []string `json:"rag_editable,omitempty"`
+	// SessionID is the persistent chat session this run belongs to, if any. It
+	// decides which folder the generated media lands in.
+	SessionID string `json:"session_id,omitempty"`
+	// BrowserToolsAvailable reports whether a browser can answer the two
+	// browser-only artifact tools. A detached session run passes a live check
+	// rather than a constant, so a session started unattended gains them as soon
+	// as a tab opens it. Nil means "always available", which is the case for the
+	// quick chat: it is streaming into a browser by definition.
+	BrowserToolsAvailable func() bool `json:"-"`
+}
+
+// browserToolsAllowed resolves BrowserToolsAvailable for the artifact loop.
+func (b chatRequestBody) browserToolsAllowed() bool {
+	if b.BrowserToolsAvailable == nil {
+		return true
+	}
+	return b.BrowserToolsAvailable()
+}
+
+// estimateTextTokens is a rough fallback (~4 chars per token) used when Ollama
+// does not report token counts, e.g. for some vision/OCR responses.
+func estimateTextTokens(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := utf8.RuneCountInString(s)
+	if n < 4 {
+		return 1
+	}
+	return n / 4
+}
+
+// modelFamily returns all model names in the same custom/base lineage as name:
+// name itself, its base model (if name is custom), and any custom models derived
+// from name or from its base model.
+func (s *Server) modelFamily(name string) []string {
+	if name == "" {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	seen := map[string]bool{name: true}
+	family := []string{name}
+
+	add := func(n string) {
+		n = strings.TrimSpace(n)
+		if n != "" && !seen[n] {
+			seen[n] = true
+			family = append(family, n)
+		}
+	}
+
+	// Support :latest tag equivalence (e.g. "model" <-> "model:latest")
+	if strings.HasSuffix(name, ":latest") {
+		add(strings.TrimSuffix(name, ":latest"))
+	} else if !strings.Contains(name, ":") {
+		add(name + ":latest")
+	}
+
+	base := ""
+	if s.customModels != nil {
+		base = s.customModels.GetBase(name)
+	}
+	if base != "" {
+		add(base)
+		if strings.HasSuffix(base, ":latest") {
+			add(strings.TrimSuffix(base, ":latest"))
+		} else if !strings.Contains(base, ":") {
+			add(base + ":latest")
+		}
+	}
+
+	if s.customModels != nil {
+		for custom, rec := range s.customModels.All() {
+			if rec.BaseModel == name || (base != "" && rec.BaseModel == base) {
+				add(custom)
+			}
+			if custom == name && rec.BaseModel != "" {
+				add(rec.BaseModel)
+			}
+		}
+	}
+
+	return family
+}
+
+// getModelUsage retrieves the usage record for name, unifying velocity (record tokens/sec),
+// load times, and last used across custom models and their base parent model.
+func (s *Server) getModelUsage(name string) (ModelUsageRecord, bool) {
+	if s.usage == nil || name == "" {
+		return ModelUsageRecord{}, false
+	}
+	family := s.modelFamily(name)
+
+	var targetRec ModelUsageRecord
+	var targetFound bool
+	if rec, ok := s.usage.Get(name); ok {
+		targetRec = rec
+		targetFound = true
+	}
+
+	var bestTelemetry ModelUsageRecord
+	var hasTelemetry bool
+
+	for _, member := range family {
+		if rec, ok := s.usage.Get(member); ok {
+			if rec.RecordTokensPerSec > 0 || rec.LastUsedAt != nil || rec.MinColdLoadMs > 0 || rec.TotalCalls > 0 {
+				if !hasTelemetry {
+					bestTelemetry = rec
+					hasTelemetry = true
+				} else {
+					bestTelemetry = mergeBaseUsage(bestTelemetry, rec)
+				}
+			}
+		}
+	}
+
+	if !targetFound && !hasTelemetry {
+		return ModelUsageRecord{}, false
+	}
+	if !hasTelemetry {
+		return targetRec, true
+	}
+	merged := mergeBaseUsage(targetRec, bestTelemetry)
+	return merged, true
+}
+
+func (s *Server) syncAllModelUsageFamilies() {
+	if s.usage == nil {
+		return
+	}
+	if s.customModels != nil {
+		for custom, rec := range s.customModels.All() {
+			if rec.BaseModel != "" {
+				_ = s.usage.InheritUsage(rec.BaseModel, custom)
+			}
+		}
+	}
+}
+
+// recordModelUsage records token telemetry across the entire family (custom and base model).
+func (s *Server) recordModelUsage(name string, evalCount int, evalDurationNs int64, promptEvalCount int, usedAt time.Time) {
+	if s.usage == nil || name == "" {
+		return
+	}
+	for _, member := range s.modelFamily(name) {
+		_ = s.usage.Record(member, evalCount, evalDurationNs, promptEvalCount, usedAt)
+	}
+}
+
+func (s *Server) recordModelTPS(name string, tps float64, usedAt time.Time) {
+	if s.usage == nil || name == "" {
+		return
+	}
+	for _, member := range s.modelFamily(name) {
+		_ = s.usage.RecordTPS(member, tps, usedAt)
+	}
+}
+
+func (s *Server) recordModelColdLoad(name string, durationMs int64, at time.Time) {
+	if s.usage == nil || name == "" {
+		return
+	}
+	for _, member := range s.modelFamily(name) {
+		_ = s.usage.RecordColdLoad(member, durationMs, at)
+	}
+}
+
+// recordModelSpeech stores one text-to-speech invocation against the model and
+// every member of its family.
+func (s *Server) recordModelSpeech(name string, inputChars, audioBytes int, latencyMs int64, cold bool, at time.Time) {
+	if s.usage == nil || name == "" {
+		return
+	}
+	for _, member := range s.modelFamily(name) {
+		_ = s.usage.RecordSpeech(member, inputChars, audioBytes, latencyMs, cold, at)
+	}
+}
+
+// recordModelDecision stores one System One ("decision") invocation against the
+// model and every member of its family.
+func (s *Server) recordModelDecision(name string, questions, inputTokens, outputTokens int, latencyMs int64, cold bool, at time.Time) {
+	if s.usage == nil || name == "" {
+		return
+	}
+	for _, member := range s.modelFamily(name) {
+		_ = s.usage.RecordDecision(member, questions, inputTokens, outputTokens, latencyMs, cold, at)
+	}
+}
+
+// sameModelName reports whether two Ollama model references point at the same
+// model, tolerating the ":latest" tag and registry namespaces.
+func sameModelName(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	if strings.TrimSuffix(a, ":latest") == strings.TrimSuffix(b, ":latest") {
+		return true
+	}
+	aBase := a[strings.LastIndex(a, "/")+1:]
+	bBase := b[strings.LastIndex(b, "/")+1:]
+	return strings.TrimSuffix(aBase, ":latest") == strings.TrimSuffix(bBase, ":latest")
+}
+
+// recordCancelUsage records a cancelled streaming response as used when it was
+// progressing too slowly to wait for completion (< cancelRecordThreshold). Rates
+// below minRecordTPS are indexed at that floor so the model is registered as
+// functional but extremely slow. At or above the threshold nothing is saved;
+// the response must complete to count. The cancellation is only registered when
+// the model has no record yet: once it has a recorded tokens-per-second, a
+// cancelled response is never saved.
+func (s *Server) recordCancelUsage(model, content string, startedAt time.Time) {
+	if s.usage == nil {
+		return
+	}
+	if rec, ok := s.usage.Get(model); ok && rec.RecordTokensPerSec > 0 {
+		return
+	}
+	est := estimateTextTokens(content)
+	if est <= 0 {
+		return
+	}
+	elapsed := time.Since(startedAt)
+	if elapsed <= 0 {
+		return
+	}
+	tps := float64(est) / elapsed.Seconds()
+	switch {
+	case tps < minRecordTPS:
+		s.recordModelTPS(model, minRecordTPS, time.Now())
+	case tps < cancelRecordThreshold:
+		s.recordModelTPS(model, tps, time.Now())
+	}
+}
+
+// estimatePromptTokens approximates prompt token usage from the request when
+// Ollama reports a zero prompt_eval_count (vision/OCR requests). Text counts
+// roughly one token per 4 characters plus a nominal allowance per image.
+func estimatePromptTokens(body chatRequestBody) int {
+	var b strings.Builder
+	for _, m := range body.Messages {
+		b.WriteString(m.Content)
+		b.WriteString("\n")
+	}
+	tokens := estimateTextTokens(b.String())
+	for _, m := range body.Messages {
+		tokens += len(m.Images) * 256
+	}
+	return tokens
+}
+
+// embeddingThroughput returns the token count and duration (nanoseconds) used
+// to record a speed for an embedding request. Ollama's /api/embed does not
+// report eval timing, only prompt_eval_count plus total/load durations, so when
+// neither eval nor prompt-eval duration is available the prompt tokens are
+// measured against the compute portion of the request (total minus load).
+func embeddingThroughput(out *ollama.EmbedResponse) (int, int64) {
+	count := out.EvalCount
+	durationNs := out.EvalDuration
+	if count <= 0 || durationNs <= 0 {
+		count = out.PromptEvalCount
+		durationNs = out.PromptEvalDuration
+	}
+	if durationNs <= 0 && count > 0 && out.TotalDuration > 0 {
+		if compute := out.TotalDuration - out.LoadDuration; compute > 0 {
+			durationNs = compute
+		}
+	}
+	return count, durationNs
+}
+
+func (s *Server) handleEmbed(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Model string          `json:"model"`
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	body.Model = strings.TrimSpace(body.Model)
+	if body.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'model'"))
+		return
+	}
+	// input may be a text string or a list of multimodal objects
+	// ({text,image,audio}) for embedding models that accept image/audio.
+	rawInput := bytes.TrimSpace(body.Input)
+	if len(rawInput) == 0 || string(rawInput) == "null" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'input'"))
+		return
+	}
+	var input any
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid 'input': %w", err))
+		return
+	}
+	if s, ok := input.(string); ok {
+		input = strings.TrimSpace(s)
+		if input == "" {
+			writeError(w, http.StatusBadRequest, errors.New("missing 'input'"))
+			return
+		}
+	} else if arr, ok := input.([]any); ok && len(arr) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'input'"))
+		return
+	}
+
+	var wasCold bool = true
+	if running, err := s.ollama.PS(r.Context()); err == nil {
+		for _, rm := range running {
+			if sameModelName(rm.Name, body.Model) || sameModelName(rm.Model, body.Model) {
+				wasCold = false
+				break
+			}
+		}
+	}
+
+	out, err := s.ollama.Embed(r.Context(), body.Model, input)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+
+	count, durationNs := embeddingThroughput(out)
+	s.recordModelUsage(body.Model, count, durationNs, out.PromptEvalCount, time.Now())
+	if wasCold && out.LoadDuration > 0 {
+		s.recordModelColdLoad(body.Model, out.LoadDuration/1e6, time.Now())
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"model":     body.Model,
+		"embedding": out.Embedding,
+		"dims":      len(out.Embedding),
+	})
+}
+
+// handleSpeech proxies the OpenAI-compatible POST /v1/audio/speech so a
+// "speech" model can turn text into audio. The response is raw audio, never
+// JSON: the browser plays it from a blob URL.
+func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Model  string `json:"model"`
+		Input  string `json:"input"`
+		Voice  string `json:"voice"`
+		Format string `json:"format"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	body.Model = strings.TrimSpace(body.Model)
+	if body.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'model'"))
+		return
+	}
+	body.Input = strings.TrimSpace(body.Input)
+	if body.Input == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'input'"))
+		return
+	}
+	// Ollama rejects longer inputs; fail here with a message that names the
+	// limit instead of forwarding a 400 from the engine.
+	if n := utf8.RuneCountInString(body.Input); n > 4096 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("input too long: %d characters (limit 4096)", n))
+		return
+	}
+
+	// The endpoint reports no timing of its own, so measure wall clock and note
+	// whether the model had to be loaded for this request.
+	wasCold := true
+	if running, err := s.ollama.PS(r.Context()); err == nil {
+		for _, rm := range running {
+			if sameModelName(rm.Name, body.Model) || sameModelName(rm.Model, body.Model) {
+				wasCold = false
+				break
+			}
+		}
+	}
+
+	started := time.Now()
+	audio, contentType, err := s.ollama.Speech(r.Context(), ollama.SpeechRequest{
+		Model:  body.Model,
+		Input:  body.Input,
+		Voice:  strings.TrimSpace(body.Voice),
+		Format: strings.TrimSpace(body.Format),
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	latencyMs := time.Since(started).Milliseconds()
+	if latencyMs < 1 {
+		latencyMs = 1
+	}
+	s.recordModelSpeech(body.Model, utf8.RuneCountInString(body.Input), len(audio), latencyMs, wasCold, time.Now())
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(audio)
+}
+
+// speechVoiceList returns the voices a speech model can speak with. Ollama
+// reports the checkpoint's own voice profiles in /api/show and always accepts
+// "default" for the voice baked into the checkpoint, so it leads the list.
+func speechVoiceList(voices []string) []string {
+	out := make([]string, 0, len(voices)+1)
+	seen := make(map[string]bool, len(voices)+1)
+	for _, v := range append([]string{"default"}, voices...) {
+		name := strings.TrimSpace(v)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, name)
+	}
+	return out
+}
+
+// handleSpeechVoices lists the voices of one speech model so the chat can offer
+// them in a selector. Ollama has no dedicated endpoint for this: the voices are
+// part of /api/show, which is what "ollama show" prints.
+func (s *Server) handleSpeechVoices(w http.ResponseWriter, r *http.Request) {
+	model := strings.TrimSpace(r.URL.Query().Get("model"))
+	if model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'model'"))
+		return
+	}
+	show, err := s.ollama.Show(r.Context(), model)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"model":  model,
+		"voices": speechVoiceList(show.Voices),
+		// reported is how many voices the engine itself listed. Ollama only
+		// fills the field from 0.40.11 on, so 0 means "cannot name them" and
+		// 1 means the checkpoint ships nothing beyond its own voice. The UI
+		// uses it to explain a selector that has a single option.
+		"reported": len(show.Voices),
+	})
+}
+
+// handleDecision proxies POST /v1/systemone for Ollama "decision" (System One)
+// models. Unlike chat/embed these models take a JSON state plus named questions
+// and return JSON answers; there is no streaming and the response carries no
+// load/eval timing, so the handler measures wall-clock latency and, when the
+// model was not loaded beforehand, records that latency as a cold-start value.
+func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Model     string                              `json:"model"`
+		State     json.RawMessage                     `json:"state"`
+		Images    []string                            `json:"images"`
+		Questions map[string]ollama.SystemOneQuestion `json:"questions"`
+		KeepAlive any                                 `json:"keep_alive,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	body.Model = strings.TrimSpace(body.Model)
+	if body.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'model'"))
+		return
+	}
+	state := bytes.TrimSpace(body.State)
+	if len(state) == 0 || string(state) == "null" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'state'"))
+		return
+	}
+	if len(body.Questions) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'questions'"))
+		return
+	}
+	if len(body.Questions) > 64 {
+		writeError(w, http.StatusBadRequest, errors.New("too many questions (max 64)"))
+		return
+	}
+	for name, q := range body.Questions {
+		if strings.TrimSpace(name) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("questions must have non-empty names"))
+			return
+		}
+		switch strings.ToLower(strings.TrimSpace(q.Type)) {
+		case "choice", "noul", "score":
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Errorf("question %q has invalid type %q", name, q.Type))
+			return
+		}
+		if strings.TrimSpace(q.Instructions) == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("question %q is missing instructions", name))
+			return
+		}
+	}
+
+	wasCold := true
+	if running, err := s.ollama.PS(r.Context()); err == nil {
+		for _, rm := range running {
+			if sameModelName(rm.Name, body.Model) || sameModelName(rm.Model, body.Model) {
+				wasCold = false
+				break
+			}
+		}
+	}
+
+	started := time.Now()
+	out, err := s.ollama.SystemOne(r.Context(), ollama.SystemOneRequest{
+		Model:     body.Model,
+		State:     body.State,
+		Images:    body.Images,
+		Questions: body.Questions,
+		KeepAlive: body.KeepAlive,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	latencyMs := time.Since(started).Milliseconds()
+
+	s.recordModelDecision(body.Model, len(body.Questions), out.Usage.InputTokens, out.Usage.OutputTokens, latencyMs, wasCold, time.Now())
+
+	// Return Ollama's response verbatim; the manager's own measurements travel
+	// in headers so the body stays exactly what the model produced.
+	w.Header().Set("X-Ollama-Latency-Ms", fmt.Sprintf("%d", latencyMs))
+	w.Header().Set("X-Ollama-Was-Cold", fmt.Sprintf("%t", wasCold))
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+
+	var body chatRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	body.Model = strings.TrimSpace(body.Model)
+	if body.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'model'"))
+		return
+	}
+	if len(body.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'messages'"))
+		return
+	}
+
+	imageCount := 0
+	for _, m := range body.Messages {
+		imageCount += len(m.Images)
+	}
+	thinkVal := "auto"
+	if body.Think != nil {
+		thinkVal = string(*body.Think)
+	}
+	comfyOn := body.Comfy != nil && *body.Comfy
+	skillsOn := s.skillsEnabled(body)
+	mcpOn := s.mcpEnabled(body)
+	log.Printf("[chat] model=%s messages=%d images=%d artifacts=%v web_tools=%v comfy=%v skills=%v mcp=%v (%d servers) think=%s",
+		body.Model, len(body.Messages), imageCount,
+		body.Artifacts != nil && *body.Artifacts, body.WebTools != nil && *body.WebTools, comfyOn, skillsOn, mcpOn, len(s.selectedMCPServers(body)), thinkVal)
+
+	writeSSEHeaders(w)
+	sink := newSSESink(w, flusher)
+	body = s.augmentChatWithRAG(r.Context(), sink, body)
+
+	if body.Artifacts != nil && *body.Artifacts {
+		s.runArtifactAgentLoop(r.Context(), sink, body)
+		return
+	}
+
+	// The web loop is the lightweight tool runner: it has the tool-call loop but
+	// none of the artifact filesystem surface, which is exactly what ComfyUI-only,
+	// Skills-only, or MCP chats want.
+	if (body.WebTools != nil && *body.WebTools) || comfyOn || s.ragAgentEnabled(r.Context(), body) || skillsOn || mcpOn {
+		s.runWebToolAgentLoop(r.Context(), sink, body)
+		return
+	}
+
+	s.runPlainChatLoop(r.Context(), sink, body)
+}
+
+// ---------- pull (enqueue) ----------
+
+// handlePull enqueues a new download. The job runs asynchronously; clients
+// should subscribe to /api/jobs/events for progress.
+func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing 'name'"))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+
+	job, err := s.jobs.Enqueue(name)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": job.ID,
+		"status": job.Status,
+		"name":   job.Name,
+	})
+}
+
+// ---------- jobs ----------
+
+func (s *Server) handleJobsList(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": s.jobs.List()})
+}
+
+func modelRepoBase(name string) string {
+	s := strings.TrimSpace(name)
+	s = strings.ToLower(s)
+	for _, p := range []string{"https://", "http://"} {
+		s = strings.TrimPrefix(s, p)
+	}
+	s = strings.TrimPrefix(s, "ollama.com/library/")
+	s = strings.TrimPrefix(s, "ollama.com/")
+	// hf.co and huggingface.co are the same registry: group them together.
+	if strings.HasPrefix(s, "hf.co/") {
+		s = "huggingface.co/" + strings.TrimPrefix(s, "hf.co/")
+	}
+	idx := strings.Index(s, ":")
+	if idx != -1 {
+		s = s[:idx]
+	}
+	return strings.TrimSpace(s)
+}
+
+func (s *Server) handleDownloadHistory(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing name"))
+		return
+	}
+	repoBase := modelRepoBase(name)
+	resp := map[string]any{
+		"name":      name,
+		"repo_base": repoBase,
+		"exists":    false,
+	}
+	if h, ok := s.jobs.History(name); ok {
+		resp["exists"] = true
+		resp["history"] = h
+	}
+	if s.uninst != nil {
+		if u, ok := s.uninst.Get(name); ok {
+			resp["uninstall"] = map[string]any{
+				"reason": u.LastReason,
+				"at":     u.LastUninstallAt,
+			}
+		}
+	}
+	if s.usage != nil {
+		if u, ok := s.usage.Get(name); ok {
+			resp["usage"] = map[string]any{
+				"last_used_at":             u.LastUsedAt,
+				"record_tokens_per_sec":    u.RecordTokensPerSec,
+				"record_tokens_per_sec_at": u.RecordTokensPerSecAt,
+				"min_cold_load_ms":         u.MinColdLoadMs,
+				"min_cold_load_at":         u.MinColdLoadAt,
+				"total_tokens":             u.TotalTokens,
+				"total_calls":              u.TotalCalls,
+			}
+		}
+	}
+
+	// Collect related models from the same repository
+	type relatedItem struct {
+		Name        string         `json:"name"`
+		IsInstalled bool           `json:"is_installed"`
+		History     any            `json:"history,omitempty"`
+		Uninstall   map[string]any `json:"uninstall,omitempty"`
+		Usage       map[string]any `json:"usage,omitempty"`
+	}
+
+	candidates := make(map[string]bool)
+	installedMap := make(map[string]bool)
+
+	if s.ollama != nil {
+		if installedList, err := s.ollama.List(r.Context()); err == nil {
+			for _, m := range installedList {
+				installedMap[m.Name] = true
+				installedMap[strings.ToLower(m.Name)] = true
+				candidates[m.Name] = true
+			}
+		}
+	}
+
+	if s.jobs != nil {
+		for cand := range s.jobs.AllHistory() {
+			candidates[cand] = true
+		}
+	}
+	if s.uninst != nil {
+		for cand := range s.uninst.All() {
+			candidates[cand] = true
+		}
+	}
+	if s.usage != nil {
+		for cand := range s.usage.All() {
+			candidates[cand] = true
+		}
+	}
+
+	var related []relatedItem
+	for cand := range candidates {
+		if cand == "" {
+			continue
+		}
+		candRepo := modelRepoBase(cand)
+		if repoBase != "" && candRepo == repoBase {
+			item := relatedItem{
+				Name:        cand,
+				IsInstalled: installedMap[cand] || installedMap[strings.ToLower(cand)],
+			}
+			if s.jobs != nil {
+				if h, ok := s.jobs.History(cand); ok {
+					item.History = h
+				}
+			}
+			if s.uninst != nil {
+				if u, ok := s.uninst.Get(cand); ok && u.LastReason != "" {
+					item.Uninstall = map[string]any{
+						"reason": u.LastReason,
+						"at":     u.LastUninstallAt,
+					}
+				}
+			}
+			if s.usage != nil {
+				if u, ok := s.usage.Get(cand); ok && (u.TotalCalls > 0 || u.RecordTokensPerSec > 0 || u.MinColdLoadMs > 0 || u.LastUsedAt != nil) {
+					item.Usage = map[string]any{
+						"last_used_at":             u.LastUsedAt,
+						"record_tokens_per_sec":    u.RecordTokensPerSec,
+						"record_tokens_per_sec_at": u.RecordTokensPerSecAt,
+						"min_cold_load_ms":         u.MinColdLoadMs,
+						"min_cold_load_at":         u.MinColdLoadAt,
+						"total_tokens":             u.TotalTokens,
+						"total_calls":              u.TotalCalls,
+					}
+				}
+			}
+			related = append(related, item)
+		}
+	}
+
+	// Sort related: installed first, then by name
+	sort.Slice(related, func(i, j int) bool {
+		if related[i].IsInstalled != related[j].IsInstalled {
+			return related[i].IsInstalled
+		}
+		return related[i].Name < related[j].Name
+	})
+
+	resp["related_models"] = related
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleJobsEvents streams job lifecycle updates as Server-Sent Events.
+// On connect it first emits a "snapshot" event with the current list, then
+// an "update" or "remove" event for every change until the client disconnects.
+func (s *Server) handleJobsEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	send := func(event string, payload any) {
+		buf, _ := json.Marshal(payload)
+		if event != "" {
+			fmt.Fprintf(w, "event: %s\n", event)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", buf)
+		flusher.Flush()
+	}
+
+	send("snapshot", map[string]any{"jobs": s.jobs.List(), "queue_paused": s.jobs.IsQueuePaused()})
+
+	ch, cancel := s.jobs.Subscribe()
+	defer cancel()
+
+	// Heartbeat to keep proxies from closing idle connections.
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			switch ev.Kind {
+			case jobs.EventUpdate:
+				send("update", map[string]any{"job": ev.Job, "queue_paused": s.jobs.IsQueuePaused()})
+			case jobs.EventRemove:
+				send("remove", map[string]any{"id": ev.ID, "queue_paused": s.jobs.IsQueuePaused()})
+			}
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+	if err := s.jobs.Cancel(id); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleJobRemove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+	if err := s.jobs.Remove(id); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleJobsClear(w http.ResponseWriter, r *http.Request) {
+	removed := s.jobs.ClearFinished()
+	writeJSON(w, http.StatusOK, map[string]any{"removed": removed})
+}
+
+func (s *Server) handleJobPause(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+	if err := s.jobs.Pause(id); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleJobResume(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+	if err := s.jobs.Resume(id); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleJobPromote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing id"))
+		return
+	}
+	if err := s.jobs.Promote(id); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleJobsPauseQueue(w http.ResponseWriter, r *http.Request) {
+	s.jobs.PauseQueue()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queue_paused": true})
+}
+
+func (s *Server) handleJobsResumeQueue(w http.ResponseWriter, r *http.Request) {
+	s.jobs.ResumeQueue()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "queue_paused": false})
+}
+
+// ---------- artifact files ----------
+
+var artifactTitleTagRe = regexp.MustCompile(`(?i)<title[^>]*>([^<]+)</title>`)
+
+// artifactEntry describes one saved artifact project for a model.
+type artifactEntry struct {
+	ID          string `json:"id"` // "<digest>/<date>", used as artifact_dir
+	Digest      string `json:"digest"`
+	Date        string `json:"date"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	FileCount   int    `json:"file_count"`
+	Size        int64  `json:"size"`
+}
+
+// handleListModelArtifacts lists every artifact project a model has created.
+// Path: GET /api/models/{name}/artifacts
+func (s *Server) handleListModelArtifacts(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	artifacts := []artifactEntry{}
+	if digest := s.artifactModelDigest(r.Context(), name); digest != "" {
+		root := filepath.Join("artifacts", digest)
+		if entries, err := os.ReadDir(root); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				dir := filepath.Join(root, e.Name())
+				fileCount, size := dirInfo(dir)
+				var artName, artDesc string
+				for _, metaFilename := range []string{".artifact.json", "artifact.json"} {
+					if metaBytes, err := os.ReadFile(filepath.Join(dir, metaFilename)); err == nil {
+						var meta struct {
+							Name        string `json:"name"`
+							Description string `json:"description"`
+						}
+						if json.Unmarshal(metaBytes, &meta) == nil {
+							artName = strings.TrimSpace(meta.Name)
+							artDesc = strings.TrimSpace(meta.Description)
+							break
+						}
+					}
+				}
+				if artName == "" {
+					if indexBytes, err := os.ReadFile(filepath.Join(dir, "index.html")); err == nil {
+						if match := artifactTitleTagRe.FindSubmatch(indexBytes); len(match) > 1 {
+							artName = strings.TrimSpace(string(match[1]))
+						}
+					}
+				}
+				artifacts = append(artifacts, artifactEntry{
+					ID:          digest + "/" + e.Name(),
+					Digest:      digest,
+					Date:        e.Name(),
+					Name:        artName,
+					Description: artDesc,
+					FileCount:   fileCount,
+					Size:        size,
+				})
+			}
+			sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].Date > artifacts[j].Date })
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": name, "artifacts": artifacts})
+}
+
+// handleDeleteArtifact removes an artifact project from disk.
+// Path: DELETE /api/artifacts/{rest...}
+func (s *Server) handleDeleteArtifact(w http.ResponseWriter, r *http.Request) {
+	rest := r.PathValue("rest")
+	if rest == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("missing artifact id"))
+		return
+	}
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid artifact id"))
+		return
+	}
+
+	var targetDir string
+	if len(parts) >= 2 {
+		targetDir = filepath.Join("artifacts", parts[0], parts[1])
+	} else {
+		targetDir = filepath.Join("artifacts", parts[0])
+	}
+
+	cleanTarget := filepath.Clean(targetDir)
+	cleanArtifacts, _ := filepath.Abs("artifacts")
+	absTarget, err := filepath.Abs(cleanTarget)
+	if err != nil || !strings.HasPrefix(absTarget, cleanArtifacts+string(filepath.Separator)) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid artifact path"))
+		return
+	}
+
+	if info, err := os.Stat(cleanTarget); err != nil || !info.IsDir() {
+		writeError(w, http.StatusNotFound, fmt.Errorf("artifact not found"))
+		return
+	}
+
+	if err := os.RemoveAll(cleanTarget); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to delete artifact: %w", err))
+		return
+	}
+
+	// Clean up empty parent digest folder if no more artifacts remain
+	if len(parts) >= 2 {
+		parentDir := filepath.Join("artifacts", parts[0])
+		if entries, err := os.ReadDir(parentDir); err == nil && len(entries) == 0 {
+			_ = os.Remove(parentDir)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": rest})
+}
+
+func (s *Server) handleArtifactFiles(w http.ResponseWriter, r *http.Request) {
+	// Path: /api/artifacts/{rest...}
+	// Current layout: artifacts/<model-digest>/<timestamp>/<files...>
+	// Legacy layout:  artifacts/<timestamp>/<files...>
+	rest := r.PathValue("rest")
+	if rest == "" {
+		http.NotFound(w, r)
+		return
+	}
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Resolve the artifact folder (2-segment <digest>/<date> when present,
+	// otherwise the legacy single-segment folder) and the remaining subpath.
+	var baseDir string
+	subpathStart := 1
+	if len(parts) >= 2 {
+		nested := filepath.Join("artifacts", parts[0], parts[1])
+		if info, err := os.Stat(nested); err == nil && info.IsDir() {
+			baseDir = nested
+			subpathStart = 2
+		} else {
+			baseDir = filepath.Join("artifacts", parts[0])
+		}
+	} else {
+		baseDir = filepath.Join("artifacts", parts[0])
+	}
+	indexPath := filepath.Join(baseDir, "index.html")
+
+	subpath := strings.Join(parts[subpathStart:], "/")
+	var cleanPath string
+	if subpath == "" {
+		cleanPath = indexPath
+	} else {
+		cleanPath = filepath.Clean(filepath.Join(baseDir, subpath))
+		// Prevent path traversal outside the artifact folder.
+		if !strings.HasPrefix(cleanPath, baseDir+string(filepath.Separator)) && cleanPath != baseDir {
+			http.NotFound(w, r)
+			return
+		}
+		// Never serve the agent's private files (prompt/context + metadata),
+		// even to authenticated callers — mirrors the read_file tool block.
+		switch strings.ToLower(filepath.Base(cleanPath)) {
+		case "prompt.txt", ".artifact.json":
+			http.NotFound(w, r)
+			return
+		}
+	}
+
+	// Check if requested cleanPath exists as a regular file
+	info, err := os.Stat(cleanPath)
+	if err != nil || info.IsDir() {
+		// SPA Fallback: if requesting a client-side route (e.g. /dashboard) that isn't a file on disk,
+		// serve index.html if it exists.
+		if indexContent, indexErr := os.ReadFile(indexPath); indexErr == nil {
+			injected := injectConsoleCaptureScript(indexContent)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(injected)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(injected)
+			return
+		}
+
+		// When requesting the artifact root or an HTML entry point and index.html is missing,
+		// serve a clean, diagnostic "Missing index.html" page instead of a raw 404.
+		if subpath == "" || strings.HasSuffix(strings.ToLower(subpath), ".html") {
+			missingHTML := renderMissingIndexPage(baseDir)
+			injected := injectConsoleCaptureScript(missingHTML)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(injected)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(injected)
+			return
+		}
+
+		http.NotFound(w, r)
+		return
+	}
+
+	// Serve the file, inject script if it's index.html or ends with .html
+	if strings.HasSuffix(strings.ToLower(cleanPath), ".html") {
+		content, err := os.ReadFile(cleanPath)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		injected := injectConsoleCaptureScript(content)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(injected)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(injected)
+		return
+	}
+
+	http.ServeFile(w, r, cleanPath)
+}
+
+func (s *Server) handleArtifactConsoleLogs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Timestamp string `json:"timestamp"`
+		Log       string `json:"log"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if body.Timestamp == "" || body.Log == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing timestamp or log"})
+		return
+	}
+
+	s.artifactConsoleMu.Lock()
+	if s.artifactConsoleLogs == nil {
+		s.artifactConsoleLogs = make(map[string][]string)
+	}
+	s.artifactConsoleLogs[body.Timestamp] = append(s.artifactConsoleLogs[body.Timestamp], body.Log)
+	if len(s.artifactConsoleLogs[body.Timestamp]) > 200 {
+		s.artifactConsoleLogs[body.Timestamp] = s.artifactConsoleLogs[body.Timestamp][len(s.artifactConsoleLogs[body.Timestamp])-200:]
+	}
+	s.artifactConsoleMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type artifactScreenshotResponse struct {
+	Image string `json:"image"`
+	Error string `json:"error"`
+}
+
+func (s *Server) handleArtifactScreenshot(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RequestID string `json:"request_id"`
+		Image     string `json:"image"`
+		Error     string `json:"error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if body.RequestID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing request_id"})
+		return
+	}
+
+	s.artifactScreenshotMu.Lock()
+	ch, ok := s.artifactScreenshotCh[body.RequestID]
+	s.artifactScreenshotMu.Unlock()
+
+	if ok && ch != nil {
+		select {
+		case ch <- artifactScreenshotResponse{Image: body.Image, Error: body.Error}:
+		default:
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+type artifactEvalResponse struct {
+	Result string `json:"result"`
+	Error  string `json:"error"`
+}
+
+func (s *Server) handleArtifactEval(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RequestID string `json:"request_id"`
+		Result    string `json:"result"`
+		Error     string `json:"error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if body.RequestID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing request_id"})
+		return
+	}
+
+	s.artifactEvalMu.Lock()
+	ch, ok := s.artifactEvalCh[body.RequestID]
+	s.artifactEvalMu.Unlock()
+
+	if ok && ch != nil {
+		select {
+		case ch <- artifactEvalResponse{Result: body.Result, Error: body.Error}:
+		default:
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func injectConsoleCaptureScript(htmlContent []byte) []byte {
+	script := []byte(`
+<script>
+(function() {
+  const sendLog = (type, msg) => {
+    window.parent.postMessage({ type: 'artifact-console', logType: type, message: msg }, '*');
+  };
+  const originalLog = console.log;
+  const originalError = console.error;
+  console.log = function() {
+    sendLog('log', Array.from(arguments).map(arg => {
+      try { return typeof arg === 'object' ? JSON.stringify(arg) : String(arg); } catch(e) { return String(arg); }
+    }).join(' '));
+    originalLog.apply(console, arguments);
+  };
+  console.error = function() {
+    sendLog('error', Array.from(arguments).map(arg => {
+      try { return typeof arg === 'object' ? JSON.stringify(arg) : String(arg); } catch(e) { return String(arg); }
+    }).join(' '));
+    originalError.apply(console, arguments);
+  };
+  window.onerror = function(message, source, lineno, colno, error) {
+    sendLog('error', message + ' (' + source + ':' + lineno + ':' + colno + ')');
+  };
+  window.addEventListener('unhandledrejection', function(event) {
+    sendLog('error', 'Unhandled Promise Rejection: ' + event.reason);
+  });
+})();
+</script>`)
+
+	lower := bytes.ToLower(htmlContent)
+	headIdx := bytes.Index(lower, []byte("<head>"))
+	if headIdx >= 0 {
+		insertPos := headIdx + len("<head>")
+		res := make([]byte, 0, len(htmlContent)+len(script))
+		res = append(res, htmlContent[:insertPos]...)
+		res = append(res, script...)
+		res = append(res, htmlContent[insertPos:]...)
+		return res
+	}
+	res := make([]byte, 0, len(htmlContent)+len(script))
+	res = append(res, script...)
+	res = append(res, htmlContent...)
+	return res
+}
+
+func renderMissingIndexPage(baseDir string) []byte {
+	var fileListItems []string
+	if entries, err := os.ReadDir(baseDir); err == nil {
+		for _, e := range entries {
+			if e.Name() == "prompt.txt" || e.Name() == ".artifact.json" {
+				continue
+			}
+			icon := "📄"
+			if e.IsDir() {
+				icon = "📁"
+			}
+			info, _ := e.Info()
+			sizeStr := ""
+			if info != nil && !e.IsDir() {
+				sizeStr = fmt.Sprintf(" · %d bytes", info.Size())
+			}
+			fileListItems = append(fileListItems, fmt.Sprintf(`<li><span class="file-icon">%s</span><span class="file-name">%s</span><span class="file-size">%s</span></li>`, icon, html.EscapeString(e.Name()), sizeStr))
+		}
+	}
+
+	filesHtml := `<div class="empty-state">(No hay archivos en el workspace todavía)</div>`
+	if len(fileListItems) > 0 {
+		filesHtml = `<ul class="file-list">` + strings.Join(fileListItems, "") + `</ul>`
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>index.html no encontrado</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  width: 100%%;
+  height: 100%%;
+  background: #090a0f;
+  background-image: 
+    radial-gradient(circle at 50%% 40%%, rgba(245, 158, 11, 0.12) 0%%, rgba(139, 92, 246, 0.08) 35%%, transparent 70%%),
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 100%% 100%%, 32px 32px, 32px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+  overflow: hidden;
+  color: #f1f5f9;
+  padding: 1.5rem;
+}
+.card {
+  max-width: 520px;
+  width: 100%%;
+  background: rgba(18, 20, 29, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 20px;
+  padding: 2.2rem 2rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  backdrop-filter: blur(16px);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), 0 0 40px rgba(245, 158, 11, 0.1);
+  animation: fadeIn 0.4s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.icon-badge {
+  width: 68px;
+  height: 68px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.2), rgba(239, 68, 68, 0.1));
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  margin-bottom: 1.25rem;
+  box-shadow: 0 0 25px rgba(245, 158, 11, 0.25);
+}
+.title {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #f8fafc;
+  margin-bottom: 0.5rem;
+}
+.desc {
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: #94a3b8;
+  margin-bottom: 1.5rem;
+}
+.hint-box {
+  width: 100%%;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+  margin-bottom: 1.5rem;
+  text-align: left;
+}
+.hint-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #f59e0b;
+  margin-bottom: 0.35rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.hint-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+  color: #e2e8f0;
+  word-break: break-all;
+}
+.files-section {
+  width: 100%%;
+  text-align: left;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  padding-top: 1rem;
+}
+.files-heading {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.6rem;
+}
+.file-list {
+  list-style: none;
+  max-height: 120px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.file-list li {
+  display: flex;
+  align-items: center;
+  font-size: 0.82rem;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: rgba(255, 255, 255, 0.03);
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+}
+.file-icon { margin-right: 0.45rem; }
+.file-name { font-weight: 500; }
+.file-size { color: #64748b; font-size: 0.75rem; margin-left: 0.4rem; }
+.empty-state {
+  font-size: 0.82rem;
+  color: #64748b;
+  font-style: italic;
+}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon-badge">⚠️</div>
+    <h1 class="title">index.html no encontrado</h1>
+    <p class="desc">Este artifact no contiene un archivo <code>index.html</code> de entrada. Para renderizar la vista previa interactiva, es necesario crear <code>index.html</code>.</p>
+    <div class="hint-box">
+      <div class="hint-label">✦ Instrucción para el Asistente / Modelo</div>
+      <div class="hint-code">write_file(path="index.html", content="...")</div>
+    </div>
+    <div class="files-section">
+      <div class="files-heading">Archivos en este artifact</div>
+      %s
+    </div>
+  </div>
+</body>
+</html>`, filesHtml)
+	return []byte(html)
+}
+
+// ---------- helpers ----------
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, err error) {
+	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// logging is a tiny request logger.
+func logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := &statusRecorder{ResponseWriter: w, status: 200}
+		next.ServeHTTP(ww, r)
+		log.Printf("%s %s %d %s", r.Method, r.URL.Path, ww.status, time.Since(start).Truncate(time.Millisecond))
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// Flush forwards to the underlying writer when it supports streaming.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// ---------- external models API ----------
+
+func (s *Server) handleListExternalModels(w http.ResponseWriter, r *http.Request) {
+	if s.externalModels == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"models": []any{}})
+		return
+	}
+	s.externalModels.RefreshProviders(r.Context())
+	all := s.externalModels.All()
+	list := make([]ExternalModelRecord, 0, len(all))
+	for _, m := range all {
+		safeM := m
+		if safeM.APIKey != "" {
+			safeM.APIKey = maskedAPIKey
+		}
+		list = append(list, safeM)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": list})
+}
+
+func (s *Server) handleCreateExternalModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID           string   `json:"id"`
+		Name         string   `json:"name"`
+		OldName      string   `json:"old_name"`
+		URL          string   `json:"url"`
+		APIKey       string   `json:"api_key"`
+		Capabilities []string `json:"capabilities"`
+		Disabled     bool     `json:"disabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	id := strings.TrimSpace(body.ID)
+	if id == "" {
+		id = strings.TrimSpace(body.OldName)
+	}
+	targetURL := strings.TrimSpace(body.URL)
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("nombre del modelo requerido"))
+		return
+	}
+	if targetURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("URL requerida"))
+		return
+	}
+	if s.externalModels == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("external models store unavailable"))
+		return
+	}
+
+	apiKey := strings.TrimSpace(body.APIKey)
+	if apiKey == "" || apiKey == maskedAPIKey {
+		apiKey = ""
+		if id != "" {
+			if existing, ok := s.externalModels.Get(id); ok && normalizeOpenAIEndpoint(existing.URL) == normalizeOpenAIEndpoint(targetURL) {
+				apiKey = existing.APIKey
+			}
+		} else if existing, ok := s.externalModels.findPair(name, targetURL); ok {
+			apiKey = existing.APIKey
+		}
+	}
+	if err := s.externalModels.validateUpsert(id, name, targetURL); err != nil {
+		switch {
+		case errors.Is(err, errExternalNotFound):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, errExternalPairConflict):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	info := fetchExternalListingInfo(r.Context(), normalizeOpenAIEndpoint(targetURL), apiKey, name)
+
+	rec, err := s.externalModels.Upsert(id, name, targetURL, apiKey, body.Capabilities, body.Disabled, info.Provider)
+	if err != nil {
+		switch {
+		case errors.Is(err, errExternalNotFound):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, errExternalPairConflict):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	s.externalModels.SetContextLength(rec.ID, info.MaxContext)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "id": rec.ID, "name": rec.Name, "disabled": rec.Disabled})
+}
+
+func (s *Server) handleToggleExternalModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name string `json:"name"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = strings.TrimSpace(r.URL.Query().Get("name"))
+	}
+	if name == "" {
+		name = strings.TrimSpace(r.PathValue("name"))
+	}
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.externalModels == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("external models store unavailable"))
+		return
+	}
+	newDisabled, err := s.externalModels.ToggleDisabled(name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "ok",
+		"name":     name,
+		"disabled": newDisabled,
+	})
+}
+
+func (s *Server) handleTestExternalModel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		URL    string `json:"url"`
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	targetURL := strings.TrimSpace(body.URL)
+	id := strings.TrimSpace(body.ID)
+	if name == "" || targetURL == "" {
+		writeError(w, http.StatusBadRequest, errors.New("nombre y URL requeridos para el test"))
+		return
+	}
+	apiKey := strings.TrimSpace(body.APIKey)
+	if apiKey == maskedAPIKey {
+		apiKey = ""
+	}
+	if apiKey == "" && s.externalModels != nil {
+		var existing ExternalModelRecord
+		var ok bool
+		if id != "" {
+			existing, ok = s.externalModels.Get(id)
+		} else {
+			existing, ok = s.externalModels.findPair(name, targetURL)
+		}
+		if ok && (id == "" || normalizeOpenAIEndpoint(existing.URL) == normalizeOpenAIEndpoint(targetURL)) {
+			apiKey = existing.APIKey
+		}
+	}
+	res, err := ProbeExternalModel(r.Context(), targetURL, apiKey, name)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"connected":    res.Connected,
+		"vision":       res.Vision,
+		"tools":        res.Tools,
+		"thinking":     res.Thinking,
+		"capabilities": res.Capabilities,
+		"provider":     res.Provider,
+		"max_context":  res.MaxContext,
+		"latency_ms":   res.LatencyMs,
+	})
+}
+
+func (s *Server) handleDeleteExternalModel(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if s.externalModels == nil {
+		writeError(w, http.StatusInternalServerError, errors.New("external models store unavailable"))
+		return
+	}
+	deletedArtifacts := s.deleteArtifactsForModel(r.Context(), name)
+	if err := s.externalModels.Unregister(name); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if s.usage != nil {
+		_, _ = s.usage.Delete(name)
+		if strings.HasSuffix(name, ":latest") {
+			_, _ = s.usage.Delete(strings.TrimSuffix(name, ":latest"))
+		} else {
+			_, _ = s.usage.Delete(name + ":latest")
+		}
+	}
+	resp := map[string]any{"status": "ok", "name": name}
+	if deletedArtifacts > 0 {
+		resp["deleted_artifacts"] = deletedArtifacts
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func isLocalFilePathOrDigest(pathOrName string) bool {
+	s := strings.TrimSpace(pathOrName)
+	if s == "" {
+		return true
+	}
+	// Hashes / digests
+	if strings.HasPrefix(s, "sha256:") || strings.HasPrefix(s, "sha256-") {
+		return true
+	}
+	// Raw 64-char hex string (sha256 digest)
+	if len(s) == 64 {
+		isHex := true
+		for _, c := range s {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				isHex = false
+				break
+			}
+		}
+		if isHex {
+			return true
+		}
+	}
+	lower := strings.ToLower(s)
+	// Common model/tensor file extensions
+	for _, ext := range []string{".gguf", ".bin", ".safetensors", ".pt", ".pth", ".onnx", ".ckpt"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	// Relative and home paths
+	if strings.HasPrefix(s, "./") || strings.HasPrefix(s, `.\`) || strings.HasPrefix(s, "../") || strings.HasPrefix(s, `..\`) || strings.HasPrefix(s, "~/") || strings.HasPrefix(s, `~\`) || s == "~" {
+		return true
+	}
+	// Windows drive letters, e.g. C:\ or C:/ or D:\
+	if len(s) >= 3 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z')) && s[1] == ':' && (s[2] == '/' || s[2] == '\\') {
+		return true
+	}
+	// Absolute paths starting with / or \
+	if strings.HasPrefix(s, "/") || strings.HasPrefix(s, "\\") {
+		return true
+	}
+	// Contains Ollama blobs path structure or sha256 blob
+	if strings.Contains(lower, "/blobs/") || strings.Contains(lower, `\blobs\`) || strings.Contains(lower, "/.ollama/") || strings.Contains(lower, `\.ollama\`) || strings.Contains(lower, "sha256-") || strings.Contains(lower, "sha256:") {
+		return true
+	}
+	return false
+}

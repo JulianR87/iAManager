@@ -1,0 +1,1066 @@
+"use strict";
+
+// ---------- downloads queue ----------
+
+/** Pasted "ollama pull|run X", a bare model name, or text containing a URL → value for /api/pull. */
+function normalizePullInput(raw) {
+  let s = String(raw || "").replace(/\r\n/g, " ").trim();
+  if (!s) return "";
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1).trim();
+  }
+  for (let d = 0; d < 2; d++) {
+    const m = s.match(/^\s*ollama\s+(?:pull|run)\s+(.+?)\s*$/i);
+    if (m) s = m[1].trim();
+    else break;
+  }
+  s = s.replace(/\s+/g, " ").trim();
+  if (/^https?:\/\//i.test(s)) {
+    s = s.split(/\s+/)[0].replace(/[),.;:>\]}]+$/g, "");
+  } else {
+    const u = s.match(/https?:\/\/[^\s<>"'()]+/i);
+    if (u) {
+      s = u[0].replace(/[),.;:>\]}]+$/g, "");
+    }
+  }
+  // Canonicalize HF short domain: hf.co fails on recent Ollama with
+  // `realm host "huggingface.co" does not match original host "hf.co"`.
+  if (/^hf\.co\//i.test(s)) return "huggingface.co/" + s.slice(6);
+  const hm = s.match(/^https?:\/\/(hf\.co|huggingface\.co)\/(.+)$/i);
+  if (hm) return "huggingface.co/" + hm[2];
+  return s;
+}
+
+// Open a single long-lived SSE connection to the job manager. On
+// disconnect, exponential backoff up to 30s.
+function connectJobsStream() {
+  if (jobsStream) return;
+  try {
+    jobsStream = new EventSource("/api/jobs/events", { withCredentials: true });
+  } catch (e) {
+    scheduleJobsReconnect();
+    return;
+  }
+
+  jobsStream.addEventListener("snapshot", (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      jobs = new Map((data.jobs || []).map((j) => [j.id, j]));
+      jobsHydrated = true;
+      queuePaused = !!data.queue_paused;
+      onJobsChanged();
+    } catch { }
+  });
+
+  jobsStream.addEventListener("update", (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      jobsHydrated = true;
+      if ("queue_paused" in data) queuePaused = !!data.queue_paused;
+      const j = data.job;
+      if (!j || !j.id) return;
+      const prev = jobs.get(j.id);
+      jobs.set(j.id, j);
+      onJobsChanged();
+      // If a job just transitioned to a terminal state, refresh the model list
+      // so a freshly installed model appears and a cancelled/failed one doesn't
+      // leave stale entries.
+      if (prev && !isTerminal(prev.status) && isTerminal(j.status) && j.status === "done") {
+        toast(t("downloads.installed", { name: j.name || "model" }), "success");
+        refreshModels().then(() => {
+          // Re-render HF cards after models are updated so the card shows
+          // the correct installed (green) / previously had (orange) color.
+          if (typeof currentView !== "undefined" && currentView === "hf" && typeof renderHFModelsList === "function") {
+            try { renderHFModelsList(); } catch {}
+          }
+          if (typeof hfActiveModel !== "undefined" && hfActiveModel && typeof renderHFQuantsTable === "function" && !$("hf-detail-modal")?.hidden) {
+            try { renderHFQuantsTable(hfActiveModel); } catch {}
+          }
+        });
+      }
+    } catch { }
+  });
+
+  jobsStream.addEventListener("remove", (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      jobsHydrated = true;
+      if ("queue_paused" in data) queuePaused = !!data.queue_paused;
+      if (!data.id) return;
+      jobs.delete(data.id);
+      onJobsChanged();
+    } catch { }
+  });
+
+  jobsStream.onopen = () => { jobsBackoffMs = 1000; };
+  jobsStream.onerror = () => {
+    if (jobsStream) { jobsStream.close(); jobsStream = null; }
+    scheduleJobsReconnect();
+  };
+}
+
+function scheduleJobsReconnect() {
+  const delay = jobsBackoffMs;
+  jobsBackoffMs = Math.min(jobsBackoffMs * 2, 30000);
+  setTimeout(connectJobsStream, delay);
+}
+
+function isTerminal(status) {
+  return status === "done" || status === "error" || status === "cancelled";
+}
+
+// renderTable is cheap enough to run on its own, but the jobs SSE stream can
+// emit ~4 events/second during a download. Throttle the table refresh so the
+// main thread stays responsive (drops clicks/jank elsewhere in the UI).
+let renderTableThrottled = false;
+let renderTablePending = false;
+function throttleRenderTable() {
+  renderTablePending = true;
+  if (renderTableThrottled) return;
+  renderTableThrottled = true;
+  renderTablePending = false;
+  renderTable();
+  setTimeout(() => {
+    renderTableThrottled = false;
+    if (renderTablePending) {
+      renderTablePending = false;
+      renderTable();
+    }
+  }, 300);
+}
+
+function hfJobStateBucket(status) {
+  if (status === "running") return "running";
+  if (status === "queued" || status === "paused") return "queued";
+  return "";
+}
+
+function computeHFJobsFingerprint() {
+  if (typeof jobs === "undefined" || !jobs) return "";
+  const parts = [];
+  for (const j of jobs.values()) {
+    const bucket = hfJobStateBucket(j?.status);
+    if (bucket) parts.push(`${j.name || ""}=${bucket}`);
+  }
+  parts.sort();
+  return parts.join("|");
+}
+
+let lastHFJobsFingerprint = null;
+let hfRenderThrottled = false;
+let hfRenderPending = false;
+function throttleHFRender() {
+  if (hfRenderThrottled) { hfRenderPending = true; return; }
+  hfRenderThrottled = true;
+  hfRenderPending = false;
+  try {
+    if (typeof currentView !== "undefined" && currentView === "hf" && typeof renderHFModelsList === "function") {
+      renderHFModelsList();
+    }
+    if (typeof hfActiveModel !== "undefined" && hfActiveModel && typeof renderHFQuantsTable === "function" && !$("hf-detail-modal")?.hidden) {
+      renderHFQuantsTable(hfActiveModel);
+    }
+  } catch {}
+  setTimeout(() => {
+    hfRenderThrottled = false;
+    if (hfRenderPending) {
+      hfRenderPending = false;
+      throttleHFRender();
+    }
+  }, 1500);
+}
+
+function onJobsChanged() {
+  updateDownloadsBadge();
+  if (!$("downloads-modal").hidden) renderDownloads();
+  throttleRenderTable(); // Update main model list to show/hide pending downloads
+  const hfFp = computeHFJobsFingerprint();
+  if (hfFp !== lastHFJobsFingerprint) {
+    lastHFJobsFingerprint = hfFp;
+    throttleHFRender();
+  }
+}
+
+// Re-fetch the authoritative job list so the jobs Map reflects the server's
+// current queue order (e.g. after "move to front"). Map insertion order is
+// preserved, so this also reorders the queue UI to match the server.
+async function refreshJobs() {
+  const data = await api("/api/jobs");
+  jobs = new Map((data.jobs || []).map((j) => [j.id, j]));
+  onJobsChanged();
+}
+
+function jobsByStatus() {
+  const buckets = { active: [], queued: [], paused: [], finished: [] };
+  for (const j of jobs.values()) {
+    if (j.status === "running") buckets.active.push(j);
+    else if (j.status === "queued") buckets.queued.push(j);
+    else if (j.status === "paused") buckets.paused.push(j);
+    else buckets.finished.push(j);
+  }
+  // Active, queued and paused keep the server's authoritative queue order
+  // (the jobs Map is inserted in the order returned by /api/jobs, which is the
+  // manager's m.order — the same order "move to front" promotes into). We must
+  // NOT re-sort by created_at here, or promotion would be undone. Finished
+  // shows most recent first.
+  buckets.finished.sort((a, b) => new Date(b.finished_at || b.created_at) - new Date(a.finished_at || a.created_at));
+  return buckets;
+}
+
+function updateDownloadsBadge() {
+  let activeCount = 0; // running + queued, shown in the counter badge
+  let runningCount = 0; // actively downloading, drives the blue glow
+  for (const j of jobs.values()) {
+    if (j.status === "running" || j.status === "queued") activeCount++;
+    if (j.status === "running") runningCount++;
+  }
+  const badge = $("downloads-count");
+  if (badge) {
+    if (activeCount > 0) {
+      badge.textContent = String(activeCount);
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+  }
+  const btn = $("downloads-btn");
+  if (btn) btn.classList.toggle("downloads-running", runningCount > 0);
+}
+
+function renderDownloads() {
+  const buckets = jobsByStatus();
+  $("dl-count-active").textContent = String(buckets.active.length);
+  $("dl-count-queued").textContent = String(buckets.queued.length);
+  $("dl-count-paused").textContent = String(buckets.paused.length);
+  $("dl-count-finished").textContent = String(buckets.finished.length);
+  dlSyncList("dl-list-active", buckets.active);
+  dlSyncList("dl-list-queued", buckets.queued);
+  dlSyncList("dl-list-paused", buckets.paused);
+  dlSyncList("dl-list-finished", buckets.finished);
+  // Re-measure name marquees after (re)insertion. setupMarquees is idempotent
+  // and does not touch the animation state when the wrapper did not change,
+  // so ongoing scrolls keep playing across progress updates.
+  requestAnimationFrame(() => {
+    const modal = $("downloads-modal");
+    if (modal && typeof setupMarquees === "function") setupMarquees(modal);
+  });
+  const hasAny = jobs.size > 0;
+  $("dl-empty").hidden = hasAny;
+  $("dl-total-badge").hidden = !hasAny;
+  if (hasAny) {
+    $("dl-total-badge").textContent = t("downloads.jobs_count", { n: jobs.size });
+  }
+  $("dl-clear-btn").disabled = !jobsHydrated || buckets.finished.length === 0;
+
+  // Section-level pause button (queued -> paused)
+  const pauseBtn = $("dl-pause-btn");
+  if (buckets.queued.length > 0) {
+    pauseBtn.hidden = false;
+    pauseBtn.title = t("downloads.pause_queue");
+    pauseBtn.textContent = "⏸";
+  } else {
+    pauseBtn.hidden = true;
+  }
+
+  // Section-level resume button (paused -> queued)
+  const resumeBtn = $("dl-resume-btn");
+  if (buckets.paused.length > 0) {
+    resumeBtn.hidden = false;
+    resumeBtn.title = t("downloads.resume_queue");
+    resumeBtn.textContent = "▶";
+  } else {
+    resumeBtn.hidden = true;
+  }
+
+  // Wire per-card buttons via delegation on the stable modal container in
+  // bindDownloadsEvents (see below). Per-card listeners are NOT attached here
+  // because while a download is active the SSE stream re-renders the list
+  // every few hundred ms, destroying the buttons before a click lands.
+}
+
+function emptyRow() {
+  return `<div class="dl-empty-row muted">${escapeHtml(t("downloads.section_empty"))}</div>`;
+}
+
+// Live job cards, keyed by job id. Reusing the same element across renders is
+// what keeps the name marquee running: a progress tick only rewrites the
+// dynamic fields, never the name node.
+const dlCardEls = new Map();
+
+function dlSizeLine(j) {
+  if (!(j.total > 0)) return "";
+  return j.status === "done"
+    ? fmtBytes(j.total)
+    : `${fmtBytes(j.completed || 0)} / ${fmtBytes(j.total)}`;
+}
+
+function dlSpeedText(j) {
+  return (j.status === "running" && j.speed > 0) ? fmtSpeed(j.speed) : "";
+}
+
+function dlEtaText(j) {
+  if (j.status === "running" && j.total > 0 && j.speed > 0) {
+    return `~${fmtETA((j.total - (j.completed || 0)) / j.speed)}`;
+  }
+  return "";
+}
+
+function dlFinishedText(j) {
+  const show = (j.status === "done" || j.status === "error") && !!j.finished_at;
+  return show ? fmtRelativeTime(j.finished_at) : "";
+}
+
+// In-place update of a card whose name and status did not change. Only the
+// dynamic fields (progress, percentages, speed, ETA, bytes, status label) are
+// rewritten; the marquee name node is left untouched so its animation survives.
+function dlUpdateCardFields(card, j) {
+  const pct = Math.max(0, Math.min(100, j.percent || 0));
+  const bar = card.querySelector(".dl-progress-bar");
+  if (bar) bar.style.width = pct.toFixed(1) + "%";
+
+  const statusEl = card.querySelector(".dl-status");
+  if (statusEl) {
+    statusEl.textContent = jobStatusLabel(j);
+    statusEl.className = "dl-status dl-status-" + j.status;
+  }
+
+  const pctEl = card.querySelector(".dl-pct");
+  if (pctEl) {
+    const txt = (j.status === "running" || j.status === "paused") ? `${pct.toFixed(1)}%` : "";
+    pctEl.textContent = txt;
+    pctEl.hidden = !txt;
+  }
+  const speedEl = card.querySelector(".dl-speed");
+  if (speedEl) {
+    const txt = dlSpeedText(j);
+    speedEl.textContent = txt;
+    speedEl.hidden = !txt;
+  }
+  const etaEl = card.querySelector(".dl-eta");
+  if (etaEl) {
+    const txt = dlEtaText(j);
+    etaEl.textContent = txt;
+    etaEl.hidden = !txt;
+  }
+  const bytesEl = card.querySelector(".dl-bytes");
+  if (bytesEl) bytesEl.textContent = dlSizeLine(j);
+
+  const finEl = card.querySelector(".dl-finished");
+  if (finEl) {
+    const txt = dlFinishedText(j);
+    finEl.textContent = txt;
+    finEl.hidden = !txt;
+    finEl.title = txt ? fmtDateTimeFull(j.finished_at) : "";
+  }
+}
+
+// Reconciles one bucket list with the desired jobs: creates only missing cards,
+// updates fields in place and reorders/strips as needed without rebuilding the
+// whole list (which would restart marquee animations).
+function dlSyncList(containerId, list) {
+  const container = $(containerId);
+  if (!container) return;
+  container.querySelectorAll(".dl-empty-row").forEach((el) => el.remove());
+
+  const wanted = new Set();
+  let cursor = container.firstElementChild;
+  for (const j of list) {
+    const id = String(j.id);
+    wanted.add(id);
+    let card = dlCardEls.get(id);
+    const reusable = card && card.dataset.status === j.status && card.dataset.name === j.name;
+    if (!reusable) {
+      if (card) card.remove();
+      const holder = document.createElement("div");
+      holder.innerHTML = jobCardHTML(j).trim();
+      card = holder.firstElementChild;
+      dlCardEls.set(id, card);
+    } else {
+      dlUpdateCardFields(card, j);
+    }
+    if (card !== cursor) {
+      container.insertBefore(card, cursor);
+    } else {
+      cursor = cursor.nextElementSibling;
+    }
+  }
+
+  for (const child of [...container.children]) {
+    if (!child.classList.contains("dl-item")) continue;
+    if (!wanted.has(child.dataset.id)) {
+      if (dlCardEls.get(child.dataset.id) === child) dlCardEls.delete(child.dataset.id);
+      child.remove();
+    }
+  }
+  if (list.length === 0) container.innerHTML = emptyRow();
+}
+
+function jobCardHTML(j) {
+  const pct = Math.max(0, Math.min(100, j.percent || 0));
+  const sizeLine = dlSizeLine(j);
+  const speedText = dlSpeedText(j);
+  const etaText = dlEtaText(j);
+  const finishedText = dlFinishedText(j);
+  const finishedTitle = finishedText ? fmtDateTimeFull(j.finished_at) : "";
+  const finishedHTML = `<span class="dl-finished muted"${finishedText ? "" : " hidden"} title="${escapeHtml(finishedTitle)}">${escapeHtml(finishedText)}</span>`;
+  const statusText = jobStatusLabel(j);
+  const showBar = j.status === "running" || j.status === "done" || j.status === "paused" || (j.total > 0);
+  const progress = showBar
+    ? `<div class="dl-progress"><div class="dl-progress-bar dl-progress-${j.status}" style="width:${pct.toFixed(1)}%"></div></div>`
+    : "";
+  const pctText = (j.status === "running" || j.status === "paused") ? `${pct.toFixed(1)}%` : "";
+
+  const siteUrl = typeof modelHomepageUrl === "function" ? modelHomepageUrl(j.name) : "";
+  const siteBtn = siteUrl
+    ? `<a class="btn-icon dl-site-btn" href="${siteUrl}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(t("detail.site"))}" aria-label="${escapeHtml(t("detail.site"))}"><span class="ghost-site-glyph" aria-hidden="true">↗</span></a>`
+    : "";
+
+  let actionBtn = "";
+  if (j.status === "running" || j.status === "queued") {
+    const promoteBtn = j.status === "queued"
+      ? `<button class="btn-icon" data-action="promote" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.promote"))}">↑</button>`
+      : "";
+    actionBtn = `
+      ${promoteBtn}
+      ${siteBtn}
+      <button class="ghost dl-pause" data-action="pause" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.pause"))}">⏸</button>
+      <button class="btn-icon" data-action="cancel" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.cancel"))}">×</button>`;
+  } else if (j.status === "paused") {
+    actionBtn = `
+      ${siteBtn}
+      <button class="ghost dl-resume" data-action="resume" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.resume"))}">▶</button>
+      <button class="btn-icon" data-action="cancel" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.cancel"))}">×</button>`;
+  } else if (j.status === "error" || j.status === "cancelled") {
+    const hfRecoverBtn = hfJobRecoverable(j)
+      ? `<button class="ghost dl-recover" data-action="hf-recover" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.hf_recover"))}">${escapeHtml(t("downloads.hf_recover"))}</button>`
+      : "";
+    actionBtn = `
+      ${siteBtn}
+      ${hfRecoverBtn}
+      <button class="ghost dl-retry" data-action="retry" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.retry"))}">↻</button>
+      <button class="btn-icon" data-action="remove" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.remove"))}">×</button>`;
+  } else {
+    // done
+    actionBtn = `
+      ${siteBtn}
+      <button class="btn-icon" data-action="remove" data-id="${escapeHtml(j.id)}" title="${escapeHtml(t("downloads.remove"))}">×</button>`;
+  }
+
+  const errBlock = j.error ? `<div class="dl-error">${escapeHtml(j.error)}</div>${hfAuthHint(j.error, j.name)}` : "";
+
+  const cardClass = j.status === "done"
+    ? `dl-item dl-${j.status} dl-clickable`
+    : `dl-item dl-${j.status}`;
+  return `
+    <div class="${cardClass}" data-id="${escapeHtml(j.id)}" data-status="${escapeHtml(j.status)}" data-name="${escapeHtml(j.name)}">
+      <div class="dl-row1">
+        <div class="dl-name-wrap marquee-wrapper">
+          <span class="dl-name mono marquee-content" title="${escapeHtml(j.name)}">${escapeHtml(j.name)}</span>
+        </div>
+        <span class="dl-actions">${actionBtn}</span>
+      </div>
+      ${progress}
+      <div class="dl-row2">
+        <div class="dl-left">
+          <span class="dl-status dl-status-${j.status}">${escapeHtml(statusText)}</span>
+          <span class="dl-pct mono"${pctText ? "" : " hidden"}>${escapeHtml(pctText)}</span>
+          <span class="dl-speed muted"${speedText ? "" : " hidden"}>${escapeHtml(speedText)}</span>
+          <span class="dl-eta muted"${etaText ? "" : " hidden"}>${escapeHtml(etaText)}</span>
+        </div>
+        <div class="dl-right">
+          <span class="dl-bytes muted">${escapeHtml(sizeLine)}</span>
+          ${finishedHTML}
+        </div>
+      </div>
+      ${errBlock}
+    </div>
+  `;
+}
+
+// hfAuthHint returns an inline help block when a download failed because
+// HuggingFace rejected Ollama's credentials (gated/private repo) or because
+// Ollama blocked a cross-host redirect to the HF XET CDN. Ollama does
+// not use an HF token for pulls: it authenticates with its own ed25519 key,
+// so the fix for gated repos is accepting conditions + registering that key.
+// Redirect failures are usually transient: retry later or pull with --insecure.
+function hfRepoUrlFromJobName(jobName) {
+  if (!jobName) return "";
+  const s = String(jobName).trim().replace(/^https?:\/\//i, "");
+  const mm = s.match(/^(?:hf\.co|huggingface\.co)\/([^\s:]+)(?::[^\s]*)?$/i);
+  if (mm && mm[1]) {
+    const parts = mm[1].split("/").map(encodeURIComponent).join("/");
+    return `https://huggingface.co/${parts}`;
+  }
+  return "";
+}
+function hfAuthHint(err, jobName) {
+  if (!err) return "";
+  const s = String(err).toLowerCase();
+  const repoUrl = hfRepoUrlFromJobName(jobName);
+  const openRepoBtn = repoUrl
+    ? `<a href="${repoUrl}" target="_blank" rel="noopener noreferrer" class="hf-link-btn">${escapeHtml(t("downloads.hf_open_repo"))} ↗</a>`
+    : "";
+  // 1. Blocked redirect to XET CDN: transient HF/Ollama issue, not your keys.
+  if (s.includes("blocked redirect")) {
+    const name = String(jobName || "").trim() || "huggingface.co/...";
+    return `<div class="muted small" style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span>${escapeHtml(t("downloads.hf_redirect_hint", { name }))}</span>
+      ${openRepoBtn}
+    </div>`;
+  }
+  // 2. Gated/private: needs accept + SSH key on the same account.
+  const authFail = s.includes("401") ||
+    s.includes("403") ||
+    s.includes("invalid username or password") ||
+    s.includes("unauthorized") ||
+    s.includes("authentication") ||
+    s.includes("gated") ||
+    s.includes("restricted") ||
+    s.includes("authorized list");
+  if (!authFail) return "";
+  const gatedMsg = repoUrl
+    ? t("downloads.hf_gated_hint", { url: repoUrl })
+    : t("downloads.hf_auth_hint");
+  return `<div class="muted small" style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+    <span>${escapeHtml(gatedMsg)}</span>
+    ${openRepoBtn}
+    <button type="button" class="ghost" onclick="openHuggingFaceSettings()">${escapeHtml(t("downloads.hf_auth_action"))}</button>
+  </div>`;
+}
+
+function jobStatusLabel(j) {
+  switch (j.status) {
+    case "running":
+      return j.status_text ? j.status_text : t("downloads.status.running");
+    case "queued":
+      return t("downloads.status.queued");
+    case "paused":
+      return t("downloads.status.paused");
+    case "done":
+      return t("downloads.status.done");
+    case "error":
+      return t("downloads.status.error");
+    case "cancelled":
+      return t("downloads.status.cancelled");
+    default:
+      return j.status || "";
+  }
+}
+
+// Resolves a finished download's job name to the installed model name. Job
+// names can be HF ids (`hf.co/repo:quant`, `repo`) while the installed model
+// carries a different prefix/tag or casing, so an exact match is not reliable.
+function dlNormalizeName(name) {
+  return String(name || "").toLowerCase().replace(/^(hf\.co|huggingface\.co)\//, "").trim();
+}
+
+function resolveInstalledModelName(name) {
+  if (!name || typeof models === "undefined" || !Array.isArray(models) || models.length === 0) return "";
+  const exact = models.find((m) => m.name === name);
+  if (exact) return exact.name;
+  const target = dlNormalizeName(name);
+  if (!target) return "";
+  const norm = (m) => dlNormalizeName(m?.name);
+  return (models.find((m) => norm(m) === target)
+    || models.find((m) => norm(m).startsWith(target + ":") || norm(m).startsWith(target + "/"))
+    || models.find((m) => norm(m).includes(target))
+    || { name: "" }).name;
+}
+
+function openDownloads() {  renderDownloads();
+  $("downloads-modal").hidden = false;
+  setTimeout(() => $("dl-add-input").focus(), 20);
+}
+function closeDownloads() {
+  $("downloads-modal").hidden = true;
+}
+function closeSettings() {
+  if (currentView === "settings") {
+    showModelsView();
+    history.pushState(null, "", "/");
+  }
+}
+
+$("downloads-btn").addEventListener("click", openDownloads);
+$("downloads-close").addEventListener("click", closeDownloads);
+$("downloads-x").addEventListener("click", closeDownloads);
+$("downloads-modal").addEventListener("click", (e) => {
+  if (e.target === $("downloads-modal")) closeDownloads();
+});
+
+// Per-card actions are delegated to the stable modal container (attached once,
+// never re-rendered). While a download is active the SSE stream re-renders the
+// list every few hundred ms, so listeners bound to individual cards/buttons
+// would be destroyed before a click lands; delegation survives that.
+$("downloads-modal").addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-action]");
+  if (btn) {
+    e.stopPropagation();
+    const id = btn.dataset.id;
+    const action = btn.dataset.action;
+    if (!id || !action) return;
+    try {
+      if (action === "cancel") {
+        await api(`/api/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+      } else if (action === "remove") {
+        await api(`/api/jobs/${encodeURIComponent(id)}`, { method: "DELETE" });
+      } else if (action === "pause") {
+        await api(`/api/jobs/${encodeURIComponent(id)}/pause`, { method: "POST" });
+      } else if (action === "resume") {
+        await api(`/api/jobs/${encodeURIComponent(id)}/resume`, { method: "POST" });
+        await refreshJobs();
+      } else if (action === "promote") {
+        await api(`/api/jobs/${encodeURIComponent(id)}/promote`, { method: "POST" });
+        await refreshJobs();
+      } else if (action === "retry") {
+        const j = jobs.get(id);
+        if (!j) return;
+        await api("/api/pull", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: j.name }),
+        });
+      } else if (action === "hf-recover") {
+        await openHFRecoveryModal(id);
+      }
+    } catch (err) {
+      toast(t("toast.error", { msg: err.message }), "error");
+    }
+    return;
+  }
+  if (e.target.closest(".dl-site-btn")) {
+    return;
+  }
+  // Click on a finished download card opens chat with that model (only if done).
+  // Clicking on running, queued, paused or failed downloads does not trigger any action.
+  const card = e.target.closest(".dl-item.dl-done");
+  if (!card) return;
+  const id = card.dataset.id;
+  if (!id) return;
+  const j = jobs.get(id);
+  if (!j || j.status !== "done" || !j.name) return;
+  if (typeof refreshModels === "function") {
+    try {
+      await refreshModels();
+    } catch (_) {}
+  }
+  // Resolve to the installed model name (HF ids/tags may differ).
+  const target = resolveInstalledModelName(j.name);
+  if (!target) {
+    toast(t("downloads.model_deleted", { name: j.name }), "warn");
+    return;
+  }
+  closeDownloads();
+  showChatViewWithModel(target);
+});
+
+$("dl-pause-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/jobs/pause", { method: "POST" });
+  } catch (err) {
+    toast(t("toast.error", { msg: err.message }), "error");
+  }
+});
+
+$("dl-resume-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/jobs/resume", { method: "POST" });
+    await refreshJobs();
+  } catch (err) {
+    toast(t("toast.error", { msg: err.message }), "error");
+  }
+});
+
+function hfJobRecoverable(j) {
+  if (!j || j.status !== "error" || !j.name) return false;
+  const s = String(j.name).trim().replace(/^https?:\/\//i, "");
+  return /^(hf\.co|huggingface\.co)\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*(:[^\s/:]+)?$/i.test(s);
+}
+
+let hfRecoveryState = null;
+
+function closeHFRecoveryModal() {
+  const modal = $("hf-recovery-modal");
+  const st = hfRecoveryState;
+  if (modal) modal.hidden = true;
+  hfRecoveryState = null;
+  if (st && st.returnFocus && typeof st.returnFocus.focus === "function") {
+    try { st.returnFocus.focus(); } catch {}
+  }
+}
+
+async function openHFRecoveryModal(jobId) {
+  const modal = $("hf-recovery-modal");
+  if (!modal) return;
+  const j = jobs.get(jobId);
+  if (!j || !hfJobRecoverable(j)) return;
+  const st = { jobId, name: j.name, preview: null, selected: "", projector: "", busy: false, error: "", returnFocus: document.activeElement };
+  hfRecoveryState = st;
+  renderHFRecoveryBody();
+  modal.hidden = false;
+  try {
+    const preview = await api(`/api/jobs/${encodeURIComponent(jobId)}/hf-recovery`);
+    if (hfRecoveryState !== st) return;
+    st.preview = preview;
+    st.selected = preview.selected_filename || "";
+    st.projector = "";
+  } catch (err) {
+    if (hfRecoveryState !== st) return;
+    st.error = err.message;
+  }
+  renderHFRecoveryBody();
+  if (hfRecoveryState === st && !st.error && st.preview) {
+    const sel = document.querySelector('#hf-recovery-body input[name="hf-rec-model"]:checked');
+    (sel || $("hf-recovery-confirm"))?.focus();
+  }
+}
+
+function hfRecoveryTotals() {
+  const st = hfRecoveryState;
+  const totals = { reused: 0, missing: 0, total: 0 };
+  if (!st || !st.preview) return totals;
+  const opt = (st.preview.options || []).find((o) => o.filename === st.selected);
+  const files = [];
+  if (opt) files.push(...(opt.files || []));
+  if (st.projector) {
+    const p = (st.preview.projectors || []).find((x) => x.filename === st.projector);
+    if (p) files.push(p);
+  }
+  for (const f of files) {
+    totals.total += f.size || 0;
+    if (f.exists) totals.reused += f.size || 0;
+    else totals.missing += f.size || 0;
+  }
+  return totals;
+}
+
+function hfRecoveryFileRow(f) {
+  const badge = f.exists
+    ? `<span class="dl-badge-installed">${escapeHtml(t("downloads.hf_recover_reused_badge"))}</span>`
+    : `<span class="dl-badge-error">${escapeHtml(t("downloads.hf_recover_missing_badge"))}</span>`;
+  return `<div class="dl-hist-stats mono" style="display:flex;gap:8px;align-items:center;"><span>${escapeHtml(f.filename)}</span><span class="muted">${escapeHtml(fmtBytes(f.size || 0))}</span>${badge}</div>`;
+}
+
+function renderHFRecoveryBody() {
+  const body = $("hf-recovery-body");
+  const confirm = $("hf-recovery-confirm");
+  if (!body || !confirm) return;
+  const st = hfRecoveryState;
+  if (!st) { body.innerHTML = ""; confirm.disabled = true; return; }
+  if (st.error) {
+    body.innerHTML = `<div class="dl-error">${escapeHtml(t("downloads.hf_recover_error", { msg: st.error }))}</div>
+      <div class="muted small" style="margin-top:6px;"><button type="button" class="ghost" onclick="hfRecoveryOpenSettings()">${escapeHtml(t("downloads.hf_auth_action"))}</button></div>`;
+    confirm.disabled = true;
+    return;
+  }
+  if (!st.preview) {
+    body.innerHTML = `<div class="muted">${escapeHtml(t("downloads.hf_recover_loading"))}</div>`;
+    confirm.disabled = true;
+    return;
+  }
+  const p = st.preview;
+  const options = Array.isArray(p.options) ? p.options : [];
+  const projectors = Array.isArray(p.projectors) ? p.projectors : [];
+
+  const dis = st.busy ? " disabled" : "";
+  const optsHtml = options.map((o) => {
+    const filesHtml = (o.files || []).map(hfRecoveryFileRow).join("");
+    const checked = o.filename === st.selected ? " checked" : "";
+    return `
+      <label class="dl-history-alert-card" style="display:block;cursor:pointer;">
+        <div class="dl-hist-head">
+          <span style="min-width:0;"><input type="radio" name="hf-rec-model" value="${escapeHtml(o.filename)}"${checked}${dis}> <span class="mono" style="overflow-wrap:anywhere;">${escapeHtml(o.filename)}</span></span>
+          <span class="dl-hist-badge dl-badge-tested">${escapeHtml(o.quant || "")} · ${escapeHtml(fmtBytes(o.total_bytes || 0))}</span>
+        </div>
+        ${filesHtml}
+      </label>`;
+  }).join("");
+
+  const projOptions = [`<option value="">${escapeHtml(t("downloads.hf_recover_projector_none"))}</option>`]
+    .concat(projectors.map((pr) => `<option value="${escapeHtml(pr.filename)}"${pr.filename === st.projector ? " selected" : ""}>${escapeHtml(pr.filename)} (${escapeHtml(fmtBytes(pr.size || 0))}${pr.exists ? " · " + escapeHtml(t("downloads.hf_recover_reused_badge")) : ""})</option>`))
+    .join("");
+
+  body.innerHTML = `
+    <div class="muted small">${escapeHtml(p.repo)} @ <span class="mono">${escapeHtml(String(p.revision || "").slice(0, 12))}</span></div>
+    <div style="margin-top:8px;font-weight:600;">${escapeHtml(t("downloads.hf_recover_model"))}</div>
+    <div class="dl-history-alert-wrap">${optsHtml || `<div class="muted">${escapeHtml(t("downloads.hf_recover_select"))}</div>`}</div>
+    <div style="margin-top:8px;font-weight:600;">${escapeHtml(t("downloads.hf_recover_projector"))}</div>
+    <select id="hf-rec-proj" style="margin-top:4px;max-width:100%;"${dis}>${projOptions}</select>
+    <div class="muted small" style="margin-top:4px;">${escapeHtml(t("downloads.hf_recover_projector_hint"))}</div>
+    <div id="hf-rec-summary" class="mono" style="margin-top:10px;overflow-wrap:anywhere;"></div>
+    <div class="muted small" style="margin-top:6px;">${escapeHtml(t("downloads.hf_recover_caveat"))}</div>
+    ${p.has_token ? "" : `<div class="muted small" style="margin-top:6px;">${escapeHtml(t("downloads.hf_recover_auth"))} <button type="button" class="ghost" onclick="hfRecoveryOpenSettings()">${escapeHtml(t("downloads.hf_auth_action"))}</button></div>`}
+  `;
+  updateHFRecoverySummary();
+}
+
+function updateHFRecoverySummary() {
+  const st = hfRecoveryState;
+  const el = $("hf-rec-summary");
+  const confirm = $("hf-recovery-confirm");
+  if (!st || !st.preview || !el || !confirm) return;
+  const totals = hfRecoveryTotals();
+  const valid = !!st.selected && totals.total > 0;
+  el.textContent = valid
+    ? `${t("downloads.hf_recover_reused", { size: fmtBytes(totals.reused) })} · ${t("downloads.hf_recover_download", { size: fmtBytes(totals.missing) })} · ${t("downloads.hf_recover_total", { size: fmtBytes(totals.total) })}`
+    : t("downloads.hf_recover_select");
+  confirm.disabled = st.busy || !valid;
+}
+
+async function submitHFRecovery() {
+  const st = hfRecoveryState;
+  if (!st || st.busy || !st.preview || !st.selected) return;
+  st.busy = true;
+  renderHFRecoveryBody();
+  try {
+    const res = await api(`/api/jobs/${encodeURIComponent(st.jobId)}/hf-recovery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        revision: st.preview.revision,
+        filename: st.selected,
+        projector: st.projector || "",
+      }),
+    });
+    const name = res && res.name ? res.name : st.name;
+    if (hfRecoveryState === st) closeHFRecoveryModal();
+    toast(t("downloads.hf_recover_queued", { name }), "success");
+    await refreshJobs();
+  } catch (err) {
+    if (hfRecoveryState === st) {
+      st.busy = false;
+      renderHFRecoveryBody();
+    }
+    toast(t("toast.error", { msg: err.message }), "error");
+  }
+}
+
+function hfRecoveryOpenSettings() {
+  closeHFRecoveryModal();
+  closeDownloads();
+  openHuggingFaceSettings();
+}
+
+$("hf-recovery-x").addEventListener("click", closeHFRecoveryModal);
+$("hf-recovery-close").addEventListener("click", closeHFRecoveryModal);
+$("hf-recovery-confirm").addEventListener("click", submitHFRecovery);
+$("hf-recovery-modal").addEventListener("click", (e) => {
+  if (e.target === $("hf-recovery-modal")) closeHFRecoveryModal();
+});
+$("hf-recovery-modal").addEventListener("change", (e) => {
+  const st = hfRecoveryState;
+  if (!st) return;
+  if (e.target && e.target.name === "hf-rec-model") {
+    st.selected = e.target.value;
+    updateHFRecoverySummary();
+  } else if (e.target && e.target.id === "hf-rec-proj") {
+    st.projector = e.target.value;
+    updateHFRecoverySummary();
+  }
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && hfRecoveryState && $("hf-recovery-modal") && !$("hf-recovery-modal").hidden) {
+    closeHFRecoveryModal();
+  }
+});
+
+function uninstallReasonToText(reasonKey) {
+  const key = String(reasonKey || "").trim();
+  if (!key) return "";
+  const byKey = {
+    load_failed: "confirm.delete_reason_load_failed",
+    missing_capabilities: "confirm.delete_reason_missing_capabilities",
+    too_slow: "confirm.delete_reason_too_slow",
+    obsolete_or_outdated: "confirm.delete_reason_obsolete_or_outdated",
+  };
+  const i18nKey = byKey[key];
+  return i18nKey ? t(i18nKey) : "";
+}
+
+async function promptDownloadModel(rawName) {
+  const name = normalizePullInput(rawName);
+  if (!name) return;
+
+  let historyData = null;
+  try {
+    historyData = await api(`/api/download-history/${encodeURIComponent(name)}`);
+  } catch {
+    // history endpoint is best-effort for UX warning
+  }
+
+  const related = Array.isArray(historyData?.related_models) ? historyData.related_models : [];
+  const repoBase = historyData?.repo_base || name.split(":")[0];
+
+  if (related.length > 0) {
+    const cardsHtml = related.map((m) => {
+      let badgeClass = "dl-badge-tested";
+      let badgeText = t("downloads.history_variant_tested");
+
+      if (m.is_installed) {
+        badgeClass = "dl-badge-installed";
+        badgeText = t("downloads.history_variant_installed");
+      } else if (m.uninstall?.reason) {
+        badgeClass = "dl-badge-uninstalled";
+        badgeText = t("downloads.history_variant_uninstalled");
+      } else if (m.history?.error_count > 0 || m.history?.last_error) {
+        badgeClass = "dl-badge-error";
+        badgeText = t("downloads.history_variant_error");
+      }
+
+      let reasonHtml = "";
+      if (m.uninstall?.reason) {
+        const rText = uninstallReasonToText(m.uninstall.reason);
+        const atText = m.uninstall.at ? ` · <span class="mono">${fmtDate(m.uninstall.at)}</span>` : "";
+        reasonHtml = `<div class="dl-hist-reason">🗑️ ${escapeHtml(t("downloads.history_delete_reason", { reason: rText }))}${atText}</div>`;
+      }
+
+      const statsParts = [];
+      if (m.usage) {
+        if (m.usage.record_tokens_per_sec > 0) {
+          statsParts.push(`⚡ ${m.usage.record_tokens_per_sec.toFixed(1)} tok/s`);
+        }
+        if (m.usage.min_cold_load_ms > 0) {
+          statsParts.push(`⏱️ ${fmtColdLoad(m.usage.min_cold_load_ms)}`);
+        }
+        if (m.usage.last_used_at) {
+          statsParts.push(`📅 ${fmtDate(m.usage.last_used_at)}`);
+        }
+        if (m.usage.total_calls > 0) {
+          statsParts.push(`💬 ${m.usage.total_calls} calls`);
+        }
+      }
+      const statsHtml = statsParts.length > 0
+        ? `<div class="dl-hist-stats mono">${statsParts.map((s) => `<span>${escapeHtml(s)}</span>`).join("")}</div>`
+        : "";
+
+      let errHtml = "";
+      if (m.history?.last_error && !m.is_installed) {
+        errHtml = `<div class="dl-hist-error">⚠️ ${escapeHtml(m.history.last_error)}</div>${hfAuthHint(m.history.last_error, m.name)}`;
+      }
+
+      return `
+        <div class="dl-history-alert-card">
+          <div class="dl-hist-head">
+            <span class="dl-hist-name mono">${escapeHtml(m.name)}</span>
+            <span class="dl-hist-badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+          </div>
+          ${reasonHtml}
+          ${statsHtml}
+          ${errHtml}
+        </div>
+      `;
+    }).join("");
+
+    const intro = t("downloads.history_alert_intro", { name: escapeHtml(name), repo: escapeHtml(repoBase) });
+    const modalHtml = `<div>${intro}</div><div class="dl-history-alert-wrap">${cardsHtml}</div>`;
+
+    const { ok } = await askConfirm({
+      title: t("downloads.history_alert_title"),
+      html: modalHtml,
+      okText: t("downloads.history_download_anyway"),
+      okClass: "primary",
+    });
+    if (!ok) return;
+  }
+
+  try {
+    await api("/api/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const input = $("dl-add-input");
+    if (input) input.value = "";
+    toast(t("downloads.enqueued", { name }), "success");
+  } catch (err) {
+    toast(t("toast.error", { msg: err.message }), "error");
+  }
+}
+
+$("dl-add-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("dl-add-input");
+  if (!input) return;
+  await promptDownloadModel(input.value);
+});
+
+$("dl-clear-btn").addEventListener("click", async () => {
+  const btn = $("dl-clear-btn");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = t("downloads.clearing");
+  try {
+    const res = await api("/api/jobs/clear", { method: "POST" });
+    // Optimistically drop terminal jobs locally so the UI updates instantly,
+    // without waiting for the SSE "remove" events.
+    for (const [id, j] of jobs) {
+      if (isTerminal(j.status)) jobs.delete(id);
+    }
+    onJobsChanged();
+    const removed = (res && typeof res.removed === "number") ? res.removed : 0;
+    if (removed > 0) toast(t("downloads.cleared", { n: removed }), "success");
+  } catch (err) {
+    toast(t("toast.error", { msg: err.message }), "error");
+  } finally {
+    btn.textContent = originalLabel;
+    renderDownloads(); // recompute the correct disabled state (no finished left)
+  }
+});
+
+$("memory-widget")?.addEventListener("click", () => {
+  openRunningModal();
+});
+$("memory-widget")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    openRunningModal();
+  }
+});
+$("vram-widget")?.addEventListener("click", () => {
+  openRunningModal();
+});
+$("vram-widget")?.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    openRunningModal();
+  }
+});
+$("running-refresh")?.addEventListener("click", () => refreshRunningModalList());
+$("running-close")?.addEventListener("click", closeRunningModal);
+$("running-x")?.addEventListener("click", closeRunningModal);
+$("running-modal")?.addEventListener("click", (e) => {
+  if (e.target === $("running-modal")) closeRunningModal();
+});
+$("running-unload-all")?.addEventListener("click", async () => {
+  const btn = $("running-unload-all");
+  if (btn?.disabled) return;
+  const { ok } = await askConfirm({
+    title: t("running.unload_all"),
+    text: t("running.unload_all_confirm"),
+    okText: t("running.unload_all"),
+    okClass: "danger",
+  });
+  if (!ok) return;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api("/api/running/unload-all", { method: "POST" });
+    const unloaded = Array.isArray(res?.unloaded) ? res.unloaded : [];
+    if (unloaded.length) {
+      toast(t("running.unload_all_done", { n: unloaded.length }), "success");
+    }
+    const failed = res?.failed && typeof res.failed === "object" ? Object.entries(res.failed) : [];
+    if (failed.length) {
+      const [name, msg] = failed[0];
+      toast(t("running.unload_failed", { name, msg }), "error");
+    }
+  } catch (e) {
+    toast(t("toast.error", { msg: e.message }), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  await refreshRunningModalList({ silent: true });
+  refreshLoadedState();
+  refreshStatus();
+});
+

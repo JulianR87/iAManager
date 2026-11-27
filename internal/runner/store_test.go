@@ -1,0 +1,552 @@
+package runner
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestDeleteTestHistory(t *testing.T) {
+	dir := t.TempDir()
+	store := NewResultStore(dir)
+
+	passed := true
+	store.runs = []BatteryRun{
+		{
+			ID:        "run-1",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Results: []TestResult{
+				{TestID: "t1", TestName: "A", Model: "m1", Passed: &passed},
+				{TestID: "t2", TestName: "B", Model: "m1", Passed: &passed},
+			},
+		},
+		{
+			ID:        "run-2",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Results: []TestResult{
+				{TestID: "t1", TestName: "A", Model: "m2", Passed: &passed},
+			},
+		},
+	}
+
+	if err := store.saveGroupLocked("core"); err != nil {
+		t.Fatalf("saveGroupLocked: %v", err)
+	}
+
+	histFile1 := filepath.Join(dir, "core", "t1._history.json")
+	if _, err := os.Stat(histFile1); err != nil {
+		t.Fatalf("expected t1._history.json to exist in core folder: %v", err)
+	}
+	histFile2 := filepath.Join(dir, "core", "t2._history.json")
+	if _, err := os.Stat(histFile2); err != nil {
+		t.Fatalf("expected t2._history.json to exist in core folder: %v", err)
+	}
+
+	if err := store.DeleteTestHistory("t1"); err != nil {
+		t.Fatalf("DeleteTestHistory: %v", err)
+	}
+	if _, err := os.Stat(histFile1); !os.IsNotExist(err) {
+		t.Fatalf("expected t1._history.json to be deleted after DeleteTestHistory")
+	}
+	if _, err := os.Stat(histFile2); err != nil {
+		t.Fatalf("expected t2._history.json to remain: %v", err)
+	}
+
+	if len(store.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(store.runs))
+	}
+	if len(store.runs[0].Results) != 1 || store.runs[0].Results[0].TestID != "t2" {
+		t.Fatalf("unexpected remaining results: %+v", store.runs[0].Results)
+	}
+
+	if err := store.DeleteTestHistory("t2"); err != nil {
+		t.Fatalf("DeleteTestHistory t2: %v", err)
+	}
+	if _, err := os.Stat(histFile2); !os.IsNotExist(err) {
+		t.Fatalf("expected t2._history.json to be deleted after DeleteTestHistory")
+	}
+	if len(store.runs) != 0 {
+		t.Fatalf("runs = %d, want 0 after removing last result", len(store.runs))
+	}
+}
+
+func TestDeleteModelHistory(t *testing.T) {
+	dir := t.TempDir()
+	store := NewResultStore(dir)
+
+	passed := true
+	store.runs = []BatteryRun{
+		{
+			ID:        "run-1",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Models:    []string{"m1", "m2"},
+			Results: []TestResult{
+				{TestID: "t1", TestName: "A", Model: "m1", Passed: &passed},
+				{TestID: "t2", TestName: "B", Model: "m1", Passed: &passed},
+				{TestID: "t1", TestName: "A", Model: "m2", Passed: &passed},
+			},
+		},
+		{
+			ID:        "run-2",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Models:    []string{"m1"},
+			Results: []TestResult{
+				{TestID: "t1", TestName: "A", Model: "m1", Passed: &passed},
+			},
+		},
+	}
+
+	if err := store.saveGroupLocked("core"); err != nil {
+		t.Fatalf("saveGroupLocked: %v", err)
+	}
+
+	if err := store.DeleteModelHistory("m1"); err != nil {
+		t.Fatalf("DeleteModelHistory: %v", err)
+	}
+
+	// Only m2 results survive; run-2 (m1 only) is dropped entirely.
+	if len(store.runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(store.runs))
+	}
+	if len(store.runs[0].Results) != 1 || store.runs[0].Results[0].Model != "m2" {
+		t.Fatalf("unexpected remaining results: %+v", store.runs[0].Results)
+	}
+
+	// t2 had only m1 results: its history file must be gone.
+	if _, err := os.Stat(filepath.Join(dir, "core", "t2._history.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected t2._history.json to be deleted after DeleteModelHistory")
+	}
+	// t1 still has the m2 result: its file must remain with only m2 inside.
+	data, err := os.ReadFile(filepath.Join(dir, "core", "t1._history.json"))
+	if err != nil {
+		t.Fatalf("expected t1._history.json to remain: %v", err)
+	}
+	var pf persistFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, r := range pf.Runs {
+		for _, res := range r.Results {
+			if res.Model == "m1" {
+				t.Fatalf("m1 result leaked into t1 history: %+v", res)
+			}
+		}
+	}
+
+	// Deleting a model with no results is a no-op.
+	if err := store.DeleteModelHistory("m1"); err != nil {
+		t.Fatalf("DeleteModelHistory (absent model): %v", err)
+	}
+	if len(store.runs) != 1 {
+		t.Fatalf("runs = %d, want 1 after no-op delete", len(store.runs))
+	}
+	if err := store.DeleteModelHistory(""); err != nil {
+		t.Fatalf("DeleteModelHistory (empty model): %v", err)
+	}
+}
+
+func TestPerExerciseHistorySaveAndLoad(t *testing.T) {
+	dir := t.TempDir()
+	catDir := filepath.Join(dir, "examples")
+	if err := os.MkdirAll(catDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Create exercise test files
+	arithmeticYaml := `id: example-arithmetic
+name: Math Suite
+group_id: examples
+`
+	weatherYaml := `id: example-weather
+name: Weather Test
+group_id: examples
+`
+	_ = os.WriteFile(filepath.Join(catDir, "arithmetic.yaml"), []byte(arithmeticYaml), 0o644)
+	_ = os.WriteFile(filepath.Join(catDir, "weather.yaml"), []byte(weatherYaml), 0o644)
+
+	store := NewResultStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	passed := true
+	run := &BatteryRun{
+		ID:        "run-100",
+		Timestamp: time.Now().UTC(),
+		GroupID:   "examples",
+		GroupName: "Examples",
+		Models:    []string{"model-a"},
+		Results: []TestResult{
+			{TestID: "example-arithmetic", TestName: "Math Suite", Model: "model-a", Passed: &passed},
+			{TestID: "example-weather", TestName: "Weather Test", Model: "model-a", Passed: &passed},
+		},
+	}
+
+	if err := store.SaveRun(run); err != nil {
+		t.Fatalf("SaveRun: %v", err)
+	}
+
+	// Verify separate history files were created
+	arithHist := filepath.Join(catDir, "arithmetic._history.json")
+	if _, err := os.Stat(arithHist); err != nil {
+		t.Fatalf("expected arithmetic._history.json: %v", err)
+	}
+	weatherHist := filepath.Join(catDir, "weather._history.json")
+	if _, err := os.Stat(weatherHist); err != nil {
+		t.Fatalf("expected weather._history.json: %v", err)
+	}
+
+	// Verify content of arithmetic history only contains arithmetic results
+	data, err := os.ReadFile(arithHist)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var pf persistFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(pf.Runs) != 1 || len(pf.Runs[0].Results) != 1 || pf.Runs[0].Results[0].TestID != "example-arithmetic" {
+		t.Fatalf("unexpected arithmetic history content: %+v", pf)
+	}
+
+	// Verify new store loads and merges results
+	store2 := NewResultStore(dir)
+	if err := store2.Load(); err != nil {
+		t.Fatalf("store2 Load: %v", err)
+	}
+	runs2 := store2.GetRuns()
+	if len(runs2) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(runs2))
+	}
+	if len(runs2[0].Results) != 2 {
+		t.Fatalf("expected 2 merged results, got %d", len(runs2[0].Results))
+	}
+}
+
+func TestLegacyHistoryMigration(t *testing.T) {
+	dir := t.TempDir()
+	catDir := filepath.Join(dir, "examples")
+	if err := os.MkdirAll(catDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	arithmeticYaml := `id: example-arithmetic
+name: Math Suite
+group_id: examples
+`
+	_ = os.WriteFile(filepath.Join(catDir, "arithmetic.yaml"), []byte(arithmeticYaml), 0o644)
+
+	passed := true
+	legacyPF := persistFile{
+		Runs: []BatteryRun{
+			{
+				ID:        "run-legacy-1",
+				Timestamp: time.Now().UTC(),
+				GroupID:   "examples",
+				GroupName: "Examples",
+				Models:    []string{"model-1"},
+				Results: []TestResult{
+					{TestID: "example-arithmetic", TestName: "Math Suite", Model: "model-1", Passed: &passed},
+				},
+			},
+		},
+	}
+	legacyData, _ := json.MarshalIndent(legacyPF, "", "  ")
+	legacyFile := filepath.Join(catDir, "_history.json")
+	if err := os.WriteFile(legacyFile, legacyData, 0o644); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	store := NewResultStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Check legacy file was deleted
+	if _, err := os.Stat(legacyFile); !os.IsNotExist(err) {
+		t.Fatalf("expected legacy _history.json to be deleted after migration")
+	}
+
+	// Check arithmetic._history.json was created
+	newHist := filepath.Join(catDir, "arithmetic._history.json")
+	if _, err := os.Stat(newHist); err != nil {
+		t.Fatalf("expected arithmetic._history.json to exist after migration: %v", err)
+	}
+
+	// Verify loaded runs
+	runs := store.GetRuns()
+	if len(runs) != 1 || runs[0].ID != "run-legacy-1" {
+		t.Fatalf("unexpected runs loaded: %+v", runs)
+	}
+}
+
+func TestGetGroupHistoryCrossCategoryAndAll(t *testing.T) {
+	store := NewResultStore("")
+	store.exerciseMap = map[string]exerciseLocation{
+		"code-1":   {GroupID: "coding", Base: "code-1"},
+		"reason-1": {GroupID: "reasoning", Base: "reason-1"},
+	}
+
+	passed := true
+	failed := false
+
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
+
+	// An "all" run with tests across coding and reasoning
+	run1 := BatteryRun{
+		ID:        "run-all",
+		Timestamp: t1,
+		GroupID:   "all",
+		GroupName: "All Tests",
+		Models:    []string{"model-alpha"},
+		Results: []TestResult{
+			{TestID: "code-1", TestName: "Coding Test 1", Model: "model-alpha", Passed: &failed, ResponseTimeMs: 100},
+			{TestID: "reason-1", TestName: "Reasoning Test 1", Model: "model-alpha", Passed: &passed, ResponseTimeMs: 200},
+		},
+	}
+
+	// Later run updates code-1 to pass
+	run2 := BatteryRun{
+		ID:        "run-coding",
+		Timestamp: t2,
+		GroupID:   "coding",
+		GroupName: "Coding",
+		Models:    []string{"model-alpha"},
+		Results: []TestResult{
+			{TestID: "code-1", TestName: "Coding Test 1", Model: "model-alpha", Passed: &passed, ResponseTimeMs: 80},
+		},
+	}
+
+	store.runs = []BatteryRun{run1, run2}
+
+	// Coding should resolve code-1 from both runs, newest first (run2 passed)
+	codingSummary := store.GetGroupHistory("coding")
+	if len(codingSummary) != 1 {
+		t.Fatalf("expected 1 model in coding summary, got %d", len(codingSummary))
+	}
+	if codingSummary[0].Passed != 1 || codingSummary[0].Failed != 0 || codingSummary[0].TotalTests != 1 {
+		t.Fatalf("unexpected coding stats: %+v", codingSummary[0])
+	}
+	if codingSummary[0].AvgResponseMs != 80 {
+		t.Fatalf("expected AvgResponseMs 80 from newest run, got %d", codingSummary[0].AvgResponseMs)
+	}
+
+	// Reasoning should resolve reason-1 from run1 (passed)
+	reasonSummary := store.GetGroupHistory("reasoning")
+	if len(reasonSummary) != 1 {
+		t.Fatalf("expected 1 model in reasoning summary, got %d", len(reasonSummary))
+	}
+	if reasonSummary[0].Passed != 1 || reasonSummary[0].TotalTests != 1 {
+		t.Fatalf("unexpected reasoning stats: %+v", reasonSummary[0])
+	}
+
+	// "all" should aggregate both code-1 (passed from run2) and reason-1 (passed from run1)
+	allSummary := store.GetGroupHistory("all")
+	if len(allSummary) != 1 {
+		t.Fatalf("expected 1 model in all summary, got %d", len(allSummary))
+	}
+	if allSummary[0].TotalTests != 2 || allSummary[0].Passed != 2 {
+		t.Fatalf("unexpected all stats: %+v", allSummary[0])
+	}
+}
+
+func TestUpdateResultPassedRecomputesScore(t *testing.T) {
+	dir := t.TempDir()
+	store := NewResultStore(dir)
+	store.runs = []BatteryRun{
+		{
+			ID:        "run-1",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Results: []TestResult{
+				// Pending human review: unscored, zero points.
+				{TestID: "t1", TestName: "A", Model: "m1", CasesTotal: 1, Points: 0, MaxPoints: 2, Score: 0, ModelResponse: "hi", Thinking: "hmm"},
+			},
+		},
+	}
+
+	if err := store.UpdateResultPassed("run-1", "t1", "m1", true); err != nil {
+		t.Fatalf("UpdateResultPassed pass: %v", err)
+	}
+	res := store.runs[0].Results[0]
+	if res.Passed == nil || !*res.Passed {
+		t.Fatalf("expected passed=true, got %+v", res.Passed)
+	}
+	if res.Points != 2 || res.Score != 100 || res.CasesPassed != 1 {
+		t.Fatalf("expected full score after pass, got points=%v score=%v cases=%d", res.Points, res.Score, res.CasesPassed)
+	}
+	if res.Thinking != "hmm" {
+		t.Fatalf("rating must preserve thinking, got %q", res.Thinking)
+	}
+
+	if err := store.UpdateResultPassed("run-1", "t1", "m1", false); err != nil {
+		t.Fatalf("UpdateResultPassed fail: %v", err)
+	}
+	res = store.runs[0].Results[0]
+	if res.Passed == nil || *res.Passed {
+		t.Fatalf("expected passed=false, got %+v", res.Passed)
+	}
+	if res.Points != 0 || res.Score != 0 || res.CasesPassed != 0 {
+		t.Fatalf("expected zero score after fail, got points=%v score=%v cases=%d", res.Points, res.Score, res.CasesPassed)
+	}
+
+	if err := store.UpdateHumanRating("run-1", "t1", "m1", "good"); err != nil {
+		t.Fatalf("UpdateHumanRating good: %v", err)
+	}
+	res = store.runs[0].Results[0]
+	if res.HumanRating != "good" || res.Passed == nil || !*res.Passed || res.Points != 2 {
+		t.Fatalf("expected good rating to pass with full points, got %+v", res)
+	}
+
+	if err := store.UpdateHumanRating("run-1", "t1", "m1", "bad"); err != nil {
+		t.Fatalf("UpdateHumanRating bad: %v", err)
+	}
+	res = store.runs[0].Results[0]
+	if res.Passed == nil || *res.Passed || res.Points != 0 {
+		t.Fatalf("expected bad rating to fail with zero points, got %+v", res)
+	}
+}
+
+func TestGetLatestRunPendingReview_EmptyOutput(t *testing.T) {
+	store := NewResultStore(t.TempDir())
+
+	// Run with only empty response for human review
+	runEmpty := &BatteryRun{
+		ID:        "run-empty",
+		Timestamp: time.Now(),
+		Results: []TestResult{
+			{
+				TestID:        "test-1",
+				Model:         "llama",
+				Passed:        nil,
+				ModelResponse: "",
+				SubResults: []SubResult{
+					{ModelResponse: ""},
+					{ModelResponse: "   "},
+				},
+			},
+		},
+	}
+	if err := store.SaveRun(runEmpty); err != nil {
+		t.Fatalf("SaveRun: %v", err)
+	}
+
+	_, pending, hasPending := store.GetLatestRunPendingReview()
+	if hasPending || pending > 0 {
+		t.Fatalf("expected no pending reviews for empty responses, got pending=%d hasPending=%v", pending, hasPending)
+	}
+
+	// Run with actual reviewable output
+	runReviewable := &BatteryRun{
+		ID:        "run-reviewable",
+		Timestamp: time.Now().Add(time.Minute),
+		Results: []TestResult{
+			{
+				TestID:        "test-2",
+				Model:         "llama",
+				Passed:        nil,
+				ModelResponse: "Actual answer from model",
+			},
+		},
+	}
+	if err := store.SaveRun(runReviewable); err != nil {
+		t.Fatalf("SaveRun: %v", err)
+	}
+
+	run, pending, hasPending := store.GetLatestRunPendingReview()
+	if !hasPending || pending != 1 || run.ID != "run-reviewable" {
+		t.Fatalf("expected 1 pending review for reviewable run, got id=%s pending=%d hasPending=%v", run.ID, pending, hasPending)
+	}
+}
+
+func TestLoadQuarantinesCorruptHistory(t *testing.T) {
+	dir := t.TempDir()
+	catDir := filepath.Join(dir, "coding")
+	if err := os.MkdirAll(catDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badFile := filepath.Join(catDir, "ex._history.json")
+	if err := os.WriteFile(badFile, []byte("{not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := NewResultStore(dir)
+	if err := store.Load(); err != nil {
+		t.Fatalf("Load should not fail on corrupt history: %v", err)
+	}
+	if _, err := os.Stat(badFile); !os.IsNotExist(err) {
+		t.Fatalf("expected corrupt history to be quarantined (renamed), still exists: %s", badFile)
+	}
+	matches, _ := filepath.Glob(badFile + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("expected one quarantined file, got %v", matches)
+	}
+	// A later save must not destroy the quarantined evidence.
+	passed := true
+	if err := store.SaveRun(&BatteryRun{
+		ID:        "run-1",
+		Timestamp: time.Now().UTC(),
+		GroupID:   "coding",
+		GroupName: "Coding",
+		Models:    []string{"m1"},
+		Results:   []TestResult{{TestID: "other", TestName: "Other", Model: "m1", Passed: &passed}},
+	}); err != nil {
+		t.Fatalf("SaveRun: %v", err)
+	}
+	matches, _ = filepath.Glob(badFile + ".corrupt-*")
+	if len(matches) != 1 {
+		t.Fatalf("quarantined evidence must survive later saves, got %v", matches)
+	}
+}
+
+func TestDeleteTestHistoryKeepsSharedExerciseFile(t *testing.T) {
+	dir := t.TempDir()
+	store := NewResultStore(dir)
+	// Force two test IDs to share one exercise base (can happen via
+	// resolve fallbacks): deleting one must not wipe the other's file.
+	store.exerciseMap["t1"] = exerciseLocation{GroupID: "core", Base: "shared"}
+	store.exerciseMap["t2"] = exerciseLocation{GroupID: "core", Base: "shared"}
+
+	passed := true
+	store.runs = []BatteryRun{
+		{
+			ID:        "run-1",
+			Timestamp: time.Now().UTC(),
+			GroupID:   "core",
+			GroupName: "Core",
+			Models:    []string{"m1"},
+			Results: []TestResult{
+				{TestID: "t1", TestName: "A", Model: "m1", Passed: &passed},
+				{TestID: "t2", TestName: "B", Model: "m1", Passed: &passed},
+			},
+		},
+	}
+
+	if err := store.DeleteTestHistory("t1"); err != nil {
+		t.Fatalf("DeleteTestHistory: %v", err)
+	}
+	sharedFile := filepath.Join(dir, "core", "shared._history.json")
+	data, err := os.ReadFile(sharedFile)
+	if err != nil {
+		t.Fatalf("expected shared._history.json to be re-saved with t2, got error: %v", err)
+	}
+	var pf persistFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		t.Fatalf("unmarshal shared history: %v", err)
+	}
+	if len(pf.Runs) != 1 || len(pf.Runs[0].Results) != 1 || pf.Runs[0].Results[0].TestID != "t2" {
+		t.Fatalf("unexpected shared history content: %+v", pf)
+	}
+}

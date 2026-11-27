@@ -1,0 +1,200 @@
+// iamanager: small web UI to manage local Ollama models.
+//
+// Usage:
+//
+//	iamanager                       # serve using ./config.json
+//	iamanager -config /path/cfg.json
+//	iamanager set-password <pwd>    # hash and store a new password
+//	iamanager version
+package main
+
+import (
+	"context"
+	"embed"
+	"flag"
+	"fmt"
+	"io/fs"
+	"log"
+	"os"
+	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"syscall"
+
+	"github.com/JulianR87/iAManager/internal/config"
+	"github.com/JulianR87/iAManager/internal/ollama"
+	"github.com/JulianR87/iAManager/internal/server"
+	"golang.org/x/crypto/bcrypt"
+)
+
+//go:embed all:web
+var webFS embed.FS
+
+//go:embed all:testing
+var testingFS embed.FS
+
+var (
+	// appVersion se inyecta en compilación vía:
+	//   go build -ldflags "-X 'main.appVersion=v1.2.3'"
+	// Sin inyección vale "dev" y getVersionInfo() intenta el fallback a VCS.
+	appVersion = "dev"
+	buildTime  = ""
+)
+
+func getVersionInfo() string {
+	info, ok := debug.ReadBuildInfo()
+	var vcsTime, vcsRevision string
+	var vcsModified bool
+	if ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				vcsRevision = setting.Value
+			case "vcs.time":
+				vcsTime = setting.Value
+			case "vcs.modified":
+				vcsModified = setting.Value == "true"
+			}
+		}
+	}
+
+	res := appVersion
+	if res == "" {
+		res = "dev"
+	}
+	if buildTime != "" {
+		res += fmt.Sprintf(" (built at %s)", buildTime)
+	} else if vcsTime != "" {
+		shortRev := vcsRevision
+		if len(shortRev) > 7 {
+			shortRev = shortRev[:7]
+		}
+		modStr := ""
+		if vcsModified {
+			modStr = " (modified)"
+		}
+		res += fmt.Sprintf(" (built from %s [%s]%s)", vcsTime, shortRev, modStr)
+	}
+	return res
+}
+
+func main() {
+	log.SetFlags(log.LstdFlags)
+	log.SetPrefix("[iamanager] ")
+
+	configPath := flag.String("config", "config.json", "path to config.json")
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "iamanager %s\n\n", getVersionInfo())
+		fmt.Fprintf(os.Stderr, "usage:\n")
+		fmt.Fprintf(os.Stderr, "  iamanager [-config path]\n")
+		fmt.Fprintf(os.Stderr, "  iamanager set-password <password>\n")
+		fmt.Fprintf(os.Stderr, "  iamanager clear-password\n")
+		fmt.Fprintf(os.Stderr, "  iamanager version\n")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	switch flag.Arg(0) {
+	case "version":
+		fmt.Println(getVersionInfo())
+		return
+	case "set-password":
+		if flag.NArg() < 2 {
+			fmt.Fprintln(os.Stderr, "set-password requires a password argument")
+			os.Exit(2)
+		}
+		runSetPassword(*configPath, flag.Arg(1))
+		return
+	case "clear-password":
+		runClearPassword(*configPath)
+		return
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+
+	if cfg.ExposeNetwork && !cfg.HasPassword() {
+		log.Println("WARNING: expose_network=true with no password set. Anyone on your LAN can manage Ollama.")
+		log.Println("         Run 'iamanager set-password <password>' to secure access.")
+	}
+	if cfg.Gateway.Enabled && cfg.Gateway.ExposeNetwork && !cfg.Gateway.RequireAuth {
+		log.Println("WARNING: gateway expose_network=true with require_auth=false. Anyone on your LAN can use your models (and your external API keys).")
+	}
+
+	subFS, err := fs.Sub(webFS, "web")
+	if err != nil {
+		log.Fatalf("embed: %v", err)
+	}
+
+	testingSubFS, err := fs.Sub(testingFS, "testing")
+	if err != nil {
+		log.Fatalf("embed testing: %v", err)
+	}
+
+	client := ollama.New(cfg.OllamaURL)
+	srv, err := server.New(cfg, client, subFS, testingSubFS)
+	if err != nil {
+		log.Fatalf("server: %v", err)
+	}
+	srv.SetVersionInfo(getVersionInfo())
+
+	// Windows solo soporta os.Interrupt (Ctrl+C) en Notify/NotifyContext;
+	// añadir SIGTERM u otras hace que el cierre por señal falle o se ignore.
+	var (
+		ctx  context.Context
+		stop context.CancelFunc
+	)
+	if runtime.GOOS == "windows" {
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt)
+	} else {
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	}
+	defer stop()
+
+	addr := cfg.BindAddress()
+	log.Printf("iamanager %s starting...", getVersionInfo())
+	log.Printf("listening on http://%s  (ollama: %s)", addr, cfg.OllamaURL)
+	// The gateway listener is managed (hot-applied on config PATCH), so a
+	// bind failure must not kill the main server: log it and keep serving.
+	// The UI polls GET /api/gateway/status and shows "not listening" until
+	// the port is fixed and the config is saved again.
+	go func() {
+		if err := srv.ListenAndServeGateway(ctx); err != nil {
+			log.Printf("gateway: %v (main server keeps running; fix the gateway port and save again)", err)
+		}
+	}()
+	if err := srv.ListenAndServe(ctx); err != nil {
+		log.Fatalf("server: %v", err)
+	}
+	log.Println("bye")
+}
+
+func runSetPassword(path, pwd string) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
+	if err != nil {
+		log.Fatalf("bcrypt: %v", err)
+	}
+	cfg.PasswordHash = string(hash)
+	if err := cfg.Save(); err != nil {
+		log.Fatalf("save: %v", err)
+	}
+	fmt.Printf("password updated in %s\n", cfg.Path())
+}
+
+func runClearPassword(path string) {
+	cfg, err := config.Load(path)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	cfg.PasswordHash = ""
+	if err := cfg.Save(); err != nil {
+		log.Fatalf("save: %v", err)
+	}
+	fmt.Printf("password cleared in %s\n", cfg.Path())
+}

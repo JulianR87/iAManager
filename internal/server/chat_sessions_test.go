@@ -1,0 +1,2691 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/JulianR87/iAManager/internal/config"
+	"github.com/JulianR87/iAManager/internal/ollama"
+)
+
+func newTestSessionStore(t *testing.T) *chatSessionStore {
+	t.Helper()
+	st := newChatSessionStore(t.TempDir())
+	st.Load()
+	return st
+}
+
+func TestChatSessionStorePersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	st := newChatSessionStore(dir)
+	st.Load()
+
+	sess := st.Create("llama3", SessionSettings{Temperature: 0.2, TopK: 40, TopP: 0.9, NumCtxPct: 50, ThinkLevel: "low", Artifacts: true})
+	if sess == nil || sess.ID == "" {
+		t.Fatal("Create returned no session")
+	}
+	if sess.Status != chatSessionIdle {
+		t.Fatalf("new session status = %q, want %q", sess.Status, chatSessionIdle)
+	}
+	if len(st.List()) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(st.List()))
+	}
+
+	if !st.AppendUser(sess.ID, "build me a todo app", []ChatAttach{{Kind: "text", Name: "spec.md", Text: "hello"}}) {
+		t.Fatal("AppendUser returned false")
+	}
+
+	srv := &Server{chatSessions: st}
+	if !srv.beginTurn(sess.ID, time.Now()) {
+		t.Fatal("beginTurn returned false")
+	}
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Content: "Sure"}})
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Thinking: "hmm"}})
+	sink.Send("tool", map[string]any{"phase": "start", "name": "create_artifact", "description": "app"})
+	sink.Send("tool", map[string]any{"phase": "done", "name": "create_artifact", "ok": true})
+	sink.Send("artifact", map[string]any{"timestamp": "2026-10-04_10-00-00", "name": "app", "url": "/api/artifacts/x/index.html"})
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Content: " done"}})
+	sink.Send("done", map[string]any{"elapsed_ms": 1234, "total_tokens": 42, "done_reason": "stop"})
+	srv.finishSession(sess.ID, time.Now())
+
+	got := st.Get(sess.ID)
+	if got == nil {
+		t.Fatal("Get returned nil")
+	}
+	if got.Status != chatSessionIdle {
+		t.Errorf("status = %q, want idle", got.Status)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages len = %d, want 2 (user + assistant)", len(got.Messages))
+	}
+	asst := got.Messages[1]
+	if asst.Role != "assistant" || asst.Pending {
+		t.Fatalf("assistant msg = %+v, want role=assistant pending=false", asst)
+	}
+	if asst.Content != "Sure done" {
+		t.Errorf("content = %q, want %q", asst.Content, "Sure done")
+	}
+	if asst.Think != "hmm" {
+		t.Errorf("think = %q, want %q", asst.Think, "hmm")
+	}
+	if !strings.Contains(asst.Raw, "<think>") {
+		t.Errorf("raw should keep the think fences the browser replays, got %q", asst.Raw)
+	}
+	if len(asst.ToolLog) != 1 || asst.ToolLog[0].Name != "create_artifact" {
+		t.Fatalf("tool_log = %+v, want one create_artifact entry", asst.ToolLog)
+	}
+	if asst.ArtifactNm != "app" || asst.ArtifactURL == "" || asst.ArtifactTS == "" {
+		t.Errorf("artifact fields not stored: %+v", asst)
+	}
+	if asst.ElapsedMs != 1234 || asst.DoneReason != "stop" {
+		t.Errorf("done stats not stored: elapsed=%d reason=%q", asst.ElapsedMs, asst.DoneReason)
+	}
+	// finishSession drops the replay log on purpose: Messages is the transcript
+	// once a turn settles, so only Seq has to survive the reload.
+	if got.Seq == 0 {
+		t.Error("Seq = 0, want the event counter to keep counting")
+	}
+	if len(got.Events) != 0 {
+		t.Errorf("Events = %d, want the replay log dropped once the turn settled", len(got.Events))
+	}
+
+	st.flush(sess.ID)
+
+	// Reload from disk and make sure the transcript survived.
+	st2 := newChatSessionStore(dir)
+	st2.Load()
+	reloaded := st2.Get(sess.ID)
+	if reloaded == nil {
+		t.Fatal("session missing after reload")
+	}
+	if len(reloaded.Messages) != 2 {
+		t.Fatalf("reloaded messages len = %d, want 2", len(reloaded.Messages))
+	}
+	if reloaded.Messages[1].Content != "Sure done" {
+		t.Errorf("reloaded content = %q", reloaded.Messages[1].Content)
+	}
+	if reloaded.Settings.NumCtxPct != 50 || !reloaded.Settings.Artifacts {
+		t.Errorf("settings not persisted: %+v", reloaded.Settings)
+	}
+	if _, err := os.Stat(filepath.Join(dir, sess.ID+".json")); err != nil {
+		t.Errorf("session file missing: %v", err)
+	}
+}
+
+func TestChatSessionLoadRewritesRunningOrphans(t *testing.T) {
+	dir := t.TempDir()
+	raw := ChatSession{
+		ID:     "cs-orphan",
+		Model:  "llama3",
+		Status: chatSessionRunning,
+		Messages: []SessionMessage{
+			{Role: "user", Content: "hi", CreatedAt: time.Now()},
+			{Role: "assistant", Pending: true, CreatedAt: time.Now()},
+		},
+	}
+	if err := writeJSONFileAtomic(filepath.Join(dir, raw.ID+".json"), &raw, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	st := newChatSessionStore(dir)
+	st.Load()
+	got := st.Get(raw.ID)
+	if got == nil {
+		t.Fatal("orphan session not loaded")
+	}
+	if got.Status != chatSessionError {
+		t.Errorf("status = %q, want %q", got.Status, chatSessionError)
+	}
+	if got.Messages[1].Pending {
+		t.Error("pending flag should be cleared for an interrupted turn")
+	}
+	if got.Error == "" {
+		t.Error("expected an interruption error message")
+	}
+}
+
+func TestChatSessionSeenAndDelete(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "hi", nil)
+
+	ch, cancel := st.Subscribe()
+	defer cancel()
+
+	// MarkSeen is a no-op (and reports false) when nothing is pending, then
+	// flips Unseen off for real.
+	if st.MarkSeen(sess.ID) {
+		t.Error("MarkSeen should report false when the session is already seen")
+	}
+	st.mu.Lock()
+	st.sessions[sess.ID].Unseen = true
+	st.mu.Unlock()
+	if !st.MarkSeen(sess.ID) {
+		t.Fatal("MarkSeen returned false on an unseen session")
+	}
+	if st.Get(sess.ID).Unseen {
+		t.Error("MarkSeen should clear Unseen")
+	}
+
+	if !st.Delete(sess.ID) {
+		t.Fatal("Delete returned false")
+	}
+	if st.Get(sess.ID) != nil {
+		t.Error("session still present after Delete")
+	}
+	if len(st.List()) != 0 {
+		t.Errorf("List() len = %d, want 0", len(st.List()))
+	}
+	if _, err := os.Stat(st.pathFor(sess.ID)); !os.IsNotExist(err) {
+		t.Errorf("session file still on disk: %v", err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Kind != chatSessionRemove {
+				continue // an update from MarkSeen; keep waiting for the removal
+			}
+			if ev.ID != sess.ID {
+				t.Errorf("remove event for %q, want %s", ev.ID, sess.ID)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no remove event broadcast")
+		}
+	}
+}
+
+func TestChatSessionQueuesBeyondConcurrencyLimit(t *testing.T) {
+	st := newTestSessionStore(t)
+	release := make(chan struct{})
+	started := make(chan string, 3)
+	var ids []string
+	for i := 0; i < 3; i++ {
+		id := st.Create("m", SessionSettings{}).ID
+		ids = append(ids, id)
+	}
+	if _, ok := st.enqueueUser(ids[0], "go", nil, false); !ok {
+		t.Fatal("enqueueUser failed")
+	}
+	for _, id := range ids {
+		id := id
+		st.Start(id, func() {
+			st.PopQueuedIntoMessages(id)
+			started <- id
+			<-release
+			st.releaseRunning(id)
+		})
+	}
+
+	for i := 0; i < maxConcurrentChatSessions; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d runs started", i, maxConcurrentChatSessions)
+		}
+	}
+	select {
+	case id := <-started:
+		t.Fatalf("more than %d runs started concurrently (got %s)", maxConcurrentChatSessions, id)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	queued := 0
+	for _, s := range st.List() {
+		if s.Status == chatSessionQueued {
+			queued++
+		}
+	}
+	if queued != 1 {
+		t.Fatalf("queued sessions = %d, want 1", queued)
+	}
+
+	// Releasing a slot must pump the queued turn.
+	close(release)
+	select {
+	case id := <-started:
+		if id == ids[0] || id == ids[1] {
+			t.Fatalf("a finished slot was started twice (%s)", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the queued turn never started after a slot freed up")
+	}
+}
+
+func TestSessionSinkBumpsUnseenWhenNotWatched(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "hi", nil)
+	started := time.Now()
+	srv.beginTurn(sess.ID, started)
+	sink := &sessionSink{srv: srv, id: sess.ID, started: started}
+	sink.Send("done", map[string]any{"elapsed_ms": 5, "total_tokens": 1})
+	srv.finishSession(sess.ID, started)
+
+	got := st.Get(sess.ID)
+	if got.Status != chatSessionIdle {
+		t.Errorf("status = %q, want idle", got.Status)
+	}
+	if !got.Unseen {
+		t.Error("expected Unseen = true when nobody was watching")
+	}
+
+	// An attached watcher is NOT the same as a reply being read. Leaving the chat
+	// for the models list keeps the session's event source open, so gating on
+	// watchers left the reply looking read and the white badge never showed up.
+	sess2 := st.Create("m", SessionSettings{})
+	st.AppendUser(sess2.ID, "hi", nil)
+	st.AddWatcher(sess2.ID)
+	started2 := time.Now()
+	srv.beginTurn(sess2.ID, started2)
+	sink2 := &sessionSink{srv: srv, id: sess2.ID, started: started2}
+	sink2.Send("done", map[string]any{"elapsed_ms": 5})
+	srv.finishSession(sess2.ID, started2)
+	st.RemoveWatcher(sess2.ID)
+	if !st.Get(sess2.ID).Unseen {
+		t.Error("a finished reply is unread even with a watcher attached")
+	}
+
+	// Reading it is what clears the badge, and only then.
+	if !st.MarkSeen(sess2.ID) {
+		t.Error("MarkSeen = false, want true on an unread session")
+	}
+	if st.Get(sess2.ID).Unseen {
+		t.Error("expected Unseen = false after the reader acknowledged it")
+	}
+}
+
+// TestCancelledTurnIsNotFlaggedUnread keeps the one exemption: the user pressed
+// stop, so they saw exactly what came of it.
+func TestCancelledTurnIsNotFlaggedUnread(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "start something long", nil)
+	started := time.Now()
+	srv.beginTurn(sess.ID, started)
+	sink := &sessionSink{srv: srv, id: sess.ID, started: started}
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Content: "partial"}})
+	// Stopping the turn is what marks it: Cancel sets the flag finishSession reads.
+	st.running[sess.ID] = func() {}
+	if !st.Cancel(sess.ID) {
+		t.Fatal("Cancel returned false")
+	}
+	srv.finishSession(sess.ID, started)
+
+	got := st.Get(sess.ID)
+	if got.Status != chatSessionCancelled {
+		t.Fatalf("status = %q, want cancelled", got.Status)
+	}
+	if got.Unseen {
+		t.Error("a turn the user stopped should not nag them with a badge")
+	}
+}
+
+// TestFailedTurnIsFlaggedUnread covers a turn that never started: there was no
+// stream to watch, so nobody can have seen it.
+func TestFailedTurnIsFlaggedUnread(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "hi", nil)
+	st.AddWatcher(sess.ID)
+	started := time.Now()
+	srv.beginTurn(sess.ID, started)
+	srv.finishSession(sess.ID, started)
+	srv.failSession(sess.ID, "model not found")
+	st.RemoveWatcher(sess.ID)
+
+	got := st.Get(sess.ID)
+	if got.Status != chatSessionError {
+		t.Fatalf("status = %q, want error", got.Status)
+	}
+	if !got.Unseen {
+		t.Error("a failed turn is unread, nobody was there to see it")
+	}
+}
+
+func TestBuildSessionMessages(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "first", nil)
+	srv.beginTurn(sess.ID, time.Now())
+	// A still-pending assistant turn must never reach the model.
+	st.AppendUser(sess.ID, "second", []ChatAttach{
+		{Kind: "text", Name: "a.txt", Text: "body"},
+		{Kind: "image", Data: "data:image/png;base64,AAA"},
+	})
+
+	msgs := st.buildSessionMessages(st.Get(sess.ID), sessionModelInfo{})
+	if len(msgs) != 2 {
+		t.Fatalf("messages len = %d, want 2 (pending turn must be skipped)", len(msgs))
+	}
+	if msgs[0].Role != "user" || msgs[0].Content != "first" {
+		t.Errorf("msgs[0] = %+v", msgs[0])
+	}
+	if len(msgs[1].Images) != 1 {
+		t.Errorf("expected the image attachment to be forwarded, got %+v", msgs[1].Images)
+	}
+	if !strings.Contains(msgs[1].Content, "--- a.txt ---") {
+		t.Errorf("text attachment not appended: %q", msgs[1].Content)
+	}
+}
+
+func TestBuildSessionMessagesPlaceholderForEmptyArtifactAnswer(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", SessionSettings{})
+	srv.beginTurn(sess.ID, time.Now())
+	srv.finishSession(sess.ID, time.Now())
+	// Mutate in place: Messages is a slice of values, so a copy would not stick.
+	st.Get(sess.ID).Messages[0].Content = ""
+	st.Get(sess.ID).Messages[0].ArtifactNm = "todo-app"
+	st.Get(sess.ID).Messages[0].ArtifactURL = "/api/artifacts/x/index.html"
+
+	msgs := st.buildSessionMessages(st.Get(sess.ID), sessionModelInfo{})
+	if len(msgs) != 1 {
+		t.Fatalf("messages len = %d, want 1", len(msgs))
+	}
+	if !strings.Contains(msgs[0].Content, "todo-app") {
+		t.Errorf("placeholder = %q, want it to mention the artifact", msgs[0].Content)
+	}
+}
+
+func TestSessionEventReplayLogIsCapped(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "hi", nil)
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+	for i := 0; i < maxSessionEvents+50; i++ {
+		sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Content: "x"}})
+	}
+	got := st.Get(sess.ID)
+	if len(got.Events) > maxSessionEvents {
+		t.Fatalf("events len = %d, want <= %d", len(got.Events), maxSessionEvents)
+	}
+	if got.Seq < maxSessionEvents {
+		t.Errorf("seq = %d, want >= %d", got.Seq, maxSessionEvents)
+	}
+}
+
+func TestSessionSummaryOmitsTranscript(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", SessionSettings{})
+	st.AppendUser(sess.ID, "hi", nil)
+	sum := st.Summary(sess.ID)
+	if sum == nil {
+		t.Fatal("Summary returned nil")
+	}
+	buf, _ := json.Marshal(sum)
+	if strings.Contains(string(buf), "\"messages\":[") {
+		t.Errorf("summary should not carry the transcript: %s", buf)
+	}
+	if sum.Messages != 1 {
+		t.Errorf("summary message count = %d, want 1", sum.Messages)
+	}
+}
+
+func TestCancelMarksSessionCancelled(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", SessionSettings{})
+	release := make(chan struct{})
+	started := make(chan struct{})
+	st.Start(sess.ID, func() {
+		close(started)
+		<-release
+		st.releaseRunning(sess.ID)
+	})
+	<-started
+
+	if !st.Cancel(sess.ID) {
+		t.Fatal("Cancel returned false")
+	}
+	if !st.Get(sess.ID).Cancelled {
+		t.Error("expected Cancelled = true")
+	}
+	close(release)
+}
+
+func TestBuildSessionBodyDropsToolsWhenModelHasNone(t *testing.T) {
+	st := newTestSessionStore(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+	}))
+	defer ts.Close()
+	srv := &Server{chatSessions: st, ollama: ollama.New(ts.URL)}
+
+	sess := st.Create("some-model", SessionSettings{WebTools: true, Artifacts: true})
+	st.AppendUser(sess.ID, "hi", nil)
+
+	// A session keeps the options it was created with, so a model that cannot
+	// call tools has to drop them rather than fail every round.
+	body := srv.buildSessionBody(context.Background(), st.Get(sess.ID), sessionModelInfo{}, nil)
+	if body.WebTools != nil || body.Artifacts != nil {
+		t.Errorf("tools should be dropped: web=%v artifacts=%v", body.WebTools, body.Artifacts)
+	}
+}
+
+func TestBuildSessionBodyDropsThinkWhenModelCannotThink(t *testing.T) {
+	st := newTestSessionStore(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+	}))
+	defer ts.Close()
+	srv := &Server{chatSessions: st, ollama: ollama.New(ts.URL)}
+
+	// think_level defaults to "auto", which travels as a hard think:true and
+	// makes Ollama answer 400 for a model without the capability. A detached turn
+	// has no browser around to have hidden the control, so the guard lives here.
+	sess := st.Create("no-thinker", SessionSettings{ThinkLevel: "auto"})
+	st.AppendUser(sess.ID, "hi", nil)
+
+	body := srv.buildSessionBody(context.Background(), st.Get(sess.ID), sessionModelInfo{CanTools: true}, nil)
+	if body.Think != nil {
+		t.Errorf("think should be omitted for a model that cannot think, got %q", *body.Think)
+	}
+
+	// The same settings on a model that does think must keep the level.
+	body = srv.buildSessionBody(context.Background(), st.Get(sess.ID), sessionModelInfo{CanTools: true, CanThink: true}, nil)
+	if body.Think == nil {
+		t.Fatal("think should be sent when the model supports it")
+	}
+	if got := string(*body.Think); got != "auto" {
+		t.Errorf("think level = %q, want %q", got, "auto")
+	}
+}
+
+func TestSessionSettingsMergeKeepsUnsentOptions(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", SessionSettings{
+		System:      "keep me",
+		Temperature: 0.7,
+		TopK:        40,
+		TopP:        0.9,
+		NumCtxPct:   100,
+		ThinkLevel:  "auto",
+		WebTools:    true,
+		Artifacts:   true,
+		ImageWidth:  512,
+		ImageHeight: 512,
+		ImageSteps:  4,
+		ImageSeed:   0,
+		RAGEnabled:  true,
+		RAGPaths:    []string{"manual.db"},
+	})
+
+	// The browser sends every option it knows about, so a field it omits must
+	// keep the value the session already had.
+	st.MergeSettings(sess.ID, sessionSettingsInput{Temperature: 0.2})
+
+	got := st.Get(sess.ID).Settings
+	if got.Temperature != 0.2 {
+		t.Errorf("temperature = %v, want 0.2", got.Temperature)
+	}
+	if got.System != "keep me" {
+		t.Errorf("system = %q, want it preserved", got.System)
+	}
+	if !got.WebTools || !got.Artifacts {
+		t.Errorf("toggles should survive a partial payload: %+v", got)
+	}
+	if got.TopK != 40 || got.TopP != 0.9 || got.NumCtxPct != 100 {
+		t.Errorf("numeric options lost: %+v", got)
+	}
+	if !got.RAGEnabled || len(got.RAGPaths) != 1 || got.RAGPaths[0] != "manual.db" {
+		t.Errorf("rag selection lost by partial payload: %+v", got)
+	}
+
+	// Explicit lists replace the previous paths and unsafe/non-file references
+	// are rejected before they reach the session JSON.
+	st.MergeSettings(sess.ID, sessionSettingsInput{
+		RAGPaths: []any{"other.db", "other.db", "../escape.db", "not-a-db.txt"},
+	})
+	got = st.Get(sess.ID).Settings
+	if len(got.RAGPaths) != 1 || got.RAGPaths[0] != "other.db" {
+		t.Errorf("rag paths = %v, want [other.db]", got.RAGPaths)
+	}
+
+	// Editable entries are filtered to the current path set on every merge.
+	st.MergeSettings(sess.ID, sessionSettingsInput{
+		RAGEnabled:  true,
+		RAGPaths:    []any{"a.db", "b.db"},
+		RAGEditable: []any{"b.db", "zzz.db", "../x.db"},
+	})
+	got = st.Get(sess.ID).Settings
+	if len(got.RAGEditable) != 1 || got.RAGEditable[0] != "b.db" {
+		t.Errorf("rag editable = %v, want [b.db]", got.RAGEditable)
+	}
+
+	// Shrinking the path set drops editable entries that no longer match.
+	st.MergeSettings(sess.ID, sessionSettingsInput{
+		RAGPaths: []any{"a.db"},
+	})
+	got = st.Get(sess.ID).Settings
+	if len(got.RAGEditable) != 0 {
+		t.Errorf("rag editable = %v, want empty after paths shrank", got.RAGEditable)
+	}
+
+	// An explicit false must still switch a toggle off and unload its RAG refs.
+	st.MergeSettings(sess.ID, sessionSettingsInput{WebTools: false, RAGEnabled: false})
+	if st.Get(sess.ID).Settings.WebTools {
+		t.Error("explicit web_tools=false should turn the toggle off")
+	}
+	if got := st.Get(sess.ID).Settings; got.RAGEnabled || len(got.RAGPaths) != 0 || len(got.RAGEditable) != 0 {
+		t.Errorf("rag settings should be empty after rag_enabled=false: %+v", got)
+	}
+}
+
+func TestChatSessionSettingsPatchUpdatesRAGRefs(t *testing.T) {
+	srv := newTestServer(t, "http://127.0.0.1:1")
+	sess := srv.chatSessions.Create("m", SessionSettings{RAGEnabled: true, RAGPaths: []string{"old.db"}})
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/chat/sessions/"+sess.ID+"/settings", bytes.NewReader([]byte(`{
+		"rag_enabled": true,
+		"rag_paths": ["new.db", "../bad.db"],
+		"rag_editable": ["new.db", "missing.db"]
+	}`)))
+	rr := httptest.NewRecorder()
+	srv.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("settings patch status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got := srv.chatSessions.Get(sess.ID).Settings
+	if !got.RAGEnabled || len(got.RAGPaths) != 1 || got.RAGPaths[0] != "new.db" {
+		t.Fatalf("rag settings = %+v, want enabled [new.db]", got)
+	}
+	if len(got.RAGEditable) != 1 || got.RAGEditable[0] != "new.db" {
+		t.Fatalf("rag editable = %v, want [new.db]", got.RAGEditable)
+	}
+}
+
+// A session carries the configuration of its last input, so a message sent
+// after the user edits the system prompt or moves a slider must overwrite what
+// came before, and both must survive a reload from disk.
+func TestSessionAdoptsLastInputConfig(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", SessionSettings{Temperature: 0.7, TopK: 40, NumCtxPct: 100})
+
+	st.MergeSettings(sess.ID, sessionSettingsInput{
+		System:      "be terse",
+		Temperature: 0.2,
+		TopK:        10,
+		TopP:        0.5,
+		NumCtxPct:   25,
+		ThinkLevel:  "low",
+		Artifacts:   true,
+		RAGEnabled:  true,
+		RAGPaths:    []any{"facts.db", "media.db"},
+	})
+	if !st.SetModel(sess.ID, "model-b") {
+		t.Fatal("SetModel on an existing session should succeed")
+	}
+	st.flush(sess.ID)
+
+	reloaded := newChatSessionStore(st.dir)
+	reloaded.Load()
+	got := reloaded.Get(sess.ID)
+	if got == nil {
+		t.Fatal("session did not survive a reload")
+	}
+	if got.Model != "model-b" {
+		t.Errorf("model = %q, want model-b", got.Model)
+	}
+	want := SessionSettings{
+		System:      "be terse",
+		Temperature: 0.2,
+		TopK:        10,
+		TopP:        0.5,
+		NumCtxPct:   25,
+		ThinkLevel:  "low",
+		Artifacts:   true,
+		RAGEnabled:  true,
+		RAGPaths:    []string{"facts.db", "media.db"},
+	}
+	if !reflect.DeepEqual(got.Settings, want) {
+		t.Errorf("settings = %+v, want %+v", got.Settings, want)
+	}
+
+	// Setting the same model again is a no-op rather than a broadcast storm.
+	if !st.SetModel(sess.ID, "model-b") {
+		t.Error("SetModel with an unchanged model should still report success")
+	}
+	if st.SetModel("missing", "model-c") {
+		t.Error("SetModel on an unknown session should fail")
+	}
+}
+
+func TestBuildSessionBodyUsesSavedSettings(t *testing.T) {
+	st := newTestSessionStore(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+	}))
+	defer ts.Close()
+	srv := &Server{chatSessions: st, ollama: ollama.New(ts.URL)}
+
+	sess := st.Create("some-model", SessionSettings{
+		Temperature: 0.11,
+		TopK:        17,
+		TopP:        0.55,
+		NumCtxPct:   25,
+		ThinkLevel:  "high",
+		WebTools:    true,
+		Artifacts:   true,
+	})
+	st.AppendUser(sess.ID, "hi", nil)
+
+	body := srv.buildSessionBody(context.Background(), st.Get(sess.ID),
+		sessionModelInfo{CanTools: true, CanThink: true}, st.sessionWatcherCheck(sess.ID))
+
+	if body.Model != "some-model" {
+		t.Errorf("model = %q", body.Model)
+	}
+	if body.browserToolsAllowed() {
+		t.Error("an unwatched session must not offer the browser-only artifact tools")
+	}
+	if body.WebTools == nil || !*body.WebTools {
+		t.Error("web tools should be enabled from the saved settings")
+	}
+	if body.Artifacts == nil || !*body.Artifacts {
+		t.Error("artifacts should be enabled from the saved settings")
+	}
+	if body.Options["temperature"] != 0.11 || body.Options["top_k"] != 17 || body.Options["top_p"] != 0.55 {
+		t.Errorf("options = %+v", body.Options)
+	}
+	if body.Think == nil || *body.Think != ollama.ThinkLevel("high") {
+		t.Errorf("think = %v, want high", body.Think)
+	}
+	if len(body.Messages) != 1 {
+		t.Errorf("messages = %d, want 1", len(body.Messages))
+	}
+}
+
+func TestNormalizeSessionNumCtxPct(t *testing.T) {
+	for _, in := range []int{0, 10, 25, 33, 50, 75, 100, 150} {
+		got := normalizeSessionNumCtxPct(in)
+		switch got {
+		case 10, 25, 50, 75, 100:
+		default:
+			t.Errorf("normalizeSessionNumCtxPct(%d) = %d, not a preset", in, got)
+		}
+	}
+	if normalizeSessionNumCtxPct(0) != 100 {
+		t.Error("an unknown percentage should fall back to the model default")
+	}
+	if sessionNumCtxTokens(100, 8192) != 0 {
+		t.Error("100% should mean \"let the model decide\" (0 tokens)")
+	}
+	if got := sessionNumCtxTokens(50, 8192); got != 4096 {
+		t.Errorf("50%% of 8192 = %d, want 4096", got)
+	}
+	if got := sessionNumCtxTokens(50, 0); got != 16384 {
+		t.Errorf("50%% of the 32768 fallback = %d, want 16384", got)
+	}
+}
+
+func TestDeleteByModelOnlyRemovesThatModelsSessions(t *testing.T) {
+	st := newTestSessionStore(t)
+	a := st.Create("model-a", defaultSessionSettings())
+	b := st.Create("model-b", defaultSessionSettings())
+	c := st.Create("model-a", defaultSessionSettings())
+	st.flush(a.ID)
+	st.flush(b.ID)
+	st.flush(c.ID)
+
+	if n := st.DeleteByModel("model-a"); n != 2 {
+		t.Fatalf("DeleteByModel(model-a) = %d, want 2", n)
+	}
+	if st.Get(a.ID) != nil || st.Get(c.ID) != nil {
+		t.Error("the model-a sessions should be gone")
+	}
+	if st.Get(b.ID) == nil {
+		t.Error("the model-b session should have been left alone")
+	}
+	if n := st.DeleteByModel("nobody"); n != 0 {
+		t.Errorf("DeleteByModel(nobody) = %d, want 0", n)
+	}
+
+	// The files have to go too, otherwise a restart would resurrect them.
+	st2 := newChatSessionStore(st.dir)
+	st2.Load()
+	if got := len(st2.List()); got != 1 {
+		t.Errorf("after reload there are %d sessions, want 1", got)
+	}
+}
+
+func TestDeleteAllClearsEverySessionAndItsFiles(t *testing.T) {
+	st := newTestSessionStore(t)
+	for i := 0; i < 3; i++ {
+		sess := st.Create("model-a", defaultSessionSettings())
+		st.flush(sess.ID)
+	}
+	// A stray file that no longer has a session: DeleteAll sweeps those too,
+	// otherwise it would come back on the next restart.
+	stray := filepath.Join(st.dir, "cs-9999999999999-9.json")
+	if err := os.WriteFile(stray, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write stray file: %v", err)
+	}
+
+	if n := st.DeleteAll(); n != 3 {
+		t.Fatalf("DeleteAll = %d, want 3", n)
+	}
+	if len(st.List()) != 0 {
+		t.Error("no session should be left in memory")
+	}
+	if _, err := os.Stat(stray); !os.IsNotExist(err) {
+		t.Error("the stray session file should have been swept")
+	}
+
+	st2 := newChatSessionStore(st.dir)
+	st2.Load()
+	if got := len(st2.List()); got != 0 {
+		t.Errorf("after reload there are %d sessions, want 0", got)
+	}
+}
+
+func TestCancelAllStopsRunningAndQueuedTurns(t *testing.T) {
+	st := newTestSessionStore(t)
+	started := make(chan string, 3)
+	stop := make(chan struct{})
+	sess := st.Create("model-a", defaultSessionSettings())
+
+	// run stands in for dispatchSessionTurn: it binds a cancel func so Cancel has
+	// something to call, and releases the slot on the way out the way
+	// runSessionTurn does through finishSession.
+	run := func(id string) func() {
+		return func() {
+			_, release := context.WithCancel(context.Background())
+			st.bindRunning(id, release)
+			started <- id
+			<-stop
+			st.releaseRunning(id)
+		}
+	}
+	// Three separate sessions: the first two fill the concurrency slots and the
+	// third has to wait in the queue. Reusing one id would just be rejected by
+	// the one-turn-per-session guard.
+	ids := []string{sess.ID}
+	for i := 0; i < 2; i++ {
+		ids = append(ids, st.Create("model-a", defaultSessionSettings()).ID)
+	}
+	for _, id := range ids {
+		st.Start(id, run(id))
+	}
+
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the first turn never started")
+	}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the second turn never started")
+	}
+	if !st.HasBusy() {
+		t.Fatal("two turns plus one queued means the store is busy")
+	}
+
+	if n := st.CancelAll(); n != 3 {
+		t.Fatalf("CancelAll = %d, want 3", n)
+	}
+	close(stop)
+	time.Sleep(200 * time.Millisecond)
+
+	if st.HasBusy() {
+		t.Error("nothing should be busy after CancelAll")
+	}
+	if got := st.Summary(sess.ID); got == nil || got.Status == chatSessionRunning {
+		t.Errorf("the first session should have settled, got %+v", got)
+	}
+}
+
+func TestTrimMessagesKeepsAnchorAndCountsDropped(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	for i := 0; i < maxSessionMessages+10; i++ {
+		if !st.AppendUser(sess.ID, "turn", nil) {
+			t.Fatalf("AppendUser failed on turn %d", i)
+		}
+	}
+
+	got := st.Get(sess.ID)
+	if len(got.Messages) > maxSessionMessages {
+		t.Fatalf("transcript kept %d messages, want at most %d", len(got.Messages), maxSessionMessages)
+	}
+	if len(got.Messages) == 0 {
+		t.Fatal("trimming everything away would leave an unusable session")
+	}
+	if got.Messages[0].Content != "turn" {
+		t.Errorf("the first message is %q, want the anchor to survive", got.Messages[0].Content)
+	}
+	if got.DroppedMessages == 0 {
+		t.Error("dropped messages should be reported so the UI can say so")
+	}
+	if sum := st.Summary(sess.ID); sum == nil || sum.DroppedMessages != got.DroppedMessages {
+		t.Errorf("summary.DroppedMessages = %+v, want %d", sum, got.DroppedMessages)
+	}
+}
+
+func TestTrimMessagesTruncatesRunawayMessage(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.AppendUser(sess.ID, "go", nil)
+
+	huge := strings.Repeat("x", maxSessionMessageRunes+5000)
+	st.Get(sess.ID).Messages = append(st.Get(sess.ID).Messages, SessionMessage{
+		Role:    "assistant",
+		Content: huge,
+		Raw:     huge,
+	})
+	st.trimMessagesLocked(st.Get(sess.ID))
+
+	got := st.Get(sess.ID)
+	last := got.Messages[len(got.Messages)-1]
+	if !last.Truncated {
+		t.Error("an oversized message should be flagged as truncated")
+	}
+	if len(last.Content) >= len(huge) {
+		t.Errorf("content is still %d runes, want it cut", len(last.Content))
+	}
+	if last.Raw != "" {
+		t.Error("the raw stream should be dropped, it is what makes these files huge")
+	}
+}
+
+// attachmentBase64 builds a bare base64 payload of the given size, which is what
+// the browser actually puts in ChatAttach.Data: it strips the data URL prefix
+// when it reads a file (web/app-svg.js splits on ",").
+func attachmentBase64(size int) string {
+	raw := make([]byte, size)
+	for i := range raw {
+		raw[i] = byte(i % 251)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// attachmentDataURL is the same payload wrapped in a data URL, for the clients
+// that send one.
+func attachmentDataURL(mime string, size int) string {
+	return "data:" + mime + ";base64," + attachmentBase64(size)
+}
+
+func TestSessionAttachmentsLiveOnDiskNotInTheJSON(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+
+	payload := attachmentBase64(4096)
+	if !st.AppendUser(sess.ID, "look", []ChatAttach{{Kind: "image", Name: "a.png", MimeType: "image/png", Data: payload}}) {
+		t.Fatal("AppendUser should have accepted the message")
+	}
+	st.flush(sess.ID)
+
+	// The stored transcript must not carry the base64 payload any more.
+	stored := st.Get(sess.ID)
+	if len(stored.Messages) != 1 || len(stored.Messages[0].Attach) != 1 {
+		t.Fatalf("expected one message with one attachment, got %#v", stored.Messages)
+	}
+	got := stored.Messages[0].Attach[0]
+	if got.Data != "" {
+		t.Error("the attachment bytes should have been moved out of the stored message")
+	}
+	if got.Blob == "" {
+		t.Fatal("the attachment should reference a stored blob")
+	}
+	if got.Size != 4096 {
+		t.Errorf("size = %d, want 4096", got.Size)
+	}
+	if _, err := os.Stat(filepath.Join(st.chatSessionBlobDir(), got.Blob)); err != nil {
+		t.Errorf("blob file missing: %v", err)
+	}
+
+	// The file on disk must be small: that was the whole point.
+	info, err := os.Stat(st.pathFor(sess.ID))
+	if err != nil {
+		t.Fatalf("stat session file: %v", err)
+	}
+	if info.Size() > 4096 {
+		t.Errorf("session file is %d bytes; the attachment should not be inline any more", info.Size())
+	}
+
+	// And the bytes have to come back byte for byte.
+	reloaded := newChatSessionStore(st.dir)
+	reloaded.Load()
+	back := reloaded.Get(sess.ID)
+	if back == nil {
+		t.Fatal("the session should survive a reload")
+	}
+	// A reloaded store holds the reference only, so it is hydration that has to
+	// bring the bytes back, byte for byte.
+	hydrated := reloaded.hydrateAttach(back.Messages[0].Attach)[0]
+	if hydrated.Data != payload {
+		t.Error("hydrating the attachment did not restore the original base64 payload")
+	}
+	// Hydration must not write the payload back into the stored message.
+	if reloaded.Get(sess.ID).Messages[0].Attach[0].Data != "" {
+		t.Error("hydration leaked the bytes back into the stored transcript")
+	}
+}
+
+func TestBuildSessionMessagesRehydratesImages(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+	payload := attachmentBase64(512)
+	st.AppendUser(sess.ID, "what is this", []ChatAttach{{Kind: "image", MimeType: "image/png", Data: payload}})
+
+	msgs := st.buildSessionMessages(st.Get(sess.ID), sessionModelInfo{})
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	if len(msgs[0].Images) != 1 || msgs[0].Images[0] != payload {
+		t.Errorf("the image never made it into the prompt: %#v", msgs[0].Images)
+	}
+}
+
+func TestDeletingASessionRemovesItsBlobs(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+	st.AppendUser(sess.ID, "keep", []ChatAttach{{Kind: "image", MimeType: "image/png", Data: attachmentBase64(256)}})
+	other := st.Create("m", defaultSessionSettings())
+	st.AppendUser(other.ID, "stays", []ChatAttach{{Kind: "image", MimeType: "image/png", Data: attachmentBase64(256)}})
+
+	blobDir := st.chatSessionBlobDir()
+	before, _ := os.ReadDir(blobDir)
+	if len(before) != 2 {
+		t.Fatalf("expected 2 blob files, got %d", len(before))
+	}
+
+	st.Delete(sess.ID)
+
+	after, _ := os.ReadDir(blobDir)
+	if len(after) != 1 {
+		t.Fatalf("expected 1 blob file left for the surviving session, got %d", len(after))
+	}
+	if !strings.HasPrefix(after[0].Name(), other.ID+"-") {
+		t.Errorf("the wrong file survived: %q", after[0].Name())
+	}
+}
+
+func TestDeleteAllRemovesEveryBlob(t *testing.T) {
+	st := newTestSessionStore(t)
+	for i := 0; i < 3; i++ {
+		s := st.Create("m", defaultSessionSettings())
+		st.AppendUser(s.ID, "x", []ChatAttach{{Kind: "image", MimeType: "image/png", Data: attachmentBase64(128)}})
+	}
+	blobDir := st.chatSessionBlobDir()
+	if before, _ := os.ReadDir(blobDir); len(before) != 3 {
+		t.Fatalf("expected 3 blob files, got %d", len(before))
+	}
+
+	if n := st.DeleteAll(); n != 3 {
+		t.Errorf("DeleteAll reported %d sessions, want 3", n)
+	}
+	if after, _ := os.ReadDir(blobDir); len(after) != 0 {
+		t.Errorf("clear all left %d attachment file(s) behind", len(after))
+	}
+}
+
+func TestTrimReclaimsBlobsOfDroppedMessages(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+	// One turn past the cap so the oldest gets dropped.
+	for i := 0; i < maxSessionMessages+2; i++ {
+		if !st.AppendUser(sess.ID, "turn", []ChatAttach{{Kind: "image", MimeType: "image/png", Data: attachmentBase64(64)}}) {
+			t.Fatalf("AppendUser failed at %d", i)
+		}
+	}
+	if got := st.Get(sess.ID).DroppedMessages; got == 0 {
+		t.Fatal("expected messages to have been trimmed")
+	}
+
+	// Every surviving turn still has its image, and no unreferenced file is left.
+	msgs := st.Get(sess.ID).Messages
+	live := map[string]bool{}
+	for i := range msgs {
+		if len(msgs[i].Attach) != 1 {
+			t.Fatalf("message %d lost its attachment reference", i)
+		}
+		live[msgs[i].Attach[0].Blob] = true
+	}
+	entries, _ := os.ReadDir(st.chatSessionBlobDir())
+	if len(entries) != len(live) {
+		t.Errorf("%d blob file(s) on disk but %d live reference(s)", len(entries), len(live))
+	}
+	for _, e := range entries {
+		if !live[e.Name()] {
+			t.Errorf("orphaned attachment file %q was not reclaimed", e.Name())
+		}
+	}
+}
+
+func TestDecodeAttachData(t *testing.T) {
+	// Bare base64 is the normal case and carries no mime of its own.
+	mime, body, ok := decodeAttachData(attachmentBase64(32))
+	if !ok {
+		t.Fatal("bare base64 should decode")
+	}
+	if mime != "" {
+		t.Errorf("mime = %q, want empty: bare base64 has no media type", mime)
+	}
+	if len(body) != 32 {
+		t.Errorf("decoded %d bytes, want 32", len(body))
+	}
+
+	// A data URL also decodes, and does hand back its media type.
+	mime, body, ok = decodeAttachData(attachmentDataURL("image/png", 32))
+	if !ok {
+		t.Fatal("a base64 data URL should decode")
+	}
+	if mime != "image/png" {
+		t.Errorf("mime = %q, want image/png", mime)
+	}
+	if len(body) != 32 {
+		t.Errorf("decoded %d bytes, want 32", len(body))
+	}
+
+	// Percent-encoded payloads are legal data URLs too.
+	if _, body, ok := decodeAttachData("data:text/plain,a%20b"); !ok || string(body) != "a b" {
+		t.Errorf("percent-encoded payload: ok=%v body=%q", ok, body)
+	}
+
+	// Undecodable input must be reported as such rather than stored as garbage.
+	if _, _, ok := decodeAttachData("/not/base64/at/all!"); ok {
+		t.Error("a plain path should not decode")
+	}
+	if _, _, ok := decodeAttachData(""); ok {
+		t.Error("an empty attachment should not decode")
+	}
+}
+
+// TestSessionHydrateReturnsBareBase64 pins the format the browser gets back. It
+// rebuilds the data URL itself from the mime type, so a rehydrated attachment
+// that carries its own "data:" prefix would render as a double prefix.
+func TestSessionHydrateReturnsBareBase64(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+	payload := attachmentBase64(2048)
+	st.AppendUser(sess.ID, "look", []ChatAttach{{Kind: "image", Name: "a.png", MimeType: "image/png", Data: payload}})
+
+	got := st.buildSessionMessages(st.Get(sess.ID), sessionModelInfo{})
+	var images []string
+	for _, m := range got {
+		images = append(images, m.Images...)
+	}
+	if len(images) != 1 {
+		t.Fatalf("built %d images, want 1", len(images))
+	}
+	if images[0] != payload {
+		t.Errorf("image payload came back as %.40q..., want the bare base64 the browser sent", images[0])
+	}
+	if strings.Contains(images[0], "data:") {
+		t.Error("rehydrated image must be bare base64, not a data URL")
+	}
+}
+
+func TestBrowserToolsFollowTheWatcherLive(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("m", defaultSessionSettings())
+	check := st.sessionWatcherCheck(sess.ID)
+
+	if check() {
+		t.Fatal("a session nobody opened must not report a watcher")
+	}
+	st.AddWatcher(sess.ID)
+	if !check() {
+		t.Error("opening the session should make the browser-only tools available")
+	}
+	// The check is a function on purpose: a turn started unattended has to pick
+	// the tools up as soon as a tab appears, without rebuilding the body.
+	st.RemoveWatcher(sess.ID)
+	if check() {
+		t.Error("closing the session should take the browser-only tools away again")
+	}
+
+	// A session that no longer exists must not report a watcher either, or a
+	// deleted session that gets its id reused could claim a stale panel.
+	st.Delete(sess.ID)
+	if check() {
+		t.Error("a deleted session must not report a watcher")
+	}
+}
+
+func TestBuildSessionBodyOffersBrowserToolsWhenWatched(t *testing.T) {
+	st := newTestSessionStore(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+	}))
+	defer ts.Close()
+	srv := &Server{chatSessions: st, ollama: ollama.New(ts.URL)}
+
+	sess := st.Create("m", SessionSettings{Artifacts: true})
+	st.AddWatcher(sess.ID)
+	body := srv.buildSessionBody(context.Background(), st.Get(sess.ID),
+		sessionModelInfo{CanTools: true}, st.sessionWatcherCheck(sess.ID))
+	if !body.browserToolsAllowed() {
+		t.Error("a watched session should offer the browser-only artifact tools")
+	}
+}
+
+// TestSessionSinkRecordsThinkDuration pins the thinking time so a restored
+// transcript shows the same "thinking 2.1s" the live turn showed, instead of an
+// empty "(0ms)" next to a full block of reasoning.
+func TestSessionSinkRecordsThinkDuration(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	chunk := func(think, content string) ollama.ChatChunk {
+		return ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Thinking: think, Content: content}}
+	}
+	sink.Send("chunk", chunk("let me think", ""))
+	// A real turn spends measurable time here; the test only needs a clock that
+	// is not zero, so the wait is short but not instantaneous.
+	time.Sleep(12 * time.Millisecond)
+	sink.Send("chunk", chunk(" harder", ""))
+	sink.Send("chunk", chunk("", "the answer"))
+	sink.Send("done", map[string]any{"elapsed_ms": 40})
+
+	got := st.Get(sess.ID).Messages
+	last := got[len(got)-1]
+	if last.ThinkMs < 10 {
+		t.Errorf("ThinkMs = %d, want at least the ~12ms spent inside the think block", last.ThinkMs)
+	}
+	if last.Content != "the answer" {
+		t.Errorf("Content = %q, want %q", last.Content, "the answer")
+	}
+	if !strings.Contains(last.Raw, "<think>") || !strings.Contains(last.Raw, "</think>") {
+		t.Errorf("Raw = %q, want the think block still fenced for the client splitter", last.Raw)
+	}
+}
+
+// TestSessionSinkRecordsThinkDurationAfterError makes sure an interrupted or
+// failed turn still keeps the thinking time it already spent.
+func TestSessionSinkRecordsThinkDurationAfterError(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{
+		Role: "assistant", Thinking: "half a thought", Content: "",
+	}})
+	time.Sleep(12 * time.Millisecond)
+	sink.Send("error", map[string]any{"error": "ollama exploded"})
+
+	got := st.Get(sess.ID).Messages
+	last := got[len(got)-1]
+	if last.ThinkMs < 10 {
+		t.Errorf("ThinkMs = %d after an error, want the time already spent thinking", last.ThinkMs)
+	}
+	if last.Error != "ollama exploded" {
+		t.Errorf("Error = %q, want the model failure to be kept", last.Error)
+	}
+}
+
+// TestSessionSinkSumsInterleavedThinkBlocks covers a model that thinks, answers a
+// few words, then thinks again. Each closed block has to add up instead of only
+// the first one counting.
+func TestSessionSinkSumsInterleavedThinkBlocks(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	send := func(think, content string) {
+		sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{
+			Role: "assistant", Thinking: think, Content: content,
+		}})
+	}
+	send("first", "")
+	time.Sleep(10 * time.Millisecond)
+	send("", "answer ")
+	send("second", "")
+	time.Sleep(10 * time.Millisecond)
+	sink.Send("done", map[string]any{})
+
+	got := st.Get(sess.ID).Messages
+	last := got[len(got)-1]
+	// Two separate 10ms blocks, so the total must clear 20ms. Without summing,
+	// only the first block would be counted and this would land under 20.
+	if last.ThinkMs < 20 {
+		t.Errorf("ThinkMs = %d, want at least 20ms from two separate think blocks", last.ThinkMs)
+	}
+	if last.Content != "answer " {
+		t.Errorf("Content = %q, want the prose between the think blocks", last.Content)
+	}
+}
+
+// TestSessionSinkRefencesInterleavedThinkBlocks guards the raw text the client
+// replays through splitThink. A model that answers and then keeps thinking has to
+// get a fresh <think> fence, or the second block is read back as part of the
+// answer. This mirrors what the browser does live with its thinkBlockClosed flag,
+// and it is why the server-side raw has to stay byte-identical to the browser's.
+func TestSessionSinkRefencesInterleavedThinkBlocks(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	send := func(think, content string) {
+		sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{
+			Role: "assistant", Thinking: think, Content: content,
+		}})
+	}
+	send("first thoughts", "")
+	send("", "partial answer")
+	send("second thoughts", "")
+	send("", " final")
+	sink.Send("done", map[string]any{})
+
+	last := st.Get(sess.ID).Messages[len(st.Get(sess.ID).Messages)-1]
+	if got := strings.Count(last.Raw, "<think>"); got != 2 {
+		t.Errorf("Raw has %d <think> fences, want 2 so the replayed splitter sees two blocks:\n%q", got, last.Raw)
+	}
+	if got := strings.Count(last.Raw, "</think>"); got != 2 {
+		t.Errorf("Raw has %d </think> fences, want 2:\n%q", got, last.Raw)
+	}
+	// The reconstructed answer must only hold prose, never the thinking text.
+	if strings.Contains(last.Content, "thoughts") {
+		t.Errorf("Content = %q, want the thinking kept out of the answer", last.Content)
+	}
+	if last.Content != "partial answer final" {
+		t.Errorf("Content = %q, want the prose from both stretches", last.Content)
+	}
+	if last.Think != "first thoughtssecond thoughts" {
+		t.Errorf("Think = %q, want both blocks concatenated", last.Think)
+	}
+}
+
+// TestSessionSinkTrimsReplayChunkPayload keeps the persisted replay log small.
+// A raw chunk repeats the model name and a timestamp per token, and nothing in a
+// replay reads them.
+func TestSessionSinkTrimsReplayChunkPayload(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("a-very-long-model-name:tag", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	sink.Send("chunk", ollama.ChatChunk{
+		Model:     "a-very-long-model-name:tag",
+		CreatedAt: time.Now(),
+		Message:   ollama.ChatMessage{Role: "assistant", Content: "hi"},
+		Done:      false,
+	})
+
+	ev := st.Get(sess.ID).Events
+	if len(ev) != 1 {
+		t.Fatalf("got %d events, want 1", len(ev))
+	}
+	raw, err := json.Marshal(ev[0].Data)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "a-very-long-model-name") {
+		t.Errorf("replayed chunk still carries the model name: %s", raw)
+	}
+	if strings.Contains(string(raw), "created_at") {
+		t.Errorf("replayed chunk still carries the timestamp: %s", raw)
+	}
+	// What the replay actually needs has to survive.
+	if !strings.Contains(string(raw), "hi") {
+		t.Errorf("replayed chunk lost its content: %s", raw)
+	}
+}
+
+// TestSessionSinkTrimsThinkingInReplayChunk keeps the reasoning text a reconnect
+// needs while still dropping the noise.
+func TestSessionSinkTrimsThinkingInReplayChunk(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", defaultSessionSettings())
+	srv.beginTurn(sess.ID, time.Now())
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+
+	sink.Send("chunk", ollama.ChatChunk{
+		Model:   "m",
+		Message: ollama.ChatMessage{Role: "assistant", Thinking: "pondering"},
+	})
+	raw, _ := json.Marshal(st.Get(sess.ID).Events[0].Data)
+	if !strings.Contains(string(raw), "pondering") {
+		t.Errorf("replayed chunk lost its thinking: %s", raw)
+	}
+}
+
+// TestFinishSessionDropsTheReplayLog is the size fix that matters: a finished
+// turn's chunks are dead weight, because Messages already holds the whole
+// result and a client that reconnects reads the session endpoint instead.
+func TestFinishSessionDropsTheReplayLog(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", defaultSessionSettings())
+	started := time.Now()
+	srv.beginTurn(sess.ID, started)
+	sink := &sessionSink{srv: srv, id: sess.ID, started: started}
+
+	for i := 0; i < 50; i++ {
+		sink.Send("chunk", ollama.ChatChunk{
+			Model:   "m",
+			Message: ollama.ChatMessage{Role: "assistant", Content: "token "},
+		})
+	}
+	if got := len(st.Get(sess.ID).Events); got != 50 {
+		t.Fatalf("mid-turn the log should hold the 50 chunks, got %d", got)
+	}
+	if st.Get(sess.ID).Status != chatSessionRunning {
+		t.Fatalf("status = %q, want running mid-turn", st.Get(sess.ID).Status)
+	}
+
+	srv.finishSession(sess.ID, started)
+
+	got := st.Get(sess.ID)
+	if len(got.Events) != 0 {
+		t.Errorf("settled session kept %d replay events, want 0", len(got.Events))
+	}
+	// The transcript has to be intact: that is what the dropped events replaced.
+	last := got.Messages[len(got.Messages)-1]
+	if !strings.Contains(last.Content, "token") {
+		t.Errorf("dropping the log also lost the text: %q", last.Content)
+	}
+	if last.Pending {
+		t.Error("the pending flag should be cleared when the turn settles")
+	}
+	// Seq keeps climbing so a client that reconnects with from=N is not confused
+	// by events that no longer exist.
+	if got.Seq != 50 {
+		t.Errorf("Seq = %d, want it to keep counting past the dropped events", got.Seq)
+	}
+	st.flush(sess.ID)
+	reloaded := newChatSessionStore(st.dir)
+	reloaded.Load()
+	if len(reloaded.Get(sess.ID).Events) != 0 {
+		t.Error("the replay log came back from disk, so the file is still fat")
+	}
+}
+
+// TestFinishSessionKeepsTheReplayLogOfAFailedTurn guards the error path: a turn
+// that blows up mid-stream is the one case where the chunk history is the only
+// record of what the model managed to say, so the message text must survive.
+func TestFinishSessionKeepsTheTranscriptOfAFailedTurn(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("m", defaultSessionSettings())
+	started := time.Now()
+	srv.beginTurn(sess.ID, started)
+	sink := &sessionSink{srv: srv, id: sess.ID, started: started}
+
+	sink.Send("chunk", ollama.ChatChunk{
+		Message: ollama.ChatMessage{Role: "assistant", Content: "partial answer"},
+	})
+	sink.Send("error", map[string]any{"error": "connection reset"})
+	srv.finishSession(sess.ID, started)
+
+	// A turn that failed mid-stream does not make the session unusable, so it
+	// settles as idle with the error on the message. Only failSession, which
+	// handles setup problems like a missing model, marks the session error.
+	got := st.Get(sess.ID)
+	if got.Status != chatSessionIdle {
+		t.Errorf("status = %q, want idle after a failed turn", got.Status)
+	}
+	if got.Error != "" {
+		t.Errorf("session error = %q, want it on the message instead", got.Error)
+	}
+	last := got.Messages[len(got.Messages)-1]
+	if last.Content != "partial answer" {
+		t.Errorf("Content = %q, want the partial answer kept", last.Content)
+	}
+	if last.Error == "" {
+		t.Error("the error should be recorded on the message")
+	}
+}
+
+// TestRegenerateReplacesReplyWithoutDuplicatingUser drives the exact sequence a
+// "regenerate" click makes: drop the reply to the last user turn, then answer it
+// again. The transcript must end with one user turn and one fresh pending
+// assistant, never a duplicated user or a leftover reply.
+func TestRegenerateReplacesReplyWithoutDuplicatingUser(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+
+	// One finished turn.
+	st.AppendUser(sess.ID, "first question", nil)
+	if !srv.beginTurn(sess.ID, time.Now()) {
+		t.Fatal("beginTurn returned false")
+	}
+	sink := &sessionSink{srv: srv, id: sess.ID, started: time.Now()}
+	sink.Send("chunk", ollama.ChatChunk{Message: ollama.ChatMessage{Role: "assistant", Content: "old answer"}})
+	sink.Send("done", map[string]any{"elapsed_ms": 1})
+	srv.finishSession(sess.ID, time.Now())
+
+	// Regenerate: replace_last trims the reply, then the turn starts again.
+	if !st.TrimAfterLastUser(sess.ID) {
+		t.Fatal("TrimAfterLastUser returned false")
+	}
+	if !srv.beginTurn(sess.ID, time.Now()) {
+		t.Fatal("beginTurn after regenerate returned false")
+	}
+
+	got := st.Get(sess.ID)
+	users, assistants, pending := 0, 0, 0
+	for _, m := range got.Messages {
+		switch m.Role {
+		case "user":
+			users++
+		case "assistant":
+			assistants++
+			if m.Pending {
+				pending++
+			}
+		}
+	}
+	if users != 1 {
+		t.Errorf("user turns = %d, want exactly 1 (regenerate must not duplicate)", users)
+	}
+	if assistants != 1 || pending != 1 {
+		t.Errorf("assistant turns = %d (pending=%d), want exactly 1 pending", assistants, pending)
+	}
+}
+
+// TestSessionNeverDerivesTitleFromPrompt pins that the prompt is never shown
+// back as a title. The list shows the relative time instead; only the user can
+// name a session.
+func TestSessionNeverDerivesTitleFromPrompt(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.AppendUser(sess.ID, "first question, please answer at length", nil)
+	st.AppendUser(sess.ID, "second question", nil)
+	got := st.Get(sess.ID)
+	if got.Title != "" {
+		t.Errorf("Title = %q after two user turns, want it to stay empty", got.Title)
+	}
+	if got.CustomTitle {
+		t.Error("CustomTitle = true, want a derived-looking title to stay uncustom")
+	}
+	if sum := st.Summary(sess.ID); sum == nil || sum.CustomTitle || sum.Title != "" {
+		t.Errorf("summary leaked a derived title: %+v", sum)
+	}
+}
+
+// TestSessionRenameMarksCustomTitle makes sure the only title the list shows is
+// the one the user typed.
+func TestSessionRenameMarksCustomTitle(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	if !st.Rename(sess.ID, "  My notes  ") {
+		t.Fatal("Rename returned false")
+	}
+	got := st.Get(sess.ID)
+	if got.Title != "My notes" || !got.CustomTitle {
+		t.Fatalf("after rename: title=%q custom=%v, want \"My notes\" and custom", got.Title, got.CustomTitle)
+	}
+	if sum := st.Summary(sess.ID); sum == nil || !sum.CustomTitle || sum.Title != "My notes" {
+		t.Errorf("summary did not carry the custom title: %+v", sum)
+	}
+	// Clearing the name falls back to the anonymous, time-only row.
+	if !st.Rename(sess.ID, "   ") {
+		t.Fatal("Rename with a blank name returned false")
+	}
+	if got := st.Get(sess.ID); got.Title != "" || got.CustomTitle {
+		t.Errorf("blank rename left title=%q custom=%v, want both cleared", got.Title, got.CustomTitle)
+	}
+}
+
+// TestLoadClearsDerivedTitles makes sure a transcript written by an older build,
+// which titled itself from the first prompt, comes back anonymous.
+func TestLoadClearsDerivedTitles(t *testing.T) {
+	dir := t.TempDir()
+	st := newChatSessionStore(dir)
+	st.Load()
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.AppendUser(sess.ID, "an old auto-generated title", nil)
+	// Simulate the old behavior writing a derived title without the marker.
+	st.mu.Lock()
+	st.sessions[sess.ID].Title = "an old auto-generated title"
+	st.sessions[sess.ID].CustomTitle = false
+	st.flushLocked(st.sessions[sess.ID])
+	st.mu.Unlock()
+
+	reloaded := newChatSessionStore(dir)
+	reloaded.Load()
+	got := reloaded.Get(sess.ID)
+	if got == nil {
+		t.Fatal("session did not reload")
+	}
+	if got.Title != "" {
+		t.Errorf("Title = %q after reload, want an old derived title cleared", got.Title)
+	}
+
+	// A user-typed title survives.
+	if !reloaded.Rename(sess.ID, "kept") {
+		t.Fatal("Rename returned false")
+	}
+	reloaded.flush(sess.ID)
+	reloaded2 := newChatSessionStore(dir)
+	reloaded2.Load()
+	if got := reloaded2.Get(sess.ID); got == nil || !got.CustomTitle || got.Title != "kept" {
+		t.Errorf("custom title did not survive reload: %+v", got)
+	}
+}
+
+// TestHandleChatSessionSendQueuesWhileBusy drives the HTTP handler the browser
+// actually calls: a message sent while the session is busy must be accepted (202)
+// with the queue echoed back, not refused with a conflict.
+func TestHandleChatSessionSendQueuesWhileBusy(t *testing.T) {
+	dir := t.TempDir()
+	st := newChatSessionStore(dir)
+	st.Load()
+	srv := &Server{chatSessions: st, cfg: &config.Config{}}
+	srv.chatSessions.defaultRun = srv.sessionTurn
+
+	sess := st.Create("model-a", defaultSessionSettings())
+	// Make the session look busy without running a real model.
+	st.mu.Lock()
+	st.running[sess.ID] = func() {}
+	st.mu.Unlock()
+
+	body := `{"content":"second message","model":"model-a"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/sessions/"+sess.ID+"/messages", strings.NewReader(body))
+	req.SetPathValue("id", sess.ID)
+	rec := httptest.NewRecorder()
+	srv.handleChatSessionSend(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OK     bool              `json:"ok"`
+		Queued bool              `json:"queued"`
+		Queue  []json.RawMessage `json:"queue"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !resp.OK || !resp.Queued {
+		t.Fatalf("response = %+v, want ok and queued", resp)
+	}
+	if len(resp.Queue) != 1 {
+		t.Fatalf("queue echoed back has %d entries, want 1", len(resp.Queue))
+	}
+	if got := st.Get(sess.ID); len(got.Queue) != 1 || got.Queue[0].Content != "second message" {
+		t.Fatalf("stored queue = %+v, want the second message", got.Queue)
+	}
+	// The echoed entry has to carry the real queue id, which is what the browser
+	// uses to cancel or promote exactly that message.
+	var echoed struct {
+		QueueID string `json:"queue_id"`
+	}
+	if err := json.Unmarshal(resp.Queue[0], &echoed); err != nil {
+		t.Fatalf("decode echoed queue entry: %v", err)
+	}
+	if echoed.QueueID == "" || echoed.QueueID != st.Get(sess.ID).Queue[0].QueueID {
+		t.Fatalf("echoed queue_id = %q, want the stored %q", echoed.QueueID, st.Get(sess.ID).Queue[0].QueueID)
+	}
+
+	// That id must be enough to take the message back out, which is the exact
+	// call the × button makes. The old bug drew the row with a local id, so the
+	// server could not find it ("queued message not found").
+	removeReq := httptest.NewRequest(http.MethodPost, "/api/chat/sessions/"+sess.ID+"/queue/remove", strings.NewReader(`{"queue_id":"`+echoed.QueueID+`"}`))
+	removeReq.SetPathValue("id", sess.ID)
+	removeRec := httptest.NewRecorder()
+	srv.handleChatSessionQueueRemove(removeRec, removeReq)
+	if removeRec.Code != http.StatusOK {
+		t.Fatalf("remove status = %d, want 200; body=%s", removeRec.Code, removeRec.Body.String())
+	}
+	if len(st.Get(sess.ID).Queue) != 0 {
+		t.Error("the echoed queue id did not remove the queued message")
+	}
+
+	// The queue survives a reload: it is part of the session file.
+	if _, ok := st.enqueueUser(sess.ID, "again", nil, true); !ok {
+		t.Fatal("enqueueUser failed")
+	}
+	st.flush(sess.ID)
+	reloaded := newChatSessionStore(dir)
+	reloaded.Load()
+	if got := reloaded.Get(sess.ID); got == nil || len(got.Queue) != 1 {
+		t.Fatalf("queue did not survive reload: %+v", got)
+	}
+}
+
+// TestQueueEchoForSendHidesDirectMessage backs the phantom queued row: a message
+// that starts right away is briefly still at the head of Queue while the run
+// goroutine claims it. Echoing it drew a queue row the browser could not clear
+// (no queued_user event ever fires for a direct turn), and it vanished on
+// reload. The echo must hide it, while a turn genuinely parked behind the
+// concurrency limit stays visible.
+func TestQueueEchoForSendHidesDirectMessage(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+
+	st.mu.Lock()
+	sess.Status = chatSessionIdle
+	sess.Queue = []SessionMessage{{Role: "user", Content: "direct", QueueID: "q-direct"}}
+	st.mu.Unlock()
+
+	if got := st.queueEchoForSend(sess.ID, "q-direct", false); len(got) != 0 {
+		t.Fatalf("echo = %+v, want empty for a direct message that is starting", got)
+	}
+
+	// The same message parked behind the global limit is really waiting, so it
+	// has to stay in the echo for the browser to show it.
+	st.mu.Lock()
+	sess.Status = chatSessionQueued
+	st.mu.Unlock()
+	if got := st.queueEchoForSend(sess.ID, "q-direct", false); len(got) != 1 || got[0].Content != "direct" {
+		t.Fatalf("echo = %+v, want the globally parked message", got)
+	}
+
+	// A deferred message sent while the session was busy is also genuine.
+	st.mu.Lock()
+	sess.Status = chatSessionRunning
+	st.mu.Unlock()
+	if got := st.queueEchoForSend(sess.ID, "q-direct", true); len(got) != 1 || got[0].Content != "direct" {
+		t.Fatalf("echo = %+v, want the deferred message", got)
+	}
+
+	// Only the just-accepted entry is withheld; a queued turn ahead of it (which
+	// would make the session busy in the first place) is not.
+	st.mu.Lock()
+	sess.Status = chatSessionRunning
+	sess.Queue = []SessionMessage{
+		{Role: "user", Content: "older", QueueID: "q-older"},
+		{Role: "user", Content: "direct", QueueID: "q-direct"},
+	}
+	st.mu.Unlock()
+	if got := st.queueEchoForSend(sess.ID, "q-direct", false); len(got) != 1 || got[0].Content != "older" {
+		t.Fatalf("echo = %+v, want only the unrelated queued turn", got)
+	}
+}
+
+// TestResetSessionClearsInPlace backs the Reset button on a persistent session:
+// it must empty the session but keep the id, model and settings, so the user
+// stays in the same session instead of falling back to the quick chat.
+func TestResetSessionClearsInPlace(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.AppendUser(sess.ID, "hello", nil)
+	if _, ok := st.enqueueUser(sess.ID, "later", nil, true); !ok {
+		t.Fatal("enqueueUser failed")
+	}
+	if !st.ResetSession(sess.ID) {
+		t.Fatal("ResetSession returned false")
+	}
+	got := st.Get(sess.ID)
+	if got == nil {
+		t.Fatal("reset removed the session")
+	}
+	if len(got.Messages) != 0 || len(got.Queue) != 0 {
+		t.Fatalf("reset left messages=%d queue=%d, want both empty", len(got.Messages), len(got.Queue))
+	}
+	if got.Status != chatSessionIdle {
+		t.Fatalf("status = %q, want idle", got.Status)
+	}
+	if got.Model != "model-a" {
+		t.Fatalf("model = %q, want it kept", got.Model)
+	}
+	if got.ResetPending {
+		t.Fatal("ResetPending must be clear when no turn was running")
+	}
+}
+
+// TestResetSessionWhileRunningFinalizes checks the harder case: a reset while a
+// turn streams cancels it and settles as a clean, idle session, without leaving
+// the cancelled reply behind as an unread badge.
+func TestResetSessionWhileRunningFinalizes(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.mu.Lock()
+	st.sessions[sess.ID].Status = chatSessionRunning
+	st.sessions[sess.ID].Messages = append(st.sessions[sess.ID].Messages,
+		SessionMessage{Role: "user", Content: "hello"},
+		SessionMessage{Role: "assistant", Pending: true},
+	)
+	cancelled := false
+	st.running[sess.ID] = func() { cancelled = true }
+	st.mu.Unlock()
+
+	if !st.ResetSession(sess.ID) {
+		t.Fatal("ResetSession returned false")
+	}
+	if !cancelled {
+		t.Fatal("ResetSession did not cancel the running turn")
+	}
+	if got := st.Get(sess.ID); !got.ResetPending {
+		t.Fatal("ResetPending should be set while the cancelled turn settles")
+	}
+
+	// The cancelled turn settles; the reset finalizes it.
+	srv.finishSession(sess.ID, time.Now())
+	got := st.Get(sess.ID)
+	if len(got.Messages) != 0 || len(got.Queue) != 0 {
+		t.Fatalf("after settle: messages=%d queue=%d, want empty", len(got.Messages), len(got.Queue))
+	}
+	if got.Status != chatSessionIdle {
+		t.Fatalf("status = %q, want idle", got.Status)
+	}
+	if got.Unseen {
+		t.Fatal("a reset turn must not leave an unread badge")
+	}
+	if got.ResetPending {
+		t.Fatal("ResetPending should clear once the turn settles")
+	}
+}
+
+// TestHandleChatSessionResetHTTP backs the endpoint the Reset button calls.
+func TestHandleChatSessionResetHTTP(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	st.AppendUser(sess.ID, "hi", nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/sessions/"+sess.ID+"/reset", nil)
+	req.SetPathValue("id", sess.ID)
+	rec := httptest.NewRecorder()
+	srv.handleChatSessionReset(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := st.Get(sess.ID); got == nil || len(got.Messages) != 0 {
+		t.Fatalf("session not cleared in place: %+v", got)
+	}
+}
+
+// TestHandleChatSessionQueueRemoveHTTP backs the "cancel a queued message" call.
+func TestHandleChatSessionQueueRemoveHTTP(t *testing.T) {
+	st := newTestSessionStore(t)
+	srv := &Server{chatSessions: st}
+	sess := st.Create("model-a", defaultSessionSettings())
+	qid, ok := st.enqueueUser(sess.ID, "take me back", []ChatAttach{{Kind: "text", Name: "a.txt", Text: "hi"}}, true)
+	if !ok {
+		t.Fatal("enqueueUser failed")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat/sessions/"+sess.ID+"/queue/remove", strings.NewReader(`{"queue_id":"`+qid+`"}`))
+	req.SetPathValue("id", sess.ID)
+	rec := httptest.NewRecorder()
+	srv.handleChatSessionQueueRemove(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Message SessionMessage `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Message.Content != "take me back" {
+		t.Errorf("returned message = %q, want the queued text", resp.Message.Content)
+	}
+	if len(st.Get(sess.ID).Queue) != 0 {
+		t.Error("queue should be empty after removing the only entry")
+	}
+}
+
+// enqueueAndRun simulates the server side of a turn: it claims the next queued
+// user turn, records it and releases the slot for whatever is behind it.
+func enqueueAndRun(st *chatSessionStore, id string, ran chan<- string) func() {
+	return func() {
+		st.PopQueuedIntoMessages(id)
+		if sess := st.Get(id); sess != nil && len(sess.Messages) > 0 {
+			ran <- sess.Messages[len(sess.Messages)-1].Content
+		}
+		st.releaseRunning(id)
+	}
+}
+
+// TestSessionQueueDrainsInOrder pins the whole point of the queue: messages sent
+// while a turn runs wait in the session and then run one by one, in order.
+func TestSessionQueueDrainsInOrder(t *testing.T) {
+	st := newTestSessionStore(t)
+	ran := make(chan string, 4)
+	sess := st.Create("model-a", defaultSessionSettings())
+
+	if _, ok := st.enqueueUser(sess.ID, "A", nil, false); !ok {
+		t.Fatal("enqueueUser(A) failed")
+	}
+	st.Start(sess.ID, enqueueAndRun(st, sess.ID, ran))
+	if _, ok := st.enqueueUser(sess.ID, "B", nil, true); !ok {
+		t.Fatal("enqueueUser(B) failed")
+	}
+	st.Start(sess.ID, enqueueAndRun(st, sess.ID, ran))
+	if _, ok := st.enqueueUser(sess.ID, "C", nil, true); !ok {
+		t.Fatal("enqueueUser(C) failed")
+	}
+	st.Start(sess.ID, enqueueAndRun(st, sess.ID, ran))
+
+	for i, want := range []string{"A", "B", "C"} {
+		select {
+		case got := <-ran:
+			if got != want {
+				t.Fatalf("turn %d ran %q, want %q", i, got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("turn %d (%s) never ran", i, want)
+		}
+	}
+
+	got := st.Get(sess.ID)
+	if len(got.Queue) != 0 {
+		t.Errorf("queue still holds %d message(s), want it drained", len(got.Queue))
+	}
+	if len(got.Messages) != 3 {
+		t.Errorf("transcript has %d messages, want the three user turns", len(got.Messages))
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for st.HasBusy() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st.HasBusy() {
+		t.Error("nothing should be busy once the queue drained")
+	}
+}
+
+// TestSessionStopPausesQueueAndResumeContinues makes sure Stop ends the turn and
+// holds the queue instead of throwing it away or running the next message.
+func TestSessionStopPausesQueueAndResumeContinues(t *testing.T) {
+	st := newTestSessionStore(t)
+	started := make(chan string, 4)
+	block := make(chan struct{})
+	var mu sync.Mutex
+	blockFirst := true
+	runner := func(id string) {
+		st.PopQueuedIntoMessages(id)
+		if sess := st.Get(id); sess != nil && len(sess.Messages) > 0 {
+			started <- sess.Messages[len(sess.Messages)-1].Content
+		}
+		mu.Lock()
+		first := blockFirst
+		blockFirst = false
+		mu.Unlock()
+		if first {
+			<-block
+		}
+		st.releaseRunning(id)
+	}
+
+	sess := st.Create("model-a", defaultSessionSettings())
+	if _, ok := st.enqueueUser(sess.ID, "A", nil, false); !ok {
+		t.Fatal("enqueueUser(A) failed")
+	}
+	st.Start(sess.ID, func() { runner(sess.ID) })
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first turn never started")
+	}
+
+	if _, ok := st.enqueueUser(sess.ID, "B", nil, true); !ok {
+		t.Fatal("enqueueUser(B) failed")
+	}
+	st.Start(sess.ID, func() { runner(sess.ID) })
+
+	if !st.Cancel(sess.ID) {
+		t.Fatal("Cancel returned false")
+	}
+	close(block)
+
+	select {
+	case got := <-started:
+		t.Fatalf("B ran while the queue was paused (started %q)", got)
+	case <-time.After(250 * time.Millisecond):
+	}
+	if got := st.Get(sess.ID); len(got.Queue) != 1 || got.Queue[0].Content != "B" {
+		t.Fatalf("queue after Stop = %+v, want B still waiting", got.Queue)
+	}
+	if st.HasBusy() {
+		t.Error("a paused queue must not read as busy")
+	}
+
+	// Sending a new message is an explicit resume: the paused B runs first, C
+	// waits its turn.
+	if _, ok := st.enqueueUser(sess.ID, "C", nil, true); !ok {
+		t.Fatal("enqueueUser(C) failed")
+	}
+	st.Resume(sess.ID)
+	st.Start(sess.ID, func() { runner(sess.ID) })
+	for i, want := range []string{"B", "C"} {
+		select {
+		case got := <-started:
+			if got != want {
+				t.Fatalf("after resume turn %d ran %q, want %q", i, got, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("after resume, %s never ran", want)
+		}
+	}
+}
+
+// TestSessionRemoveQueuedReturnsMessage backs the "cancel a queued message and
+// get it back in the composer" behavior.
+func TestSessionRemoveQueuedReturnsMessage(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	qid, ok := st.enqueueUser(sess.ID, "recover me", []ChatAttach{{Kind: "text", Name: "f.txt", Text: "hello"}}, true)
+	if !ok {
+		t.Fatal("enqueueUser failed")
+	}
+	msg, ok := st.RemoveQueued(sess.ID, qid)
+	if !ok {
+		t.Fatal("RemoveQueued returned false")
+	}
+	if msg.Content != "recover me" || len(msg.Attach) != 1 {
+		t.Fatalf("RemoveQueued returned %+v, want the text and attachment", msg)
+	}
+	if got := st.Get(sess.ID); len(got.Queue) != 0 || len(got.Messages) != 0 {
+		t.Fatalf("after remove: queue=%d messages=%d, want both empty", len(got.Queue), len(got.Messages))
+	}
+	if _, ok := st.RemoveQueued(sess.ID, qid); ok {
+		t.Error("removing the same queued message twice should fail")
+	}
+}
+
+// TestSessionPromoteQueuedMovesToFront backs the lightning "run this one next"
+// button.
+func TestSessionPromoteQueuedMovesToFront(t *testing.T) {
+	st := newTestSessionStore(t)
+	sess := st.Create("model-a", defaultSessionSettings())
+	_, _ = st.enqueueUser(sess.ID, "A", nil, true)
+	_, _ = st.enqueueUser(sess.ID, "B", nil, true)
+	qidC, _ := st.enqueueUser(sess.ID, "C", nil, true)
+
+	if !st.PromoteQueued(sess.ID, qidC) {
+		t.Fatal("PromoteQueued returned false")
+	}
+	q := st.Get(sess.ID).Queue
+	if len(q) != 3 || q[0].Content != "C" || q[1].Content != "A" || q[2].Content != "B" {
+		t.Fatalf("order after promote = %v, want C, A, B", []string{q[0].Content, q[1].Content, q[2].Content})
+	}
+}
+
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+type wireRecorder struct {
+	mu   sync.Mutex
+	reqs map[string][]map[string]any
+}
+
+func newWireRecorder() *wireRecorder {
+	return &wireRecorder{reqs: map[string][]map[string]any{}}
+}
+
+func (w *wireRecorder) record(r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		decoded = map[string]any{"_raw": string(body)}
+	}
+	w.mu.Lock()
+	w.reqs[r.URL.Path] = append(w.reqs[r.URL.Path], decoded)
+	w.mu.Unlock()
+}
+
+func (w *wireRecorder) get(path string) []map[string]any {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]map[string]any(nil), w.reqs[path]...)
+}
+
+func wireToolNames(req map[string]any) []string {
+	var names []string
+	tools, _ := req["tools"].([]any)
+	for _, t := range tools {
+		m, _ := t.(map[string]any)
+		fn, _ := m["function"].(map[string]any)
+		if n, ok := fn["name"].(string); ok {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func wireRolesAndArtifactSystem(req map[string]any) (roles []string, artifactSys bool) {
+	msgs, _ := req["messages"].([]any)
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		role, _ := mm["role"].(string)
+		roles = append(roles, role)
+		if role == "system" {
+			if c, ok := mm["content"].(string); ok && strings.Contains(c, "ISOLATED WORKSPACE ENVIRONMENT") {
+				artifactSys = true
+			}
+		}
+	}
+	return roles, artifactSys
+}
+
+func TestSessionTurnDiagnosticLogs(t *testing.T) {
+	logBuf := &syncLogBuffer{}
+	prev := log.Writer()
+	log.SetOutput(logBuf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	newMock := func(t *testing.T, showStatus int, caps []string) (*httptest.Server, *atomic.Int64) {
+		var chatCount atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/show":
+				if showStatus != http.StatusOK {
+					http.Error(w, `{"error":"private-backend-sentinel"}`, showStatus)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"capabilities": caps,
+					"details":      map[string]any{"format": "gguf"},
+					"model_info":   map[string]any{},
+				})
+			case r.Method == http.MethodGet && r.URL.Path == "/api/tags":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"models":[]}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/api/ps":
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"models":[]}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/api/chat":
+				chatCount.Add(1)
+				_, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				fmt.Fprintln(w, `{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant","content":"private-reply-sentinel"},"done":false}`)
+				fmt.Fprintln(w, `{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":3}`)
+			default:
+				http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(ts.Close)
+		return ts, &chatCount
+	}
+
+	newExternalMock := func(t *testing.T) *httptest.Server {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chat/completions") {
+				_, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprintln(w, `data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"private-reply-sentinel"}}]}`)
+				fmt.Fprintln(w, `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`)
+				fmt.Fprintln(w, `data: [DONE]`)
+				return
+			}
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}))
+		t.Cleanup(ts.Close)
+		return ts
+	}
+
+	cases := []struct {
+		name       string
+		settings   func(SessionSettings) SessionSettings
+		showStatus int
+		showCaps   []string
+		external   bool
+		model      string
+		wantStatus string
+		wantErr    string
+		wantNoChat bool
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name:       "artifacts enabled show ok runs artifact loop",
+			settings:   func(s SessionSettings) SessionSettings { s.Artifacts = true; return s },
+			showStatus: http.StatusOK,
+			showCaps:   []string{"completion", "tools"},
+			model:      "diag-model",
+			wantStatus: chatSessionIdle,
+			want: []string{
+				`capability_lookup=ok`,
+				`capabilities=["completion" "tools"]`,
+				`source=ollama`,
+				`turn_start requested_artifacts=true`,
+				`turn_config can_tools=true`,
+				`effective_artifacts=true`,
+				`runner=artifact`,
+			},
+		},
+		{
+			name:       "artifacts enabled show fails blocks the turn",
+			settings:   func(s SessionSettings) SessionSettings { s.Artifacts = true; return s },
+			showStatus: http.StatusNotFound,
+			model:      "diag-model",
+			wantStatus: chatSessionError,
+			wantErr:    "could not determine model capabilities",
+			wantNoChat: true,
+			want: []string{
+				`capability_lookup=failed reason=request_failed`,
+				`turn_start requested_artifacts=true`,
+				`runner=blocked reason=capability_lookup_failed`,
+			},
+			wantAbsent: []string{`runner=plain`, `runner=artifact`, `runner=web_tools`},
+		},
+		{
+			name:       "artifacts enabled completion-only model blocks the turn",
+			settings:   func(s SessionSettings) SessionSettings { s.Artifacts = true; return s },
+			showStatus: http.StatusOK,
+			showCaps:   []string{"completion"},
+			model:      "diag-model",
+			wantStatus: chatSessionError,
+			wantErr:    "does not support tools",
+			wantNoChat: true,
+			want: []string{
+				`capability_lookup=ok`,
+				`source=ollama`,
+				`turn_start requested_artifacts=true`,
+				`runner=blocked reason=tools_unsupported`,
+			},
+			wantAbsent: []string{`runner=plain`, `runner=artifact`, `runner=web_tools`},
+		},
+		{
+			name:       "web tools enabled show ok runs web loop",
+			settings:   func(s SessionSettings) SessionSettings { s.WebTools = true; return s },
+			showStatus: http.StatusOK,
+			showCaps:   []string{"completion", "tools"},
+			model:      "diag-model",
+			wantStatus: chatSessionIdle,
+			want: []string{
+				`capability_lookup=ok`,
+				`requested_web_tools=true`,
+				`effective_web_tools=true`,
+				`runner=web_tools`,
+			},
+		},
+		{
+			name:       "no tools requested show ok runs plain loop",
+			settings:   func(s SessionSettings) SessionSettings { return s },
+			showStatus: http.StatusOK,
+			showCaps:   []string{"completion", "tools"},
+			model:      "diag-model",
+			wantStatus: chatSessionIdle,
+			want: []string{
+				`turn_start requested_artifacts=false requested_web_tools=false requested_comfy=false`,
+				`effective_artifacts=false effective_web_tools=false effective_comfy=false`,
+				`runner=plain`,
+			},
+		},
+		{
+			name:       "external model uses registered capabilities and runs artifact loop",
+			settings:   func(s SessionSettings) SessionSettings { s.Artifacts = true; return s },
+			showStatus: http.StatusNotFound,
+			external:   true,
+			model:      "diag-ext",
+			wantStatus: chatSessionIdle,
+			want: []string{
+				`external_model=true`,
+				`capability_lookup=ok`,
+				`source=external`,
+				`turn_start requested_artifacts=true`,
+				`effective_artifacts=true`,
+				`runner=artifact`,
+			},
+			wantAbsent: []string{`capability_lookup=failed`, `runner=plain`, `runner=blocked`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ollamaMock, chatCount := newMock(t, tc.showStatus, tc.showCaps)
+			ext := newExternalModelsStore("")
+			model := tc.model
+			if tc.external {
+				extMock := newExternalMock(t)
+				if err := ext.Register("diag-ext", extMock.URL+"/v1/chat/completions", "", []string{"completion", "tools"}, false); err != nil {
+					t.Fatalf("register external: %v", err)
+				}
+				rec, ok := ext.Get("diag-ext")
+				if !ok {
+					t.Fatal("external model not found")
+				}
+				model = rec.ID
+			}
+
+			st := newTestSessionStore(t)
+			srv := &Server{chatSessions: st, ollama: ollama.New(ollamaMock.URL), externalModels: ext}
+
+			settings := tc.settings(defaultSessionSettings())
+			settings.System = "private-system-sentinel"
+			sess := st.Create(model, settings)
+			if !st.AppendUser(sess.ID, "private-user-sentinel create a page", nil) {
+				t.Fatal("AppendUser returned false")
+			}
+
+			mark := len(logBuf.String())
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			srv.runSessionTurn(ctx, sess.ID)
+
+			got := st.Get(sess.ID)
+			if got.Status != tc.wantStatus {
+				t.Fatalf("session status = %q (error=%q), want %q", got.Status, got.Error, tc.wantStatus)
+			}
+			if tc.wantErr != "" {
+				if !strings.Contains(got.Error, tc.wantErr) {
+					t.Errorf("session error = %q, want it to contain %q", got.Error, tc.wantErr)
+				}
+			} else {
+				last := got.Messages[len(got.Messages)-1]
+				if last.Role != "assistant" || !strings.Contains(last.Content, "private-reply-sentinel") {
+					t.Errorf("assistant reply = %+v, want the mock reply text", last)
+				}
+			}
+			if tc.wantNoChat && chatCount.Load() != 0 {
+				t.Errorf("/api/chat was called %d times; a blocked turn must not reach the model", chatCount.Load())
+			}
+
+			segment := logBuf.String()[mark:]
+			for _, want := range tc.want {
+				if !strings.Contains(segment, want) {
+					t.Errorf("log missing %q\ngot:\n%s", want, segment)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(segment, absent) {
+					t.Errorf("log should not contain %q\ngot:\n%s", absent, segment)
+				}
+			}
+			for _, prefix := range []string{
+				fmt.Sprintf(`[chat-sessions] session=%q model=%q turn_start`, sess.ID, model),
+				fmt.Sprintf(`[chat-sessions] session=%q model=%q runner=`, sess.ID, model),
+			} {
+				if !strings.Contains(segment, prefix) {
+					t.Errorf("log missing prefix %q\ngot:\n%s", prefix, segment)
+				}
+			}
+			for _, sentinel := range []string{"private-system-sentinel", "private-user-sentinel", "private-reply-sentinel", "private-backend-sentinel"} {
+				if strings.Contains(segment, sentinel) {
+					t.Errorf("log leaked %q\ngot:\n%s", sentinel, segment)
+				}
+			}
+		})
+	}
+}
+
+func TestSessionModelCapsMatchesToolCapability(t *testing.T) {
+	newShowMock := func(t *testing.T, showStatus int, caps []string) (*httptest.Server, *atomic.Int64) {
+		var showCount atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && r.URL.Path == "/api/show" {
+				showCount.Add(1)
+				if showStatus != http.StatusOK {
+					http.Error(w, `{"error":"model not found"}`, showStatus)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"capabilities": caps,
+					"details":      map[string]any{"format": "gguf"},
+					"model_info":   map[string]any{},
+				})
+				return
+			}
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}))
+		t.Cleanup(ts.Close)
+		return ts, &showCount
+	}
+
+	t.Run("local capabilities", func(t *testing.T) {
+		cases := []struct {
+			name string
+			caps []string
+			want sessionModelInfo
+		}{
+			{"completion and tools", []string{"completion", "tools"}, sessionModelInfo{CanTools: true}},
+			{"completion only", []string{"completion"}, sessionModelInfo{}},
+			{"tools only", []string{"tools"}, sessionModelInfo{CanTools: true}},
+			{"image only", []string{"image"}, sessionModelInfo{IsImage: true}},
+			{"uppercase capabilities", []string{"COMPLETION", "TOOLS", "THINKING"}, sessionModelInfo{CanTools: true, CanThink: true}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				mock, _ := newShowMock(t, http.StatusOK, tc.caps)
+				srv := &Server{ollama: ollama.New(mock.URL), externalModels: newExternalModelsStore("")}
+				got := srv.sessionModelCaps(context.Background(), "m")
+				if got != tc.want {
+					t.Errorf("sessionModelCaps(%v) = %+v, want %+v", tc.caps, got, tc.want)
+				}
+			})
+		}
+		t.Run("lookup failure reports LookupFailed", func(t *testing.T) {
+			mock, _ := newShowMock(t, http.StatusNotFound, nil)
+			srv := &Server{ollama: ollama.New(mock.URL), externalModels: newExternalModelsStore("")}
+			got := srv.sessionModelCaps(context.Background(), "m")
+			if !got.LookupFailed {
+				t.Errorf("sessionModelCaps on Show failure = %+v, want LookupFailed", got)
+			}
+		})
+	})
+
+	t.Run("external uses registered capabilities without local Show", func(t *testing.T) {
+		mock, showCount := newShowMock(t, http.StatusNotFound, nil)
+		ext := newExternalModelsStore("")
+		if err := ext.Register("diag-ext", "http://127.0.0.1:9/v1/chat/completions", "", []string{"completion", "tools", "thinking", "vision"}, false); err != nil {
+			t.Fatalf("register external: %v", err)
+		}
+		srv := &Server{ollama: ollama.New(mock.URL), externalModels: ext}
+		got := srv.sessionModelCaps(context.Background(), "diag-ext")
+		want := sessionModelInfo{CanTools: true, CanThink: true, HasVision: true}
+		if got != want {
+			t.Errorf("sessionModelCaps(external) = %+v, want %+v", got, want)
+		}
+		if n := showCount.Load(); n != 0 {
+			t.Errorf("local /api/show was called %d times for an external model, want 0", n)
+		}
+	})
+
+	t.Run("external completion-only has no tools", func(t *testing.T) {
+		mock, showCount := newShowMock(t, http.StatusNotFound, nil)
+		ext := newExternalModelsStore("")
+		if err := ext.Register("diag-ext2", "http://127.0.0.1:9/v1/chat/completions", "", []string{"completion"}, false); err != nil {
+			t.Fatalf("register external: %v", err)
+		}
+		srv := &Server{ollama: ollama.New(mock.URL), externalModels: ext}
+		got := srv.sessionModelCaps(context.Background(), "diag-ext2")
+		if got.CanTools {
+			t.Errorf("sessionModelCaps(external completion-only) = %+v, want CanTools=false", got)
+		}
+		if got.LookupFailed {
+			t.Errorf("registered external caps must not report LookupFailed: %+v", got)
+		}
+		if n := showCount.Load(); n != 0 {
+			t.Errorf("local /api/show was called %d times for an external model, want 0", n)
+		}
+	})
+}
+
+func TestSessionArtifactToolsSurviveRestoreAndBackground(t *testing.T) {
+	const pageHTML = "<html><body><svg></svg></body></html>"
+
+	localScript := func(round int) []string {
+		switch round {
+		case 0:
+			return []string{
+				`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant","tool_calls":[{"function":{"name":"create_artifact","arguments":{"name":"Background SVG"}}}]},"done":false}`,
+				`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":3}`,
+			}
+		case 1:
+			return []string{
+				fmt.Sprintf(`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"index.html","content":%q}}}]},"done":false}`, pageHTML),
+				`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":3}`,
+			}
+		default:
+			return []string{
+				`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant","content":"Created"},"done":false}`,
+				`{"model":"m","created_at":"2026-10-09T00:00:00Z","message":{"role":"assistant"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":3}`,
+			}
+		}
+	}
+	externalScript := func(round int) []string {
+		var toolCalls string
+		switch round {
+		case 0:
+			toolCalls = `"tool_calls":[{"index":0,"id":"c0","type":"function","function":{"name":"create_artifact","arguments":"{\"name\":\"Background SVG\"}"}}]`
+		case 1:
+			args, _ := json.Marshal(map[string]string{"path": "index.html", "content": pageHTML})
+			toolCalls = fmt.Sprintf(`"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"write_file","arguments":%q}}]`, string(args))
+		default:
+			return []string{
+				`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Created"}}]}`,
+				`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`,
+				`data: [DONE]`,
+			}
+		}
+		return []string{
+			fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"role":"assistant",%s}}]}`, toolCalls),
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`,
+			`data: [DONE]`,
+		}
+	}
+
+	cases := []struct {
+		name     string
+		showCaps []string
+		external bool
+		extCaps  []string
+	}{
+		{"local completion tools", []string{"completion", "tools"}, false, nil},
+		{"local tools only", []string{"tools"}, false, nil},
+		{"external completion tools", nil, true, []string{"completion", "tools"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			t.Chdir(workDir)
+
+			rec := newWireRecorder()
+			var round atomic.Int64
+			ollamaMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && r.URL.Path == "/api/show":
+					rec.record(r)
+					if tc.external {
+						http.Error(w, `{"error":"model not found"}`, http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"capabilities": tc.showCaps,
+						"details":      map[string]any{"format": "gguf"},
+						"model_info":   map[string]any{},
+					})
+				case r.Method == http.MethodGet && r.URL.Path == "/api/tags",
+					r.Method == http.MethodGet && r.URL.Path == "/api/ps":
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"models":[]}`))
+				case r.Method == http.MethodPost && r.URL.Path == "/api/chat":
+					rec.record(r)
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					for _, line := range localScript(int(round.Add(1)) - 1) {
+						fmt.Fprintln(w, line)
+					}
+				default:
+					http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+				}
+			}))
+			t.Cleanup(ollamaMock.Close)
+
+			ext := newExternalModelsStore("")
+			model := "diag-local"
+			chatPath := "/api/chat"
+			if tc.external {
+				extMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/chat/completions") {
+						rec.record(r)
+						w.Header().Set("Content-Type", "text/event-stream")
+						for _, line := range externalScript(int(round.Add(1)) - 1) {
+							fmt.Fprintln(w, line)
+						}
+						return
+					}
+					http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+				}))
+				t.Cleanup(extMock.Close)
+				if err := ext.Register("diag-ext", extMock.URL+"/v1/chat/completions", "", tc.extCaps, false); err != nil {
+					t.Fatalf("register external: %v", err)
+				}
+				rec2, ok := ext.Get("diag-ext")
+				if !ok {
+					t.Fatal("external model not found")
+				}
+				model = rec2.ID
+				chatPath = "/v1/chat/completions"
+			}
+
+			storeDir := t.TempDir()
+			st := newChatSessionStore(storeDir)
+			st.Load()
+			srv := &Server{chatSessions: st, ollama: ollama.New(ollamaMock.URL), externalModels: ext}
+
+			sess := st.Create(model, defaultSessionSettings())
+			st.MergeSettings(sess.ID, sessionSettingsInput{Artifacts: true})
+			if !st.AppendUser(sess.ID, "create an animated SVG", nil) {
+				t.Fatal("AppendUser returned false")
+			}
+			st2 := newChatSessionStore(storeDir)
+			st2.Load()
+			srv.chatSessions = st2
+			if st2.Get(sess.ID) == nil {
+				t.Fatal("session missing after reload")
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			srv.runSessionTurn(ctx, sess.ID)
+
+			got := st2.Get(sess.ID)
+			if got.Status != chatSessionIdle {
+				t.Fatalf("session status = %q (error=%q), want idle", got.Status, got.Error)
+			}
+			if !got.Settings.Artifacts {
+				t.Error("stored artifacts flag changed during the turn")
+			}
+			last := got.Messages[len(got.Messages)-1]
+			if last.Role != "assistant" || last.Pending {
+				t.Fatalf("final message = %+v, want a settled assistant turn", last)
+			}
+			if last.Content != "Created" {
+				t.Errorf("assistant content = %q, want %q", last.Content, "Created")
+			}
+			if last.ArtifactNm != "Background SVG" || last.ArtifactTS == "" || last.ArtifactURL == "" {
+				t.Errorf("artifact fields not stored: %+v", last)
+			}
+			var toolNames []string
+			for _, e := range last.ToolLog {
+				toolNames = append(toolNames, e.Name)
+			}
+			for _, want := range []string{"create_artifact", "write_file"} {
+				found := false
+				for _, n := range toolNames {
+					if n == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("tool log %v missing %q", toolNames, want)
+				}
+			}
+			if last.ArtifactGenerating {
+				t.Error("artifact should not still be marked generating after a finished turn")
+			}
+			for _, e := range last.ToolLog {
+				if e.Error != "" || e.Status == "error" {
+					t.Errorf("tool %q recorded error: %q (status=%q)", e.Name, e.Error, e.Status)
+				}
+			}
+			for _, want := range []string{"create_artifact", "write_file"} {
+				ok := false
+				for _, e := range last.ToolLog {
+					if e.Name == want && e.Status == "ok" {
+						ok = true
+					}
+				}
+				if !ok {
+					t.Errorf("tool log %v has no ok entry for %q", last.ToolLog, want)
+				}
+			}
+
+			indexFile := filepath.Join(workDir, "artifacts", filepath.FromSlash(last.ArtifactTS), "index.html")
+			data, err := os.ReadFile(indexFile)
+			if err != nil {
+				t.Fatalf("expected artifact file %s: %v", indexFile, err)
+			}
+			if string(data) != pageHTML {
+				t.Errorf("index.html = %q, want %q", data, pageHTML)
+			}
+
+			reqs := rec.get(chatPath)
+			if len(reqs) != 3 {
+				t.Fatalf("%s requests = %d, want 3 (three agent rounds)", chatPath, len(reqs))
+			}
+			roles0, sys0 := wireRolesAndArtifactSystem(reqs[0])
+			tools0 := wireToolNames(reqs[0])
+			t.Logf("round 1 request: roles=%v tools=%v artifact_system=%v", roles0, tools0, sys0)
+			if !sys0 {
+				t.Error("round 1 request missing the artifact system prompt")
+			}
+			for _, want := range []string{"create_artifact", "write_file", "read_file", "replace_in_file", "list_dir", "exec"} {
+				found := false
+				for _, n := range tools0 {
+					if n == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("round 1 tools = %v, want %q", tools0, want)
+				}
+			}
+			for _, banned := range []string{"get_artifact_console", "eval_artifact_js", "take_artifact_screenshot"} {
+				for _, n := range tools0 {
+					if n == banned {
+						t.Errorf("round 1 tools expose preview tool %q before preview activation", banned)
+					}
+				}
+			}
+			tools1 := wireToolNames(reqs[1])
+			t.Logf("round 2 request: tools=%v", tools1)
+			for _, want := range []string{"write_file", "read_file", "replace_in_file", "list_dir", "exec", "get_artifact_console"} {
+				found := false
+				for _, n := range tools1 {
+					if n == want {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("round 2 tools = %v, missing %q", tools1, want)
+				}
+			}
+			for _, banned := range []string{"create_artifact", "eval_artifact_js", "take_artifact_screenshot"} {
+				for _, n := range tools1 {
+					if n == banned {
+						t.Errorf("round 2 tools expose unexpected %q", banned)
+					}
+				}
+			}
+		})
+	}
+}

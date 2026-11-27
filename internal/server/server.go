@@ -1,0 +1,527 @@
+// Package server wires the HTTP layer: routing, embedded UI, auth and
+// proxying to the Ollama client.
+package server
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"html/template"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/JulianR87/iAManager/internal/agent"
+	"github.com/JulianR87/iAManager/internal/config"
+	"github.com/JulianR87/iAManager/internal/jobs"
+	"github.com/JulianR87/iAManager/internal/ollama"
+	"github.com/JulianR87/iAManager/internal/runner"
+	"github.com/JulianR87/iAManager/internal/tests"
+)
+
+// WebFS is the embedded static frontend (set from main via //go:embed).
+type WebFS = embed.FS
+
+// Server holds shared state for HTTP handlers.
+type Server struct {
+	cfg            *config.Config
+	ollama         *ollama.Client
+	web            fs.FS
+	tmpl           *template.Template
+	jobs           *jobs.Manager
+	uninst         *uninstallHistoryStore
+	archived       *archivedModelsStore
+	testsStore     *tests.Store
+	agentStore     *agent.SessionStore
+	runnerStore    *runner.ResultStore
+	runner         *runner.Client
+	usage          *modelUsageStore
+	customModels   *customModelsStore
+	externalModels *externalModelsStore
+	gatewayKeys    *gatewayKeysStore
+	systemPrompts  *systemPromptsStore
+	// chatSessions owns the persistent, detached chat sessions that keep
+	// working after the browser that started them is closed.
+	chatSessions *chatSessionStore
+
+	// Guards mutations to cfg done by /api/config endpoints.
+	cfgMu sync.RWMutex
+
+	// stopFixBackupRoot overrides where the stop-fix engine stores the
+	// previous Modelfile (tests point it at a temporary directory).
+	stopFixBackupRoot string
+
+	// Managed gateway listener state. The gateway runs on its own
+	// listener so config changes can be applied live (hot-apply) without
+	// restarting the whole process. gwMu guards gwSrv/gwAddr/gwListening.
+	gwMu        sync.Mutex
+	gwSrv       *http.Server
+	gwAddr      string
+	gwListening bool
+
+	// Serializes read-modify-write cycles against the opencode config file.
+	opencodeMu sync.Mutex
+
+	ragWriteMu sync.Mutex
+
+	// Cache of context_length keyed by model digest. Model info doesn't
+	// change unless the model is reinstalled (digest changes), so we never
+	// need to invalidate by name.
+	ctxMu     sync.RWMutex
+	ctxCache  map[string]int64
+	capsCache map[string][]string
+	metaCache map[string]modelMetaCache
+
+	artifactConsoleMu   sync.RWMutex
+	artifactConsoleLogs map[string][]string // timestamp -> slice of log lines
+
+	artifactScreenshotMu sync.Mutex
+	artifactScreenshotCh map[string]chan artifactScreenshotResponse
+
+	artifactEvalMu sync.Mutex
+	artifactEvalCh map[string]chan artifactEvalResponse
+
+	leaderboardMu sync.Mutex
+
+	// In-memory parse of _leaderboard.json, keyed by the file's modtime+size
+	// so hot read paths (e.g. the /api/models BENCH column) never rebuild the
+	// leaderboard from every stored run.
+	leaderboardCacheMu   sync.RWMutex
+	leaderboardCache     *LeaderboardData
+	leaderboardCacheMod  time.Time
+	leaderboardCacheSize int64
+
+	testsCacheMu   sync.RWMutex
+	testsCacheJSON []byte
+	testsCacheETag string
+
+	projectorCacheMu sync.RWMutex
+	projectorCache   map[string]string // url -> hexSum
+
+	mcpMu          sync.RWMutex
+	mcpStatusCache map[string]MCPServerStatus
+
+	// comfyWorkflows is the registry of API-format workflows the chat agent can
+	// run. It lives next to config.json so a config directory stays portable.
+	comfyWorkflows *comfyWorkflowStore
+
+	versionInfo string
+}
+
+// SetVersionInfo sets the version and build time string reported in API responses.
+func (s *Server) SetVersionInfo(v string) {
+	s.versionInfo = v
+}
+
+// New builds a Server. webRoot is the embedded "web/" directory, and testingRoot is the embedded "testing/" directory.
+func New(cfg *config.Config, ollamaClient *ollama.Client, webRoot fs.FS, testingRoot fs.FS) (*Server, error) {
+	tmpl, err := template.ParseFS(webRoot, "login.html")
+	if err != nil {
+		return nil, fmt.Errorf("parse login template: %w", err)
+	}
+
+	// Store jobs.json next to config.json so "config" and "jobs" always
+	// travel together.
+	jobsPath := filepath.Join(filepath.Dir(cfg.Path()), "jobs.json")
+	historyPath := filepath.Join(filepath.Dir(cfg.Path()), "download_history.json")
+	uninstallPath := filepath.Join(filepath.Dir(cfg.Path()), "uninstall_history.json")
+	jobMgr := jobs.New(jobsPath, historyPath, ollamaClient, log.Default())
+	if err := jobMgr.Load(); err != nil {
+		log.Printf("jobs: could not load %s: %v", jobsPath, err)
+	}
+	uninst := newUninstallHistoryStore(uninstallPath)
+	if err := uninst.Load(); err != nil {
+		log.Printf("uninstall-history: could not load %s: %v", uninstallPath, err)
+	}
+	archivedPath := filepath.Join(filepath.Dir(cfg.Path()), "archived_models.json")
+	archivedStore := newArchivedModelsStore(archivedPath)
+	if err := archivedStore.Load(); err != nil {
+		log.Printf("archived-models: could not load %s: %v", archivedPath, err)
+	}
+
+	testingDir := getTestingDir(cfg.Path())
+	testsStore := tests.New(testingDir)
+	if testingRoot != nil {
+		if err := testsStore.SyncEmbeddedDefaults(testingRoot); err != nil {
+			log.Printf("tests: sync embedded defaults failed: %v", err)
+		}
+	}
+	if err := testsStore.Load(); err != nil {
+		log.Printf("tests: could not load %s: %v", testingDir, err)
+	}
+	if err := testsStore.PopulateSeed(); err != nil {
+		log.Printf("tests: seed populate failed: %v", err)
+	}
+
+	agentStore := agent.NewSessionStore(filepath.Dir(cfg.Path()))
+
+	runnerStore := runner.NewResultStore(testingDir)
+	runnerStore.SetTestsStore(testsStore)
+	if err := runnerStore.Load(); err != nil {
+		log.Printf("runner: could not load history in %s: %v", testingDir, err)
+	}
+
+	usagePath := filepath.Join(filepath.Dir(cfg.Path()), "model_usage.json")
+	usageStore := newModelUsageStore(usagePath)
+	if err := usageStore.Load(); err != nil {
+		log.Printf("model-usage: could not load %s: %v", usagePath, err)
+	}
+
+	customPath := filepath.Join(filepath.Dir(cfg.Path()), "custom_models.json")
+	customStore := newCustomModelsStore(customPath)
+	if err := customStore.Load(); err != nil {
+		log.Printf("custom-models: could not load %s: %v", customPath, err)
+	}
+
+	extPath := filepath.Join(filepath.Dir(cfg.Path()), "external_models.json")
+	extStore := newExternalModelsStore(extPath)
+	if err := extStore.Load(); err != nil {
+		log.Printf("external-models: could not load %s: %v", extPath, err)
+	}
+
+	gwKeysPath := filepath.Join(filepath.Dir(cfg.Path()), "gateway_keys.json")
+	gwKeysStore := newGatewayKeysStore(gwKeysPath)
+	if err := gwKeysStore.Load(); err != nil {
+		log.Printf("gateway-keys: could not load %s: %v", gwKeysPath, err)
+	}
+
+	promptsDir := getPromptsDir(cfg.Path())
+	promptsLegacyPath := filepath.Join(filepath.Dir(cfg.Path()), "system_prompts.json")
+	promptsStore := newSystemPromptsStore(promptsDir, promptsLegacyPath)
+	if err := promptsStore.Load(); err != nil {
+		log.Printf("system-prompts: could not initialize %s: %v", promptsDir, err)
+	}
+
+	// Chat sessions live in their own directory so one corrupt transcript can
+	// never take the rest of them down with it.
+	chatSessionDir := filepath.Join(filepath.Dir(cfg.Path()), "chat_sessions")
+	chatSessions := newChatSessionStore(chatSessionDir)
+	chatSessions.Load()
+
+	// ComfyUI workflows and the media they produce go next to config.json too:
+	// the generated images are referenced by the chat transcripts, so they must
+	// move with them.
+	comfyRoot := filepath.Join(filepath.Dir(cfg.Path()), "comfyui")
+	comfyMediaBase = filepath.Join(comfyRoot, "media")
+	comfyWorkflows := newComfyWorkflowStore(filepath.Join(comfyRoot, "workflows"))
+	comfyWorkflows.Load()
+	sweepOrphanComfyMedia(chatSessions.LiveIDs())
+
+	srv := &Server{
+		cfg:                  cfg,
+		ollama:               ollamaClient,
+		web:                  webRoot,
+		tmpl:                 tmpl,
+		jobs:                 jobMgr,
+		uninst:               uninst,
+		archived:             archivedStore,
+		testsStore:           testsStore,
+		agentStore:           agentStore,
+		runnerStore:          runnerStore,
+		runner:               runner.NewClient(ollamaClient),
+		usage:                usageStore,
+		customModels:         customStore,
+		externalModels:       extStore,
+		gatewayKeys:          gwKeysStore,
+		systemPrompts:        promptsStore,
+		chatSessions:         chatSessions,
+		comfyWorkflows:       comfyWorkflows,
+		ctxCache:             make(map[string]int64),
+		capsCache:            make(map[string][]string),
+		metaCache:            make(map[string]modelMetaCache),
+		artifactConsoleLogs:  make(map[string][]string),
+		artifactScreenshotCh: make(map[string]chan artifactScreenshotResponse),
+		artifactEvalCh:       make(map[string]chan artifactEvalResponse),
+		projectorCache:       make(map[string]string),
+		mcpStatusCache:       make(map[string]MCPServerStatus),
+		testsCacheETag:       fmt.Sprintf("\"%d\"", time.Now().UnixNano()),
+	}
+	// Route battery turns through chatWithModel so external
+	// (OpenAI-compatible) models work in bench, not just Ollama.
+	// chatWithModel already dispatches external vs Ollama.
+	srv.runner.SetChatFunc(srv.chatWithModel)
+	// A queued turn restored from disk has no parked run, so the store rebuilds
+	// one through this when a paused queue resumes.
+	srv.chatSessions.defaultRun = srv.sessionTurn
+	srv.runner.SetIsExternal(func(name string) bool {
+		return srv.externalModels != nil && srv.externalModels.IsExternal(name)
+	})
+	// Recorded tok/s drives per-speed auto-skip rules (family-aware).
+	srv.runner.SetSpeedFunc(func(name string) (float64, bool) {
+		rec, ok := srv.getModelUsage(name)
+		if !ok || rec.RecordTokensPerSec <= 0 {
+			return 0, false
+		}
+		return rec.RecordTokensPerSec, true
+	})
+	jobMgr.SetRecoveryRunner(srv.runHFRecovery)
+	jobMgr.Start()
+	return srv, nil
+}
+
+// Routes returns the http.Handler with all routes mounted.
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Static assets (CSS, JS) are always public.
+	staticFS, err := fs.Sub(s.web, ".")
+	if err != nil {
+		// Should never happen for an embed FS.
+		panic(err)
+	}
+	fileServer := http.FileServer(http.FS(staticFS))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		fileServer.ServeHTTP(w, r)
+	})))
+
+	mux.HandleFunc("GET /login", s.handleLoginPage)
+	mux.HandleFunc("POST /login", s.handleLoginSubmit)
+	mux.HandleFunc("POST /api/login", s.handleAPILogin)
+	mux.HandleFunc("POST /logout", s.handleLogout)
+
+	mux.HandleFunc("GET /", s.handleIndex)
+
+	mux.Handle("GET /api/models", s.requireAuth(s.handleListModels))
+	mux.Handle("GET /api/models/{name}/artifacts", s.requireAuth(s.handleListModelArtifacts))
+	mux.Handle("GET /api/running", s.requireAuth(s.handleListRunning))
+	mux.Handle("POST /api/running/unload-all", s.requireAuth(s.handleUnloadAllRunning))
+	mux.Handle("POST /api/model-repair/preview", s.requireAuth(s.handleRepairPreview))
+	mux.Handle("POST /api/model-repair/apply", s.requireAuth(s.handleRepairApply))
+	mux.Handle("POST /api/model-stop-fix/preview", s.requireAuth(s.handleStopFixPreview))
+	mux.Handle("POST /api/model-stop-fix/apply", s.requireAuth(s.handleStopFixApply))
+	mux.Handle("GET /api/models/{name...}", s.requireAuth(s.handleShowModel))
+	mux.Handle("POST /api/models/unload", s.requireAuth(s.handleUnloadModel))
+	mux.Handle("POST /api/models/archive", s.requireAuth(s.handleArchiveModel))
+	mux.Handle("POST /api/models/unarchive", s.requireAuth(s.handleUnarchiveModel))
+	mux.Handle("POST /api/models/ghost/remove", s.requireAuth(s.handleDeleteGhost))
+	mux.Handle("POST /api/models/analytics/reset", s.requireAuth(s.handleResetModelAnalytics))
+	mux.Handle("GET /api/usage/devices", s.requireAuth(s.handleGetUsageDevices))
+	mux.Handle("GET /api/usage/{name...}", s.requireAuth(s.handleGetModelUsage))
+	mux.Handle("POST /api/models/create", s.requireAuth(s.handleCreateModel))
+	mux.Handle("DELETE /api/models/{name...}", s.requireAuth(s.handleDeleteModel))
+	mux.Handle("POST /api/chat", s.requireAuth(s.handleChat))
+	mux.Handle("GET /api/chat/sessions", s.requireAuth(s.handleChatSessionsList))
+	mux.Handle("POST /api/chat/sessions", s.requireAuth(s.handleChatSessionCreate))
+	// One global feed keeps the session list and the model badges in sync even
+	// when the browser never opened the session that produced the event.
+	mux.Handle("GET /api/chat/events", s.requireAuth(s.handleChatEvents))
+	mux.Handle("GET /api/chat/sessions/{id}", s.requireAuth(s.handleChatSessionGet))
+	mux.Handle("PATCH /api/chat/sessions/{id}", s.requireAuth(s.handleChatSessionPatch))
+	mux.Handle("PATCH /api/chat/sessions/{id}/settings", s.requireAuth(s.handleChatSessionSettingsPatch))
+	mux.Handle("DELETE /api/chat/sessions", s.requireAuth(s.handleChatSessionsDeleteAll))
+	mux.Handle("DELETE /api/chat/sessions/{id}", s.requireAuth(s.handleChatSessionDelete))
+	mux.Handle("GET /api/chat/sessions/{id}/events", s.requireAuth(s.handleChatSessionEvents))
+	mux.Handle("POST /api/chat/sessions/{id}/messages", s.requireAuth(s.handleChatSessionSend))
+	mux.Handle("POST /api/chat/sessions/{id}/queue/remove", s.requireAuth(s.handleChatSessionQueueRemove))
+	mux.Handle("POST /api/chat/sessions/{id}/queue/promote", s.requireAuth(s.handleChatSessionQueuePromote))
+	mux.Handle("POST /api/chat/sessions/{id}/cancel", s.requireAuth(s.handleChatSessionCancel))
+	mux.Handle("POST /api/chat/sessions/{id}/reset", s.requireAuth(s.handleChatSessionReset))
+	mux.Handle("POST /api/chat/sessions/{id}/seen", s.requireAuth(s.handleChatSessionSeen))
+	mux.Handle("POST /api/embed", s.requireAuth(s.handleEmbed))
+	mux.Handle("POST /api/speech", s.requireAuth(s.handleSpeech))
+	mux.Handle("GET /api/speech/voices", s.requireAuth(s.handleSpeechVoices))
+	mux.Handle("POST /api/decision", s.requireAuth(s.handleDecision))
+	mux.Handle("POST /api/pull", s.requireAuth(s.handlePull))
+	mux.Handle("GET /api/status", s.requireAuth(s.handleStatus))
+	mux.Handle("GET /api/external-models", s.requireAuth(s.handleListExternalModels))
+	mux.Handle("POST /api/external-models", s.requireAuth(s.handleCreateExternalModel))
+	mux.Handle("POST /api/external-models/test", s.requireAuth(s.handleTestExternalModel))
+	mux.Handle("POST /api/external-models/toggle", s.requireAuth(s.handleToggleExternalModel))
+	mux.Handle("DELETE /api/external-models/{name...}", s.requireAuth(s.handleDeleteExternalModel))
+	mux.Handle("GET /api/gateway/status", s.requireAuth(s.handleGatewayStatus))
+	mux.Handle("GET /api/gateway/keys", s.requireAuth(s.handleListGatewayKeys))
+	mux.Handle("POST /api/gateway/keys", s.requireAuth(s.handleCreateGatewayKey))
+	mux.Handle("DELETE /api/gateway/keys/{id}", s.requireAuth(s.handleDeleteGatewayKey))
+	mux.Handle("GET /api/hf/search", s.requireAuth(s.handleHFSearch))
+	mux.Handle("GET /api/hf/model", s.requireAuth(s.handleHFModelDetails))
+	mux.Handle("GET /api/hf/readme", s.requireAuth(s.handleHFReadme))
+	mux.Handle("GET /api/ollama/key", s.requireAuth(s.handleOllamaKey))
+
+	mux.Handle("GET /api/jobs", s.requireAuth(s.handleJobsList))
+	mux.Handle("GET /api/jobs/events", s.requireAuth(s.handleJobsEvents))
+	mux.Handle("GET /api/download-history/{name...}", s.requireAuth(s.handleDownloadHistory))
+	mux.Handle("POST /api/jobs/clear", s.requireAuth(s.handleJobsClear))
+	mux.Handle("POST /api/jobs/pause", s.requireAuth(s.handleJobsPauseQueue))
+	mux.Handle("POST /api/jobs/resume", s.requireAuth(s.handleJobsResumeQueue))
+	mux.Handle("POST /api/jobs/{id}/cancel", s.requireAuth(s.handleJobCancel))
+	mux.Handle("POST /api/jobs/{id}/pause", s.requireAuth(s.handleJobPause))
+	mux.Handle("POST /api/jobs/{id}/resume", s.requireAuth(s.handleJobResume))
+	mux.Handle("POST /api/jobs/{id}/promote", s.requireAuth(s.handleJobPromote))
+	mux.Handle("GET /api/jobs/{id}/hf-recovery", s.requireAuth(s.handleHFRecovery))
+	mux.Handle("POST /api/jobs/{id}/hf-recovery", s.requireAuth(s.handleHFRecovery))
+	mux.Handle("DELETE /api/jobs/{id}", s.requireAuth(s.handleJobRemove))
+
+	mux.Handle("GET /api/rags", s.requireAuth(s.handleListRAGs))
+	mux.Handle("POST /api/rags", s.requireAuth(s.handleCreateRAG))
+	mux.Handle("POST /api/rags/import", s.requireAuth(s.handleImportRAG))
+	mux.Handle("POST /api/rags/external/open", s.requireAuth(s.handleOpenExternalRAG))
+	mux.Handle("POST /api/rags/external/save", s.requireAuth(s.handleSaveExternalRAG))
+	mux.Handle("GET /api/chat/rags", s.requireAuth(s.handleListChatRAGs))
+	mux.Handle("POST /api/chat/rags", s.requireAuth(s.handleUploadChatRAG))
+	mux.Handle("GET /api/rags/models", s.requireAuth(s.handleRAGModels))
+	mux.Handle("GET /api/rags/{id}/media/{entry}/{type}", s.requireAuth(s.handleGetRAGMedia))
+	mux.Handle("GET /api/rags/{id}/download", s.requireAuth(s.handleDownloadRAG))
+	mux.Handle("GET /api/rags/{id}", s.requireAuth(s.handleGetRAG))
+	mux.Handle("PUT /api/rags/{id}", s.requireAuth(s.handleUpdateRAG))
+	mux.Handle("DELETE /api/rags/{id}", s.requireAuth(s.handleDeleteRAG))
+
+	mux.Handle("GET /api/skills", s.requireAuth(s.handleListSkills))
+
+	mux.Handle("GET /api/mcp/servers", s.requireAuth(s.handleMCPServers))
+	mux.Handle("POST /api/mcp/test", s.requireAuth(s.handleMCPTest))
+
+	mux.Handle("GET /api/config", s.requireAuth(s.handleGetConfig))
+	mux.Handle("PATCH /api/config", s.requireAuth(s.handlePatchConfig))
+	mux.Handle("POST /api/settings/secrets/reveal", s.requireAuth(s.handleRevealSecret))
+	mux.Handle("POST /api/config/password", s.requireAuth(s.handleSetPassword))
+
+	mux.Handle("GET /api/system-prompts", s.requireAuth(s.handleListSystemPrompts))
+	mux.Handle("POST /api/system-prompts", s.requireAuth(s.handleCreateSystemPrompt))
+	mux.Handle("GET /api/system-prompts/{id}", s.requireAuth(s.handleSystemPromptByID))
+	mux.Handle("PUT /api/system-prompts/{id}", s.requireAuth(s.handleSystemPromptByID))
+	mux.Handle("PATCH /api/system-prompts/{id}", s.requireAuth(s.handleSystemPromptByID))
+	mux.Handle("DELETE /api/system-prompts/{id}", s.requireAuth(s.handleSystemPromptByID))
+
+	mux.Handle("GET /api/opencode", s.requireAuth(s.handleOpenCodeGet))
+	mux.Handle("POST /api/opencode/provider", s.requireAuth(s.handleOpenCodeEnsureProvider))
+	mux.Handle("POST /api/opencode/models", s.requireAuth(s.handleOpenCodeSetModels))
+
+	mux.Handle("GET /api/tests", s.requireAuth(s.handleTestsList))
+	mux.Handle("POST /api/tests", s.requireAuth(s.handleTestsCreate))
+	mux.Handle("PUT /api/tests/{id}", s.requireAuth(s.handleTestsUpdate))
+	mux.Handle("DELETE /api/tests/{id}", s.requireAuth(s.handleTestsDelete))
+	mux.Handle("POST /api/tests/reorder", s.requireAuth(s.handleTestsReorder))
+	mux.Handle("POST /api/tests/{id}/sidecars", s.requireAuth(s.handleTestSidecarUpload))
+	mux.Handle("DELETE /api/tests/{id}/sidecars/{index}", s.requireAuth(s.handleTestSidecarDelete))
+	mux.Handle("POST /api/test-groups", s.requireAuth(s.handleTestGroupsCreate))
+	mux.Handle("PUT /api/test-groups/{id}", s.requireAuth(s.handleTestGroupsUpdate))
+	mux.Handle("DELETE /api/test-groups/{id}", s.requireAuth(s.handleTestGroupsDelete))
+
+	mux.Handle("GET /api/tests/agent/sessions", s.requireAuth(s.handleAgentSessionsList))
+	mux.Handle("POST /api/tests/agent/sessions", s.requireAuth(s.handleAgentSessionsCreate))
+	mux.Handle("GET /api/tests/agent/sessions/{id}", s.requireAuth(s.handleAgentSessionGet))
+	mux.Handle("POST /api/tests/agent/sessions/{id}/message", s.requireAuth(s.handleAgentSessionMessage))
+	mux.Handle("POST /api/tests/agent/sessions/{id}/tool", s.requireAuth(s.handleAgentSessionTool))
+	mux.Handle("POST /api/tests/agent/sessions/{id}/reset", s.requireAuth(s.handleAgentSessionReset))
+	mux.Handle("DELETE /api/tests/agent/sessions/{id}", s.requireAuth(s.handleAgentSessionDestroy))
+	mux.Handle("GET /api/tests/agent/sessions/{id}/files", s.requireAuth(s.handleAgentSessionFiles))
+
+	mux.Handle("GET /api/runner/sys-info", s.requireAuth(s.handleSysInfo))
+	mux.Handle("GET /api/runner/active", s.requireAuth(s.handleActiveBatteryRun))
+	mux.Handle("POST /api/runner/battery", s.requireAuth(s.handleBatteryRun))
+	mux.Handle("GET /api/runner/runs", s.requireAuth(s.handleListRuns))
+	mux.Handle("GET /api/runner/runs/{id}", s.requireAuth(s.handleGetRun))
+	mux.Handle("GET /api/runner/runs/{id}/progress", s.requireAuth(s.handleBatteryProgress))
+	mux.Handle("POST /api/runner/runs/{id}/cancel", s.requireAuth(s.handleCancelBatteryRun))
+	mux.Handle("POST /api/runner/runs/{id}/skip", s.requireAuth(s.handleSkipBatteryTest))
+	mux.Handle("POST /api/runner/runs/{id}/skip-model", s.requireAuth(s.handleSkipBatteryModel))
+	mux.Handle("POST /api/runner/runs/{id}/abort", s.requireAuth(s.handleAbortBatteryRun))
+	mux.Handle("POST /api/runner/runs/{id}/retry", s.requireAuth(s.handleRetryBatteryTest))
+	mux.Handle("PUT /api/runner/runs/{id}/rate", s.requireAuth(s.handleRateRun))
+	mux.Handle("DELETE /api/runner/runs/{id}", s.requireAuth(s.handleDeleteRun))
+	mux.Handle("DELETE /api/runner/model-history/{name...}", s.requireAuth(s.handleDeleteModelHistory))
+	mux.Handle("GET /api/runner/test-history/{id}", s.requireAuth(s.handleGetTestHistory))
+	mux.Handle("GET /api/runner/group-history/{id}", s.requireAuth(s.handleGetGroupHistory))
+	mux.Handle("GET /api/runner/leaderboard", s.requireAuth(s.handleGetLeaderboard))
+	mux.Handle("POST /api/artifacts/console", s.requireAuth(s.handleArtifactConsoleLogs))
+	mux.Handle("POST /api/artifacts/screenshot", s.requireAuth(s.handleArtifactScreenshot))
+	mux.Handle("POST /api/artifacts/eval", s.requireAuth(s.handleArtifactEval))
+
+	// ComfyUI. The summary route is registered before the {id} wildcard because
+	// Go's ServeMux prefers the more specific pattern, so ordering does not matter
+	// here, but the literal paths stay grouped for readability.
+	mux.Handle("GET /api/comfyui/status", s.requireAuth(s.handleComfyStatus))
+	mux.Handle("POST /api/comfyui/interrupt", s.requireAuth(s.handleComfyInterrupt))
+	mux.Handle("POST /api/comfyui/run", s.requireAuth(s.handleComfyRun))
+	mux.Handle("GET /api/comfyui/object-info", s.requireAuth(s.handleComfyObjectInfo))
+	mux.Handle("GET /api/comfyui/workflows", s.requireAuth(s.handleComfyWorkflows))
+	mux.Handle("POST /api/comfyui/workflows", s.requireAuth(s.handleComfyWorkflowCreate))
+	mux.Handle("GET /api/comfyui/workflows/summary", s.requireAuth(s.handleComfyWorkflowsSummary))
+	mux.Handle("POST /api/comfyui/workflows/detect", s.requireAuth(s.handleComfyDetect))
+	mux.Handle("GET /api/comfyui/workflows/{id}", s.requireAuth(s.handleComfyWorkflowGet))
+	mux.Handle("PATCH /api/comfyui/workflows/{id}", s.requireAuth(s.handleComfyWorkflowUpdate))
+	mux.Handle("DELETE /api/comfyui/workflows/{id}", s.requireAuth(s.handleComfyWorkflowDelete))
+
+	// Generated media needs the same auth as the rest of the API, but it must
+	// answer Range requests so <video> can seek.
+	mux.Handle("GET /api/comfyui/media/{file...}", s.requireAuth(s.handleComfyMedia))
+	mux.Handle("DELETE /api/comfyui/media/{file...}", s.requireAuth(s.handleComfyDeleteMedia))
+
+	// Artifact files — same auth as the rest of the API. The preview iframe
+	// sends the session cookie (allow-same-origin), so it keeps working
+	// while logged in.
+	mux.Handle("GET /api/artifacts/{rest...}", s.requireAuth(s.handleArtifactFiles))
+	mux.Handle("DELETE /api/artifacts/{rest...}", s.requireAuth(s.handleDeleteArtifact))
+
+	return logging(mux)
+}
+
+// ListenAndServe binds and serves until ctx is cancelled.
+func (s *Server) ListenAndServe(ctx context.Context) error {
+	srv := &http.Server{
+		Addr:    s.cfg.BindAddress(),
+		Handler: s.Routes(),
+	}
+
+	// Graceful shutdown.
+	go func() {
+		<-ctx.Done()
+		log.Println("shutting down…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Chat sessions own their own background runs, so they must be told to
+		// stop and to flush every transcript before the HTTP server goes away.
+		s.chatSessions.Shutdown()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	// Prime the leaderboard cache (and build _leaderboard.json when missing)
+	// so the first /api/models request is served from cache instead of
+	// recomputing the whole leaderboard from every stored run.
+	go s.WarmLeaderboardCache()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) requireAuth(next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.isAuthenticated(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	})
+}
+
+func getPromptsDir(cfgPath string) string {
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		lower := strings.ToLower(exeDir)
+		if !strings.Contains(lower, "go-build") && !strings.Contains(lower, "temp") && !strings.Contains(lower, "tmp") {
+			return filepath.Join(exeDir, "prompts")
+		}
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "prompts")
+}
+
+func getTestingDir(cfgPath string) string {
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		lower := strings.ToLower(exeDir)
+		if !strings.Contains(lower, "go-build") && !strings.Contains(lower, "temp") && !strings.Contains(lower, "tmp") {
+			return filepath.Join(exeDir, "testing")
+		}
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "testing")
+}

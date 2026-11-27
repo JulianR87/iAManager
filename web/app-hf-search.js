@@ -1,0 +1,1859 @@
+"use strict";
+
+// ---------- HuggingFace Model Explorer Section ----------
+
+let hfModels = [];
+let hfActiveModel = null;
+let hfReadmeCache = new Map();
+let hfSearchDebounce = null;
+let hfCurrentFilter = "all"; // "all" | "ollama" | "vision"
+let hfCurrentTimeFilter = "all"; // "all" | "week" | "month" | "year"
+let hfCurrentSort = "trending"; // "trending" | "downloads" | "likes" | "recent"
+let hfActiveTab = "quants"; // "quants" | "readme"
+let hfPage = 0;
+let hfNextCursor = "";
+let hfHasMore = false;
+let hfLoadingMore = false;
+let hfDetailReturnFocus = null;
+
+function showHFView() {
+  if (typeof hideAllMainViews === "function") {
+    hideAllMainViews();
+  } else {
+    $("models-view") && ($("models-view").hidden = true);
+    $("chat-view") && ($("chat-view").hidden = true);
+    $("tests-view") && ($("tests-view").hidden = true);
+    $("analytics-view") && ($("analytics-view").hidden = true);
+    $("settings-view") && ($("settings-view").hidden = true);
+    $("modelfile-view") && ($("modelfile-view").hidden = true);
+  }
+
+  if (typeof closeDownloads === "function") {
+    closeDownloads();
+  }
+
+  currentView = "hf";
+  const hfView = $("hf-view");
+  if (hfView) hfView.hidden = false;
+
+  $("chat-btn")?.classList.remove("active");
+  $("settings-btn")?.classList.remove("active");
+  $("modelfile-btn")?.classList.remove("active");
+  $("hf-topbar-btn")?.classList.add("active");
+
+  if (window.location.pathname !== "/hf" && window.location.pathname !== "/huggingface") {
+    history.pushState(null, "", "/hf");
+  }
+
+  updateHFMemoryBanner();
+  const input = $("hf-search-input");
+  if (input && !input.value.trim() && hfModels.length === 0) {
+    doHFSearch("");
+  } else {
+    renderHFModelsList();
+  }
+  // Ensure models/ghostModels are fresh so card colors (installed/green,
+  // previously had/orange, downloading/yellow) reflect current state.
+  if (typeof refreshModels === "function") {
+    refreshModels().then(() => { try { renderHFModelsList(); } catch {} });
+  }
+  setTimeout(() => input?.focus(), 50);
+}
+
+function updateHFMemoryBanner() {
+  const banner = $("hf-memory-banner");
+  if (!banner) return;
+  const vramBytes = Number(lastSystemStatus?.vram_total || 0);
+  const ramBytes = Number(lastSystemStatus?.memory_total || 0);
+  const vramText = vramBytes > 0 ? fmtBytes(vramBytes) : "—";
+  const ramText = ramBytes > 0 ? fmtBytes(ramBytes) : "—";
+  banner.textContent = t("hf.sys_mem_info", { vram: vramText, ram: ramText });
+}
+
+/**
+ * Calculates memory fit based on GGUF size, optional vision projector, and current system specs.
+ * Returns: { level: 'optimal'|'partial'|'exceeds', label: string, desc: string, totalBytes: number }
+ */
+function computeMemoryFit(modelSizeBytes, visionSizeBytes = 0) {
+  const vramTotal = Number(lastSystemStatus?.vram_total || 0);
+  const ramTotal = Number(lastSystemStatus?.memory_total || 0);
+  const totalModelBytes = (modelSizeBytes || 0) + (visionSizeBytes || 0);
+
+  // Approximate KV cache & context overhead (~1GB)
+  const ctxOverhead = 1024 * 1024 * 1024;
+  const neededBytes = totalModelBytes + ctxOverhead;
+
+  if (vramTotal > 0 && neededBytes <= vramTotal) {
+    return {
+      level: "optimal",
+      badgeClass: "hf-fit-optimal",
+      label: t("hf.fit_optimal"),
+      shortLabel: t("hf.fit_optimal_short"),
+      desc: t("hf.fit_optimal_desc"),
+      totalBytes: totalModelBytes,
+    };
+  }
+
+  const combinedMemory = vramTotal + ramTotal;
+  if (combinedMemory > 0 && neededBytes <= combinedMemory) {
+    return {
+      level: "partial",
+      badgeClass: "hf-fit-partial",
+      label: t("hf.fit_partial"),
+      shortLabel: t("hf.fit_partial_short"),
+      desc: t("hf.fit_partial_desc"),
+      totalBytes: totalModelBytes,
+    };
+  }
+
+  return {
+    level: "exceeds",
+    badgeClass: "hf-fit-exceeds",
+    label: t("hf.fit_exceeds"),
+    shortLabel: t("hf.fit_exceeds_short"),
+    desc: t("hf.fit_exceeds_desc"),
+    totalBytes: totalModelBytes,
+  };
+}
+
+let hfAutoFetchDepth = 0;
+
+function getVisibleHFCount() {
+  const now = Date.now();
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  return hfModels.filter((m) => {
+    if (!m.gguf_count || m.gguf_count <= 0) return false;
+    if (hfCurrentFilter === "ollama" && !m.has_ollama) return false;
+    if (hfCurrentFilter === "vision" && !m.has_vision) return false;
+
+    if (hfCurrentTimeFilter !== "all" && m.last_modified) {
+      const modTime = new Date(m.last_modified).getTime();
+      if (!isNaN(modTime)) {
+        const diffDays = (now - modTime) / ONE_DAY;
+        if (hfCurrentTimeFilter === "week" && diffDays > 7) return false;
+        if (hfCurrentTimeFilter === "month" && diffDays > 30) return false;
+        if (hfCurrentTimeFilter === "6months" && diffDays > 180) return false;
+        if (hfCurrentTimeFilter === "year" && diffDays > 365) return false;
+      }
+    }
+    return true;
+  }).length;
+}
+
+async function doHFSearch(query, append = false) {
+  const listEl = $("hf-models-list");
+  const loadingEl = $("hf-loading");
+  const emptyEl = $("hf-empty");
+  const errorEl = $("hf-error");
+  const loadMoreWrap = $("hf-load-more-wrap");
+
+  if (!append) {
+    hfNextCursor = "";
+    hfAutoFetchDepth = 0;
+    if (loadingEl) loadingEl.hidden = false;
+    if (emptyEl) emptyEl.hidden = true;
+    if (errorEl) errorEl.hidden = true;
+    if (loadMoreWrap) loadMoreWrap.hidden = true;
+    if (listEl) listEl.innerHTML = "";
+  }
+
+  try {
+    const params = new URLSearchParams();
+    if (query && query.trim()) params.set("q", query.trim());
+    params.set("sort", hfCurrentSort);
+    params.set("filter", hfCurrentFilter);
+    params.set("limit", "30");
+    if (append && hfNextCursor) {
+      params.set("cursor", hfNextCursor);
+    }
+
+    const data = await api(`/api/hf/search?${params.toString()}`);
+    const incoming = Array.isArray(data?.models) ? data.models : [];
+    hfNextCursor = data?.next_cursor || "";
+    hfHasMore = incoming.length >= 30 && !!hfNextCursor;
+
+    if (append) {
+      const existing = new Set(hfModels.map((m) => m.id));
+      const newItems = incoming.filter((m) => !existing.has(m.id));
+      hfModels.push(...newItems);
+    } else {
+      hfModels = incoming;
+    }
+
+    if (loadingEl) loadingEl.hidden = true;
+    renderHFModelsList();
+
+    // If after date/type filtering we have very few visible results (< 12)
+    // and there are more pages available, automatically fetch the next batch (up to 3 continuous pulls)
+    const visibleCount = getVisibleHFCount();
+    if (visibleCount < 12 && hfHasMore && hfNextCursor && (hfAutoFetchDepth || 0) < 3) {
+      hfAutoFetchDepth = (hfAutoFetchDepth || 0) + 1;
+      await doHFSearch(query, true);
+    } else {
+      hfAutoFetchDepth = 0;
+    }
+  } catch (err) {
+    if (loadingEl) loadingEl.hidden = true;
+    if (errorEl) {
+      errorEl.textContent = `${t("hf.error")} (${err.message})`;
+      errorEl.hidden = false;
+    }
+  }
+}
+
+function hfListHeadInnerHTML() {
+  return `
+      <span class="hf-col hf-col-model">${escapeHtml(t("col.name"))}</span>
+      <span class="hf-col hf-col-quants">${escapeHtml(t("hf.col_quants"))}</span>
+      <span class="hf-col hf-col-record">${escapeHtml(t("hf.col_record"))}</span>
+      <span class="hf-col hf-col-bench">${escapeHtml(t("hf.col_bench"))}</span>
+      <span class="hf-col hf-col-updated">${escapeHtml(t("hf.col_updated"))}</span>
+      <span class="hf-col hf-col-downloads">${escapeHtml(t("hf.col_downloads"))}</span>
+      <span class="hf-col hf-col-likes">${escapeHtml(t("hf.col_likes"))}</span>
+      <span class="hf-col hf-col-link"></span>
+  `;
+}
+
+function renderHFModelsList() {
+  const listEl = $("hf-models-list");
+  const emptyEl = $("hf-empty");
+  const loadMoreWrap = $("hf-load-more-wrap");
+  if (!listEl) return;
+
+  const now = Date.now();
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+
+  const filtered = hfModels.filter((m) => {
+    if (!m.gguf_count || m.gguf_count <= 0) return false;
+    if (hfCurrentFilter === "ollama" && !m.has_ollama) return false;
+    if (hfCurrentFilter === "vision" && !m.has_vision) return false;
+
+    if (hfCurrentTimeFilter !== "all" && m.last_modified) {
+      const modTime = new Date(m.last_modified).getTime();
+      if (!isNaN(modTime)) {
+        const diffDays = (now - modTime) / ONE_DAY;
+        if (hfCurrentTimeFilter === "week" && diffDays > 7) return false;
+        if (hfCurrentTimeFilter === "month" && diffDays > 30) return false;
+        if (hfCurrentTimeFilter === "6months" && diffDays > 180) return false;
+        if (hfCurrentTimeFilter === "year" && diffDays > 365) return false;
+      }
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    listEl.innerHTML = "";
+    if (emptyEl) emptyEl.hidden = false;
+    if (loadMoreWrap) loadMoreWrap.hidden = true;
+    return;
+  }
+  if (emptyEl) emptyEl.hidden = true;
+
+  const seenIds = new Set();
+  const ordered = [];
+  for (const m of filtered) {
+    const id = String(m.id || "");
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+    ordered.push(m);
+  }
+
+  const lang = typeof window !== "undefined" && window.I18n && typeof window.I18n.getLang === "function"
+    ? window.I18n.getLang()
+    : "";
+  let headEl = listEl.firstElementChild;
+  if (!headEl || !headEl.classList.contains("hf-list-head")) {
+    headEl = document.createElement("div");
+    headEl.className = "hf-list-head";
+    headEl.setAttribute("aria-hidden", "true");
+    headEl.dataset.hfLang = lang;
+    headEl.innerHTML = hfListHeadInnerHTML();
+    listEl.insertBefore(headEl, listEl.firstElementChild || null);
+  } else if (headEl.dataset.hfLang !== lang) {
+    headEl.dataset.hfLang = lang;
+    headEl.innerHTML = hfListHeadInnerHTML();
+  }
+
+  // Remove obsolete cards before positioning so surviving cards stay in place
+  // and do not get shifted via insertBefore (which restarts CSS animations).
+  const existingCards = new Map();
+  for (const child of [...listEl.children]) {
+    if (child === headEl) continue;
+    if (!child.classList.contains("hf-model-row")) {
+      child.remove();
+      continue;
+    }
+    const repoId = child.dataset.repoId;
+    if (!repoId || !seenIds.has(repoId) || existingCards.has(repoId)) {
+      child.remove();
+      continue;
+    }
+    existingCards.set(repoId, child);
+  }
+
+  let cursor = headEl.nextElementSibling;
+  for (const m of ordered) {
+    const data = hfModelCardData(m);
+    let card = existingCards.get(data.repoId);
+    if (card && card.dataset.hfTitleSig === data.titleSig) {
+      if (card.dataset.hfSig !== data.sig) {
+        patchHFModelCard(card, data);
+      }
+    } else {
+      if (card) card.remove();
+      const holder = document.createElement("div");
+      holder.innerHTML = hfModelCardHTMLFromData(data).trim();
+      card = holder.firstElementChild;
+    }
+    if (card !== cursor) {
+      listEl.insertBefore(card, cursor || null);
+    } else {
+      cursor = cursor.nextElementSibling;
+    }
+  }
+  while (cursor) {
+    const next = cursor.nextElementSibling;
+    cursor.remove();
+    cursor = next;
+  }
+
+  if (loadMoreWrap) {
+    loadMoreWrap.hidden = !hfHasMore;
+  }
+  updateHFMarquees();
+}
+
+// Scrolls truncated model names (like the models list). Names only truncate in
+// the single-line column layout; on mobile they wrap, so no animation runs.
+function updateHFMarquees() {
+  if (typeof updateMarquee !== "function") return;
+  document.querySelectorAll("#hf-models-list .hf-row-title-wrap").forEach((track) => {
+    const text = track.querySelector(".hf-row-title-inner");
+    if (text) updateMarquee(track, text);
+  });
+}
+
+window.addEventListener("resize", () => {
+  if (typeof currentView !== "undefined" && currentView === "hf") {
+    updateHFMarquees();
+  }
+});
+
+function normalizeHFModelName(name) {
+  if (!name) return "";
+  // hf.co and huggingface.co are the same registry (ollama#15661): strip both.
+  return String(name).toLowerCase().replace(/^(hf\.co|huggingface\.co)\//, "").trim();
+}
+
+// Rewrites hf.co/ → huggingface.co/ so Ollama doesn't fail with
+// `realm host "huggingface.co" does not match original host "hf.co"`.
+function canonicalHFPullName(name) {
+  if (!name) return name;
+  const s = String(name).trim();
+  if (/^hf\.co\//i.test(s)) return "huggingface.co/" + s.slice(6);
+  if (/^https?:\/\/hf\.co\//i.test(s)) return s.replace(/^https?:\/\/hf\.co\//i, "huggingface.co/");
+  return s;
+}
+
+function getHFModelInstallStatus(repoId) {
+  if (!repoId) return { installedCount: 0, ghostCount: 0, bestTps: 0, bestBench: null };
+  const target = normalizeHFModelName(repoId);
+  const targetRepo = target.includes("/") ? target.split("/")[1] : target;
+
+  const matches = (m) => {
+    const norm = normalizeHFModelName(m?.name || "");
+    if (norm === target || norm.startsWith(target + ":") || norm.includes(target)) return true;
+    const normRepo = norm.includes("/") ? norm.split("/")[1] : norm;
+    const normBase = normRepo.split(":")[0];
+    if (targetRepo && (normBase === targetRepo || normRepo.startsWith(targetRepo + ":"))) return true;
+    return false;
+  };
+
+  const installedMatches = (models || []).filter(matches);
+  const installedNames = new Set(installedMatches.map((m) => normalizeHFModelName(m.name)));
+
+  const ghostMatches = (ghostModels || []).filter((g) => {
+    const norm = normalizeHFModelName(g.name || "");
+    return matches(g) && !installedNames.has(norm);
+  });
+
+  let bestTps = 0;
+  let bestBench = null;
+
+  for (const m of [...installedMatches, ...ghostMatches]) {
+    const tps = Number(m.record_tokens_per_sec) || 0;
+    if (tps > bestTps) bestTps = tps;
+    if (typeof m.bench_overall === "number" && isFinite(m.bench_overall)) {
+      if (bestBench === null || m.bench_overall > bestBench) {
+        bestBench = m.bench_overall;
+      }
+    }
+  }
+
+  return {
+    installedCount: installedMatches.length,
+    ghostCount: ghostMatches.length,
+    installedModels: installedMatches,
+    bestTps,
+    bestBench,
+  };
+}
+
+function getHFQuantInstallStatus(pullName) {
+  if (!pullName) return { isInstalled: false, wasInstalled: false, record: null, installedModel: null };
+  const target = normalizeHFModelName(pullName);
+  const targetRepo = target.includes("/") ? target.split("/")[1] : target;
+
+  const matches = (entry) => {
+    const norm = normalizeHFModelName(entry?.name || "");
+    if (norm === target || norm.startsWith(target + ":")) return true;
+    const normRepo = norm.includes("/") ? norm.split("/")[1] : norm;
+    if (targetRepo && (normRepo === targetRepo || normRepo.startsWith(targetRepo + ":"))) return true;
+    return false;
+  };
+
+  const installed = (models || []).find(matches) || null;
+  const ghost = installed ? null : ((ghostModels || []).find(matches) || null);
+
+  return {
+    isInstalled: !!installed,
+    wasInstalled: !!ghost,
+    record: installed || ghost,
+    installedModel: installed,
+  };
+}
+
+function getHFToksColor(tps) {
+  if (!tps || tps <= 0) return "";
+  const rel = Math.max(0, Math.min(1, (tps - 10) / 70));
+  const hue = Math.round(rel * 125);
+  return `hsl(${hue}, 85%, 62%)`;
+}
+
+function getHFBenchHeatStyle(score) {
+  if (score == null || !isFinite(score)) return "";
+  if (typeof batteryLbHeatStyle === "function") {
+    return batteryLbHeatStyle(score, { min: 0, max: 100 }, true);
+  }
+  const rel = Math.max(0, Math.min(1, score / 100));
+  const hue = Math.round(rel * 120);
+  const bgPct = (18 + rel * 38).toFixed(0);
+  const textL = (58 + rel * 18).toFixed(0);
+  return `background: color-mix(in srgb, hsl(${hue}, 75%, 42%) ${bgPct}%, transparent); color: hsl(${hue}, 88%, ${textL}%); font-weight: ${rel >= 0.95 ? "700" : "600"};`;
+}
+
+/**
+ * Builds the "Your Record" cell for a quant: best tokens/s ever measured plus
+ * the accumulated tokens and calls, and overall benchmark score if evaluated.
+ */
+function hfQuantUsageHTML(rec) {
+  const tps = Number(rec?.record_tokens_per_sec) || 0;
+  const totalTokens = Number(rec?.total_tokens) || 0;
+  const totalCalls = Number(rec?.total_calls) || 0;
+  const coldLoadMs = Number(rec?.min_cold_load_ms) || 0;
+  const benchScore = (typeof rec?.bench_overall === "number" && isFinite(rec.bench_overall)) ? rec.bench_overall : null;
+  const reasonHTML = hfUninstallReasonHTML(rec);
+
+  if (tps <= 0 && totalTokens <= 0 && totalCalls <= 0 && benchScore === null) {
+    // A quant you removed before it ever ran has no numbers, but the reason you
+    // gave when uninstalling it explains exactly why.
+    if (reasonHTML) return `<div class="hf-usage-cell">${reasonHTML}</div>`;
+    return `<span class="hf-usage-empty" title="${escapeHtml(t("hf.usage_none"))}">—</span>`;
+  }
+
+  const tooltipParts = [];
+  if (rec?.record_tokens_per_sec_at) {
+    tooltipParts.push(t("detail.record_at", { date: fmtDateTimeFull(rec.record_tokens_per_sec_at) }));
+  }
+  if (benchScore !== null) {
+    tooltipParts.push(`${t("hf.bench_overall_label")}: ${benchScore.toFixed(1)}`);
+  }
+  if (coldLoadMs > 0) {
+    tooltipParts.push(`${t("detail.min_cold_load")}: ${fmtColdLoad(coldLoadMs)}`);
+  }
+  if (rec?.last_used_at) {
+    tooltipParts.push(`${t("detail.last_used")}: ${fmtDateTimeFull(rec.last_used_at)}`);
+  }
+
+  let tpsHTML;
+  if (tps > 0) {
+    const color = getHFToksColor(tps);
+    const colorStyle = color ? ` style="color: ${color};"` : "";
+    tpsHTML = `<span class="hf-usage-tps"${colorStyle}>${tps.toFixed(1)}</span> <span class="hf-usage-unit">tok/s</span>`;
+  } else {
+    tpsHTML = `<span class="hf-usage-tps hf-usage-tps-none">—</span> <span class="hf-usage-unit">tok/s</span>`;
+  }
+
+  let benchHTML = "";
+  if (benchScore !== null) {
+    const heatStyle = getHFBenchHeatStyle(benchScore);
+    benchHTML = `<span class="hf-usage-bench" style="${heatStyle}" title="${escapeHtml(t("hf.bench_overall_label"))}: ${benchScore.toFixed(1)}">🎯 ${benchScore.toFixed(1)}</span>`;
+  }
+
+  const subParts = [];
+  if (totalTokens > 0) {
+    subParts.push(`<span title="${escapeHtml(t("hf.usage_total_tokens", { n: totalTokens.toLocaleString() }))}">${escapeHtml(fmtCompactTokens(totalTokens))} tok</span>`);
+  }
+  if (totalCalls > 0) {
+    subParts.push(`<span title="${escapeHtml(t("hf.usage_total_calls", { n: totalCalls.toLocaleString() }))}">${totalCalls.toLocaleString()} ${escapeHtml(t("hf.usage_calls_unit"))}</span>`);
+  }
+
+  return `
+    <div class="hf-usage-cell" title="${escapeHtml(tooltipParts.join(" · "))}">
+      <div class="hf-usage-main">
+        <span class="hf-usage-tps-wrap">⚡ ${tpsHTML}</span>
+        ${benchHTML ? `<span class="hf-usage-bench-wrap">${benchHTML}</span>` : ""}
+      </div>
+      ${subParts.length ? `<div class="hf-usage-sub">${subParts.join(" · ")}</div>` : ""}
+      ${reasonHTML}
+    </div>
+  `;
+}
+
+/**
+ * Renders the reason given when this quant was last uninstalled, if any.
+ * Only ghost entries carry it, since installed models were never removed.
+ */
+function hfUninstallReasonHTML(rec) {
+  const key = rec?.uninstall_reason;
+  if (!key) return "";
+
+  const text = (typeof uninstallReasonToText === "function") ? uninstallReasonToText(key) : "";
+  if (!text) return "";
+
+  const tooltip = rec.uninstall_at
+    ? `${t("hf.uninstall_reason_label")}: ${text} · ${t("analytics.usage_uninstall_at")} ${fmtDateTimeFull(rec.uninstall_at)}`
+    : `${t("hf.uninstall_reason_label")}: ${text}`;
+
+  return `<div class="hf-usage-reason" title="${escapeHtml(tooltip)}">🗑️ ${escapeHtml(text)}</div>`;
+}
+
+function getHFModelDownloadStatus(repoId) {
+  if (!repoId || typeof jobs === "undefined" || !jobs) return { isDownloading: false, isQueued: false };
+  const target = normalizeHFModelName(repoId);
+  let isDownloading = false;
+  let isQueued = false;
+  for (const j of jobs.values()) {
+    const jName = normalizeHFModelName(j.name || "");
+    // Match: huggingface.co/repo:quant, hf.co/repo:quant or repo:quant, or loose contains for fallback
+    const matches = jName === target || jName.startsWith(target + ":") || jName.includes(target);
+    if (!matches) continue;
+    if (j.status === "running") isDownloading = true;
+    else if (j.status === "queued" || j.status === "paused") isQueued = true;
+  }
+  return { isDownloading, isQueued };
+}
+
+function isHFQuantDownloading(pullName) {
+  if (!pullName || typeof jobs === "undefined" || !jobs) return { isDownloading: false, isQueued: false };
+  const target = normalizeHFModelName(pullName);
+  let isDownloading = false;
+  let isQueued = false;
+  for (const j of jobs.values()) {
+    if (normalizeHFModelName(j.name || "") === target) {
+      if (j.status === "running") isDownloading = true;
+      else if (j.status === "queued" || j.status === "paused") isQueued = true;
+    }
+  }
+  return { isDownloading, isQueued };
+}
+
+function hfModelCardData(m) {
+  const repoId = String(m.id || "");
+  const rawAuthor = m.author || repoId.split("/")[0] || "";
+  const rawName = m.name || repoId;
+  const author = escapeHtml(rawAuthor);
+  const name = escapeHtml(rawName);
+  const dlCount = Number(m.downloads || 0).toLocaleString();
+  const likesCount = Number(m.likes || 0).toLocaleString();
+  const rawUpdated = m.last_modified && !m.last_modified.startsWith("0001") ? m.last_modified : null;
+  const updatedRelTime = rawUpdated ? fmtRelativeTime(rawUpdated) : "";
+  const updatedFullDate = rawUpdated ? fmtDateTimeFull(rawUpdated) : "";
+  const updatedTooltip = updatedFullDate && updatedFullDate !== "—" ? (t("hf.updated", { time: updatedFullDate }) || updatedFullDate) : "";
+
+  const installStatus = getHFModelInstallStatus(m.id);
+  const dlStatus = getHFModelDownloadStatus(m.id);
+  let statusEmoji = "";
+  let statusTooltip = "";
+  let cardClass = "hf-model-row hf-card";
+
+  if (installStatus.installedCount > 0) {
+    cardClass += " hf-card-installed";
+    statusEmoji = "💾";
+    statusTooltip = t("hf.status_installed_tip", { count: installStatus.installedCount });
+  } else if (dlStatus.isDownloading) {
+    cardClass += " hf-card-downloading";
+    statusEmoji = "⏳";
+    statusTooltip = t("hf.downloading_badge");
+  } else if (dlStatus.isQueued) {
+    cardClass += " hf-card-downloading";
+    statusEmoji = "⏳";
+    statusTooltip = t("hf.queued_badge");
+  } else if (installStatus.ghostCount > 0) {
+    cardClass += " hf-card-had";
+    statusEmoji = "🕒";
+    statusTooltip = t("hf.status_had_tip", { count: installStatus.ghostCount });
+  }
+
+  const qCountText = m.gguf_count > 0 ? t("hf.quants_tag", { n: m.gguf_count }) : t("hf.tag_gguf");
+  const updatedCellText = updatedRelTime && updatedRelTime !== "—" ? updatedRelTime : "—";
+
+  const recordColor = installStatus.bestTps > 0 ? getHFToksColor(installStatus.bestTps) : "";
+  const recordCell = installStatus.bestTps > 0
+    ? `<span class="hf-chip hf-chip-record" title="${escapeHtml(t("models.col_toks"))}"><span class="hf-row-perf-tps"${recordColor ? ` style="color: ${recordColor};"` : ""}>⚡ ${installStatus.bestTps.toFixed(1)} <span class="hf-row-perf-unit">tok/s</span></span></span>`
+    : `<span class="hf-chip hf-chip-record hf-chip-empty">—</span>`;
+  const benchCell = installStatus.bestBench != null
+    ? `<span class="hf-chip hf-chip-bench" title="${escapeHtml(t("hf.bench_overall_label"))}"><span class="hf-row-perf-bench" style="${getHFBenchHeatStyle(installStatus.bestBench)}">🎯 ${installStatus.bestBench.toFixed(1)}</span></span>`
+    : `<span class="hf-chip hf-chip-bench hf-chip-empty">—</span>`;
+
+  const hfUrl = `https://huggingface.co/${repoId.split("/").map(encodeURIComponent).join("/")}`;
+
+  const hfLinkHTML = `<a href="${hfUrl}" target="_blank" rel="noopener noreferrer" class="hf-ext-link hf-cell-link" title="${escapeHtml(t("hf.view_on_hf"))}" onclick="event.stopPropagation();">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+            <polyline points="15 3 21 3 21 9"></polyline>
+            <line x1="10" y1="14" x2="21" y2="3"></line>
+          </svg>
+        </a>`;
+
+  const visionBadge = m.has_vision ? `<span class="badge badge-vision">${t("hf.tag_vision")}</span>` : "";
+  const isGated = !!(m.is_gated || m.gated);
+  const gatedBadge = isGated ? `<span class="badge badge-warn" title="${escapeHtml(t("hf.gated_badge_tip"))}">${escapeHtml(t("hf.gated_badge"))}</span>` : "";
+  const gatedKeyIcon = isGated ? `<span class="hf-gated-key" title="${escapeHtml(t("hf.gated_badge_tip"))}" aria-label="${escapeHtml(t("hf.gated_badge"))}">🔑</span>` : "";
+
+  const hasDesktopCaps = !!(m.has_vision || isGated);
+  const desktopCapsInnerHTML = `${visionBadge}${gatedBadge}`;
+  const chipsInnerHTML = `
+        ${m.has_vision ? `<span class="hf-chip hf-chip-vision hf-caps-mobile">${visionBadge}</span>` : ""}
+        ${isGated ? `<span class="hf-chip hf-chip-gated hf-caps-mobile">${gatedBadge}</span>` : ""}
+        <span class="hf-chip hf-chip-quants" title="${escapeHtml(t("hf.quants_count", { n: m.gguf_count }) || qCountText)}"><span class="badge badge-subtle"><span class="hf-q-long">${escapeHtml(qCountText)}</span><span class="hf-q-short">${m.gguf_count}q</span></span></span>
+        ${recordCell}
+        ${benchCell}
+      `;
+  const footerInnerHTML = `
+        <span class="hf-stat hf-stat-downloads" title="${dlCount} ${escapeHtml(t("hf.downloads_count", { n: dlCount }) || "downloads")}"><span class="hf-cell-ico">⬇️</span> ${dlCount}</span>
+        <span class="hf-stat hf-stat-likes" title="${likesCount} ${escapeHtml(t("hf.likes_count", { n: likesCount }) || "likes")}"><span class="hf-cell-ico">❤️</span> ${likesCount}</span>
+        ${hfLinkHTML}
+      `;
+
+  const lang = typeof window !== "undefined" && window.I18n && typeof window.I18n.getLang === "function"
+    ? window.I18n.getLang()
+    : "";
+  const titleSig = JSON.stringify([rawAuthor, rawName, isGated ? 1 : 0]);
+  const sig = JSON.stringify([
+    cardClass,
+    statusEmoji,
+    statusTooltip,
+    qCountText,
+    m.gguf_count || 0,
+    installStatus.bestTps || 0,
+    installStatus.bestBench ?? null,
+    updatedCellText,
+    updatedTooltip,
+    dlCount,
+    likesCount,
+    m.has_vision ? 1 : 0,
+    isGated ? 1 : 0,
+    lang,
+  ]);
+
+  return {
+    repoId,
+    author,
+    name,
+    cardClass,
+    statusEmoji,
+    statusTooltip,
+    titleSig,
+    sig,
+    chipsInnerHTML,
+    updatedCellText,
+    updatedTooltip,
+    footerInnerHTML,
+    desktopCapsInnerHTML,
+    hasDesktopCaps,
+    gatedKeyIcon,
+  };
+}
+
+function hfModelCardHTMLFromData(data) {
+  const statusTagHTML = data.statusEmoji
+    ? `<span class="hf-status-tag" title="${escapeHtml(data.statusTooltip)}">${data.statusEmoji}</span>`
+    : "";
+
+  // Columnar row: model columns are fixed-width cells so the values align
+  // across rows. On mobile the wrappers reflow into a compact card.
+  return `
+    <div class="${data.cardClass}" data-repo-id="${escapeHtml(data.repoId)}" data-hf-sig="${escapeHtml(data.sig)}" data-hf-title-sig="${escapeHtml(data.titleSig)}" role="button" tabindex="0" aria-label="${escapeHtml(data.repoId)}">
+      <div class="hf-cell-model">
+        <div class="hf-cell-model-line">
+          ${statusTagHTML}
+          <div class="hf-row-title-wrap">
+            <div class="hf-row-title-inner">
+              <span class="hf-row-author">${data.author}/</span>
+              <span class="hf-row-name">${data.name}</span>${data.gatedKeyIcon}
+            </div>
+          </div>
+        </div>
+        ${data.hasDesktopCaps ? `<div class="hf-cell-caps hf-caps-desktop">${data.desktopCapsInnerHTML}</div>` : ""}
+      </div>
+      <div class="hf-cell-chips">${data.chipsInnerHTML}</div>
+      <span class="hf-cell-updated hf-stat hf-stat-time muted" title="${escapeHtml(data.updatedTooltip)}"><span class="hf-stat-time-icon hf-cell-ico">🕒</span> <span class="hf-stat-time-text">${escapeHtml(data.updatedCellText)}</span></span>
+      <div class="hf-cell-footer">${data.footerInnerHTML}</div>
+    </div>
+  `;
+}
+
+function hfModelCardHTML(m) {
+  return hfModelCardHTMLFromData(hfModelCardData(m));
+}
+
+function patchHFModelCard(card, data) {
+  if (card.className !== data.cardClass) card.className = data.cardClass;
+  card.dataset.hfSig = data.sig;
+
+  const modelLine = card.querySelector(".hf-cell-model-line");
+  if (modelLine) {
+    let tagEl = modelLine.querySelector(".hf-status-tag");
+    if (data.statusEmoji) {
+      if (!tagEl) {
+        tagEl = document.createElement("span");
+        tagEl.className = "hf-status-tag";
+        const titleWrap = modelLine.querySelector(".hf-row-title-wrap");
+        modelLine.insertBefore(tagEl, titleWrap || null);
+      }
+      if (tagEl.textContent !== data.statusEmoji) tagEl.textContent = data.statusEmoji;
+      if (tagEl.title !== data.statusTooltip) tagEl.title = data.statusTooltip;
+    } else if (tagEl) {
+      tagEl.remove();
+    }
+  }
+
+  const cellModel = card.querySelector(".hf-cell-model");
+  if (cellModel) {
+    let desktopCaps = cellModel.querySelector(".hf-cell-caps.hf-caps-desktop");
+    if (data.hasDesktopCaps) {
+      if (!desktopCaps) {
+        desktopCaps = document.createElement("div");
+        desktopCaps.className = "hf-cell-caps hf-caps-desktop";
+        cellModel.appendChild(desktopCaps);
+      }
+      desktopCaps.innerHTML = data.desktopCapsInnerHTML;
+    } else if (desktopCaps) {
+      desktopCaps.remove();
+    }
+  }
+
+  const chipsEl = card.querySelector(".hf-cell-chips");
+  if (chipsEl) chipsEl.innerHTML = data.chipsInnerHTML;
+
+  const updatedEl = card.querySelector(".hf-cell-updated");
+  if (updatedEl) {
+    if (updatedEl.title !== data.updatedTooltip) updatedEl.title = data.updatedTooltip;
+    const updatedTextEl = updatedEl.querySelector(".hf-stat-time-text");
+    if (updatedTextEl && updatedTextEl.textContent !== data.updatedCellText) {
+      updatedTextEl.textContent = data.updatedCellText;
+    }
+  }
+
+  const footerEl = card.querySelector(".hf-cell-footer");
+  if (footerEl) footerEl.innerHTML = data.footerInnerHTML;
+}
+
+async function openHFModelDetail(repoId) {
+  const modal = $("hf-detail-modal");
+  if (!modal) return;
+
+  // Remember the card that opened the modal so focus can return to it on close.
+  hfDetailReturnFocus = document.activeElement;
+
+  $("hf-detail-name").textContent = repoId;
+  const initUpdatedBadge = $("hf-detail-updated");
+  if (initUpdatedBadge) initUpdatedBadge.hidden = true;
+  $("hf-detail-loading").hidden = false;
+  $("hf-detail-body").hidden = true;
+  modal.hidden = false;
+  hfActiveTab = "quants";
+  switchHFDetailTab("quants");
+  $("hf-detail-close")?.focus();
+
+  try {
+    const data = await api(`/api/hf/model?id=${encodeURIComponent(repoId)}`);
+    hfActiveModel = data;
+    renderHFModelDetail(data);
+    $("hf-detail-loading").hidden = true;
+    $("hf-detail-body").hidden = false;
+
+    // Usage records change as the user chats, so pull fresh stats and repaint
+    // the table once they arrive.
+    if (typeof refreshModels === "function") {
+      refreshModels()
+        .then(() => {
+          if (hfActiveModel === data && !modal.hidden) renderHFQuantsTable(data);
+        })
+        .catch(() => {});
+    }
+  } catch (err) {
+    $("hf-detail-loading").hidden = true;
+    toast(t("toast.error", { msg: err.message }), "error");
+    closeHFModelDetail();
+  }
+}
+
+function closeHFModelDetail() {
+  const modal = $("hf-detail-modal");
+  if (modal) modal.hidden = true;
+  hfActiveModel = null;
+
+  if (hfDetailReturnFocus && typeof hfDetailReturnFocus.focus === "function" && hfDetailReturnFocus.isConnected) {
+    hfDetailReturnFocus.focus();
+  }
+  hfDetailReturnFocus = null;
+}
+
+function renderHFModelDetail(m) {
+  $("hf-detail-author").textContent = m.author || m.id.split("/")[0] || "";
+  $("hf-detail-name").textContent = m.name || m.id;
+  $("hf-detail-downloads").textContent = `⬇️ ${Number(m.downloads || 0).toLocaleString()}`;
+  $("hf-detail-likes").textContent = `❤️ ${Number(m.likes || 0).toLocaleString()}`;
+
+  const updatedBadge = $("hf-detail-updated");
+  if (updatedBadge) {
+    const rawUpdated = m.last_modified && !m.last_modified.startsWith("0001") ? m.last_modified : null;
+    if (rawUpdated) {
+      const relTime = fmtRelativeTime(rawUpdated);
+      const fullDate = fmtDateTimeFull(rawUpdated);
+      const label = relTime && relTime !== "—" ? (t("hf.updated", { time: relTime }) || relTime) : "";
+      if (label) {
+        updatedBadge.textContent = `🕒 ${label}`;
+        updatedBadge.title = fullDate && fullDate !== "—" ? (t("hf.updated", { time: fullDate }) || fullDate) : "";
+        updatedBadge.hidden = false;
+      } else {
+        updatedBadge.hidden = true;
+      }
+    } else {
+      updatedBadge.hidden = true;
+    }
+  }
+
+  $("hf-detail-link").href = `https://huggingface.co/${m.id.split("/").map(encodeURIComponent).join("/")}`;
+
+  // Gated repo notice: accept conditions on HF before downloading.
+  const gatedBox = $("hf-detail-gated-box");
+  if (gatedBox) {
+    if (m.is_gated || m.gated) {
+      const repoUrl = `https://huggingface.co/${m.id}`;
+      gatedBox.innerHTML = `<div>${escapeHtml(t("hf.gated_warn", { url: repoUrl }))}</div>
+        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <a href="${repoUrl}" target="_blank" rel="noopener noreferrer" class="hf-link-btn">${escapeHtml(t("hf.gated_open"))} ↗</a>
+          <button type="button" class="ghost" onclick="openHuggingFaceSettings()">${escapeHtml(t("downloads.hf_auth_action"))}</button>
+        </div>`;
+      gatedBox.hidden = false;
+    } else {
+      gatedBox.hidden = true;
+      gatedBox.innerHTML = "";
+    }
+  }
+
+  // XET CDN notice: pulls may fail with "blocked redirect", usually temporary.
+  const xetBox = $("hf-detail-xet-box");
+  if (xetBox) {
+    if (m.uses_xet) {
+      const firstQuant = Array.isArray(m.gguf_files) && m.gguf_files[0]
+        ? (m.gguf_files[0].pull_name || `huggingface.co/${m.id}`)
+        : `huggingface.co/${m.id}`;
+      xetBox.textContent = t("hf.xet_warn", { name: firstQuant });
+      xetBox.hidden = false;
+    } else {
+      xetBox.hidden = true;
+      xetBox.textContent = "";
+    }
+  }
+
+  // Vision Projector Notice
+  const visionBox = $("hf-detail-vision-box");
+  if (visionBox) {
+    if (m.has_vision && Array.isArray(m.vision_files) && m.vision_files.length > 0) {
+      const vFile = m.vision_files[0];
+      visionBox.textContent = t("hf.vision_projector_note", {
+        file: vFile.filename,
+        size: fmtBytes(vFile.size_bytes),
+      });
+      visionBox.hidden = false;
+    } else if (m.has_vision) {
+      visionBox.textContent = t("hf.tag_vision") + ": Multimodal vision support.";
+      visionBox.hidden = false;
+    } else {
+      visionBox.hidden = true;
+    }
+  }
+
+  // Header chat button if model has installed quants
+  const installStatus = getHFModelInstallStatus(m.id);
+  const headChatBtn = $("hf-detail-chat-btn");
+  if (headChatBtn) {
+    if (installStatus.installedCount > 0) {
+      headChatBtn.hidden = false;
+      const targetModelName = installStatus.installedModels?.[0]?.name || canonicalHFPullName(m.id);
+      headChatBtn.dataset.modelName = targetModelName;
+      headChatBtn.title = t("hf.chat_btn_title", { name: targetModelName });
+    } else {
+      headChatBtn.hidden = true;
+      headChatBtn.dataset.modelName = "";
+    }
+  }
+
+  // Render Quants Table
+  renderHFQuantsTable(m);
+}
+
+/**
+ * Fills the strip above the quants table: how many quants the repo offers, how
+ * many of them you already have, the size range, and the system memory the
+ * "Memory Fit" column is measured against.
+ */
+function renderHFQuantsSummary(rows) {
+  const el = $("hf-quants-summary");
+  if (!el) return;
+
+  if (!rows || rows.length === 0) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+
+  const installed = rows.filter((r) => r.status.isInstalled).length;
+  const had = rows.filter((r) => r.status.wasInstalled).length;
+  const sizes = rows.map((r) => Number(r.file.size_bytes) || 0).filter((n) => n > 0);
+
+  const pills = [`<span class="hf-summary-pill">${escapeHtml(t("hf.summary_quants", { n: rows.length }))}</span>`];
+  if (installed > 0) {
+    pills.push(`<span class="hf-summary-pill hf-summary-installed">💾 ${escapeHtml(t("hf.summary_installed", { n: installed }))}</span>`);
+  }
+  if (had > 0) {
+    pills.push(`<span class="hf-summary-pill hf-summary-had">🕒 ${escapeHtml(t("hf.summary_had", { n: had }))}</span>`);
+  }
+  if (sizes.length > 0) {
+    const range = t("hf.summary_size_range", {
+      min: fmtBytes(Math.min(...sizes)),
+      max: fmtBytes(Math.max(...sizes)),
+    });
+    pills.push(`<span class="hf-summary-pill mono">${escapeHtml(range)}</span>`);
+  }
+
+  const vramBytes = Number(lastSystemStatus?.vram_total || 0);
+  const ramBytes = Number(lastSystemStatus?.memory_total || 0);
+  const memInfo = (vramBytes > 0 || ramBytes > 0)
+    ? t("hf.sys_mem_info", {
+        vram: vramBytes > 0 ? fmtBytes(vramBytes) : "—",
+        ram: ramBytes > 0 ? fmtBytes(ramBytes) : "—",
+      })
+    : "";
+
+  el.innerHTML = `
+    <div class="hf-summary-pills">${pills.join("")}</div>
+    ${memInfo ? `<div class="hf-summary-mem mono">${escapeHtml(memInfo)}</div>` : ""}
+  `;
+  el.hidden = false;
+}
+
+function renderHFQuantsTable(m) {
+  const tbody = $("hf-quants-tbody");
+  if (!tbody) return;
+
+  const ggufFiles = Array.isArray(m.gguf_files) ? m.gguf_files : [];
+  if (ggufFiles.length === 0) {
+    delete tbody.dataset.hfRepoId;
+    renderHFQuantsSummary([]);
+    tbody.innerHTML = `
+      <tr>
+        <td colspan="5" class="muted text-center" style="padding: 36px 20px;">
+          <div style="font-size: 15px; font-weight: 600; margin-bottom: 6px; color: var(--text);">⚠️ ${escapeHtml(t("hf.no_gguf_files"))}</div>
+          <div class="small muted" style="max-width: 480px; margin: 0 auto; line-height: 1.5;">${escapeHtml(t("hf.no_gguf_files_desc"))}</div>
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  // Vision size to account for
+  let visionSize = 0;
+  if (Array.isArray(m.vision_files) && m.vision_files.length > 0) {
+    visionSize = m.vision_files[0].size_bytes || 0;
+  }
+
+  // Filter out imatrix, mtp, draft, and auxiliary non-standalone files. Mirrors
+  // IsAuxiliaryGGUF in internal/server/hf_models.go: the leading [a-z]* catches
+  // vendor-prefixed variants such as "FastMTP" or "SpecDraft".
+  const auxFileRegex = /(?:^|[-._])[a-z]*(?:mtp|draft)(?:[-._0-9]|$)/;
+  const validFiles = ggufFiles.filter((f) => {
+    const fn = (f.filename || "").toLowerCase().replace(/\.gguf$/, "");
+    const q = (f.quant || "").toUpperCase();
+    if (q === "IMATRIX" || q === "AUXILIARY" || q === "MMPROJ") return false;
+    if (fn.includes("imatrix") || fn.endsWith(".dat")) return false;
+    if (auxFileRegex.test(fn)) return false;
+    return true;
+  });
+
+  // Sort files by size ascending, resolving each row's fit/install state once.
+  const rows = [...validFiles]
+    .sort((a, b) => (a.size_bytes || 0) - (b.size_bytes || 0))
+    .map((f) => {
+      const pullName = canonicalHFPullName(f.pull_name || f.pullName || (m.id ? `huggingface.co/${m.id}:${f.quant}` : ""));
+      return {
+        file: f,
+        pullName,
+        fit: computeMemoryFit(f.size_bytes, visionSize),
+        status: getHFQuantInstallStatus(pullName),
+        download: isHFQuantDownloading(pullName),
+      };
+    });
+
+  // Determine recommended quant using priority list
+  const quantPriority = [
+    "Q4_K_M", "Q5_K_M", "Q4_K_S", "Q5_K_S", "IQ4_XS", "IQ4_NL",
+    "Q4_0", "Q4_1", "Q3_K_M", "Q3_K_L", "Q3_K_S", "IQ3_M", "IQ3_S",
+    "Q6_K", "Q8_0", "Q2_K"
+  ];
+
+  function pickBestQuant(candidates) {
+    for (const q of quantPriority) {
+      const match = candidates.find((r) => r.file.quant === q);
+      if (match) return match;
+    }
+    return candidates.find((r) => r.file.quant !== "OTHER") || candidates[0] || null;
+  }
+
+  // Prefer a quant that runs fully on the GPU; otherwise settle for one that at
+  // least fits in VRAM+RAM before recommending anything that exceeds memory.
+  const byLevel = (level) => rows.filter((r) => r.fit.level === level);
+  const recommendedRow =
+    pickBestQuant(byLevel("optimal")) ||
+    pickBestQuant(byLevel("partial")) ||
+    pickBestQuant(rows);
+
+  renderHFQuantsSummary(rows);
+
+  const lang = typeof window !== "undefined" && window.I18n && typeof window.I18n.getLang === "function"
+    ? window.I18n.getLang()
+    : "";
+
+  const rowEntries = rows.map((row) => {
+    const f = row.file;
+    const fit = row.fit;
+    const pullName = row.pullName;
+    const isRec = recommendedRow && recommendedRow.file === f;
+
+    const quantStatus = row.status;
+    const isInstalled = quantStatus.isInstalled;
+    const wasInstalled = quantStatus.wasInstalled;
+    const usageRecord = quantStatus.record;
+
+    const isDownloading = row.download.isDownloading;
+    const isQueued = row.download.isQueued;
+
+    let statusBtn = "";
+    if (isInstalled) {
+      const chatModelName = quantStatus.installedModel?.name || canonicalHFPullName(pullName);
+      statusBtn = `
+        <button type="button" class="hf-chat-btn" data-model-name="${escapeHtml(chatModelName)}" title="${escapeHtml(t("hf.chat_btn_title", { name: chatModelName }))}">
+          💬 ${escapeHtml(t("hf.chat_btn"))}
+        </button>
+      `;
+    } else if (isDownloading) {
+      statusBtn = `<span class="badge hf-badge-downloading">⏳ ${escapeHtml(t("hf.downloading_badge"))}</span>`;
+    } else if (isQueued) {
+      statusBtn = `<span class="badge hf-badge-downloading">⏳ ${escapeHtml(t("hf.queued_badge"))}</span>`;
+    } else if (wasInstalled) {
+      statusBtn = `
+        <button type="button" class="secondary btn-sm hf-install-btn" data-pull-name="${escapeHtml(pullName)}" title="ollama pull ${escapeHtml(pullName)}">
+          🔄 ${escapeHtml(t("hf.reinstall_btn"))}
+        </button>
+      `;
+    } else {
+      statusBtn = `
+        <button type="button" class="primary btn-sm hf-install-btn" data-pull-name="${escapeHtml(pullName)}" title="ollama pull ${escapeHtml(pullName)}">
+          ${escapeHtml(t("hf.install_btn"))}
+        </button>
+      `;
+    }
+
+    const recBadge = isRec ? `<span class="badge badge-rec hf-quant-state-badge" title="${escapeHtml(t("hf.recommended_quant"))}">★ ${escapeHtml(t("hf.recommended_quant"))}</span>` : "";
+    let quantStatusBadge = "";
+    if (isInstalled) {
+      quantStatusBadge = `<span class="badge badge-success hf-quant-state-badge" title="${escapeHtml(t("hf.quant_installed"))}">💾 ${escapeHtml(t("hf.card_installed"))}</span>`;
+    } else if (wasInstalled) {
+      quantStatusBadge = `<span class="badge badge-subtle hf-badge-history hf-quant-state-badge" title="${escapeHtml(t("hf.quant_was_installed_desc"))}">🕒 ${escapeHtml(t("hf.quant_was_installed"))}</span>`;
+    }
+    const quantBadges = recBadge + quantStatusBadge;
+
+    const rowClasses = ["hf-quant-row"];
+    if (isRec) rowClasses.push("hf-row-recommended");
+    if (isInstalled) rowClasses.push("hf-row-installed");
+    const rowClass = rowClasses.join(" ");
+    const hasPerf = (Number(usageRecord?.record_tokens_per_sec) > 0) || (typeof usageRecord?.bench_overall === "number" && isFinite(usageRecord?.bench_overall));
+    const usageClass = hasPerf ? "hf-cell-usage has-perf" : "hf-cell-usage no-perf";
+    const usageHtml = hfQuantUsageHTML(usageRecord);
+    const fitHtml = `<span class="badge ${fit.badgeClass}" title="${escapeHtml(fit.label + " — " + fit.desc)}">${escapeHtml(fit.shortLabel || fit.label)}</span>`;
+    const sizeText = fmtBytes(f.size_bytes);
+
+    // Other files sharing this quantization scheme (e.g. NEO vs NEO-MAX). HF
+    // resolves the bare `:scheme` tag to this row's file only, so the rest are
+    // shown as read-only detail with no install action.
+    const extraVariants = Array.isArray(f.extra_variants) ? f.extra_variants : [];
+    const extraVariantsHtml = extraVariants.length
+      ? `<details class="hf-extra-variants">
+           <summary>${escapeHtml(t("hf.extra_variants", { n: extraVariants.length }))}</summary>
+           ${extraVariants.map((v) => `<div class="hf-extra-variant mono" title="${escapeHtml(v.filename)}">${escapeHtml(v.filename)} · ${escapeHtml(fmtBytes(v.size_bytes))}</div>`).join("")}
+         </details>`
+      : "";
+
+    const rowSig = JSON.stringify([
+      rowClass,
+      quantBadges,
+      fit.badgeClass,
+      fit.label,
+      fit.desc,
+      fit.shortLabel || "",
+      sizeText,
+      usageClass,
+      usageHtml,
+      statusBtn,
+      lang,
+    ]);
+
+    return {
+      file: f,
+      pullName,
+      rowClass,
+      quantBadges,
+      fitHtml,
+      sizeText,
+      usageClass,
+      usageHtml,
+      statusBtn,
+      extraVariantsHtml,
+      rowSig,
+    };
+  });
+
+  const repoId = String(m.id || "");
+  const existingRows = [...tbody.querySelectorAll("tr.hf-quant-row")];
+  const canReuse =
+    tbody.dataset.hfRepoId === repoId &&
+    existingRows.length === rowEntries.length &&
+    rowEntries.every((entry, idx) =>
+      existingRows[idx].dataset.pullName === entry.pullName &&
+      existingRows[idx].dataset.hfQuantFilename === String(entry.file.filename || "")
+    );
+
+  if (canReuse) {
+    // Patch mutable cells in-place so .hf-filename-text marquees and open
+    // <details class="hf-extra-variants"> survive status/stats updates.
+    rowEntries.forEach((entry, idx) => {
+      const tr = existingRows[idx];
+      if (tr.dataset.hfQuantSig === entry.rowSig) return;
+      tr.className = entry.rowClass;
+      tr.dataset.hfQuantSig = entry.rowSig;
+
+      const headerRow = tr.querySelector(".hf-quant-header-row");
+      if (headerRow) {
+        let badgesEl = headerRow.querySelector(".hf-quant-badges");
+        if (entry.quantBadges) {
+          if (!badgesEl) {
+            badgesEl = document.createElement("span");
+            badgesEl.className = "hf-quant-badges";
+            headerRow.appendChild(badgesEl);
+          }
+          badgesEl.innerHTML = entry.quantBadges;
+        } else if (badgesEl) {
+          badgesEl.remove();
+        }
+      }
+
+      const sizeEl = tr.querySelector(".hf-cell-size");
+      if (sizeEl && sizeEl.textContent !== entry.sizeText) sizeEl.textContent = entry.sizeText;
+
+      const fitEl = tr.querySelector(".hf-cell-fit");
+      if (fitEl) fitEl.innerHTML = entry.fitHtml;
+
+      const usageEl = tr.querySelector(".hf-cell-usage");
+      if (usageEl) {
+        usageEl.className = entry.usageClass;
+        usageEl.innerHTML = entry.usageHtml;
+      }
+
+      const actionEl = tr.querySelector(".hf-cell-action");
+      if (actionEl) actionEl.innerHTML = entry.statusBtn;
+    });
+  } else {
+    tbody.dataset.hfRepoId = repoId;
+    tbody.innerHTML = rowEntries.map((entry) => {
+      const f = entry.file;
+      return `
+        <tr class="${entry.rowClass}" data-pull-name="${escapeHtml(entry.pullName)}" data-hf-quant-filename="${escapeHtml(f.filename || "")}" data-hf-quant-sig="${escapeHtml(entry.rowSig)}">
+          <td class="hf-cell-quant-file">
+            <div class="hf-quant-header-row">
+              <span class="hf-quant-name mono">${escapeHtml(f.quant)}</span>
+              ${entry.quantBadges ? `<span class="hf-quant-badges">${entry.quantBadges}</span>` : ""}
+            </div>
+            <div class="hf-filename-track" title="${escapeHtml(f.filename)}">
+              <span class="hf-filename-text mono">${escapeHtml(f.filename)}</span>
+            </div>
+            ${entry.extraVariantsHtml}
+          </td>
+          <td class="hf-cell-size mono">${entry.sizeText}</td>
+          <td class="hf-cell-fit">${entry.fitHtml}</td>
+          <td class="${entry.usageClass}">${entry.usageHtml}</td>
+          <td class="hf-cell-action">${entry.statusBtn}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  updateHFQuantMarquees();
+}
+
+/**
+ * Long GGUF filenames share a common prefix and only differ at the end, which
+ * is exactly the part an ellipsis hides. Scroll them instead.
+ */
+function updateHFQuantMarquees() {
+  if (typeof updateMarquee !== "function") return;
+  document.querySelectorAll("#hf-quants-tbody .hf-filename-track").forEach((track) => {
+    const text = track.querySelector(".hf-filename-text");
+    if (text) updateMarquee(track, text);
+  });
+}
+
+function switchHFDetailTab(tab) {
+  hfActiveTab = tab;
+  const quantsTab = $("hf-tab-quants");
+  const readmeTab = $("hf-tab-readme");
+  const quantsSection = $("hf-section-quants");
+  const readmeSection = $("hf-section-readme");
+
+  if (tab === "quants") {
+    quantsTab?.classList.add("active");
+    readmeTab?.classList.remove("active");
+    if (quantsSection) quantsSection.hidden = false;
+    if (readmeSection) readmeSection.hidden = true;
+    // The section had no width while hidden, so the marquees need re-measuring.
+    updateHFQuantMarquees();
+  } else {
+    readmeTab?.classList.add("active");
+    quantsTab?.classList.remove("active");
+    if (readmeSection) readmeSection.hidden = false;
+    if (quantsSection) quantsSection.hidden = true;
+    if (hfActiveModel) loadHFReadme(hfActiveModel.id);
+  }
+}
+
+async function loadHFReadme(repoId) {
+  const container = $("hf-readme-content");
+  if (!container) return;
+
+  if (hfReadmeCache.has(repoId)) {
+    container.innerHTML = hfReadmeCache.get(repoId);
+    return;
+  }
+
+  container.innerHTML = `<div class="muted text-center" style="padding: 30px;">${escapeHtml(t("hf.readme_loading"))}</div>`;
+
+  try {
+    const data = await api(`/api/hf/readme?id=${encodeURIComponent(repoId)}`);
+    const raw = data?.content || "";
+    if (!raw.trim()) {
+      container.innerHTML = `<div class="muted text-center" style="padding: 30px;">${escapeHtml(t("hf.readme_error"))}</div>`;
+      return;
+    }
+    const formatted = formatHFMarkdown(raw, repoId);
+    hfReadmeCache.set(repoId, formatted);
+    container.innerHTML = formatted;
+  } catch (err) {
+    container.innerHTML = `<div class="muted text-center danger-text" style="padding: 30px;">${escapeHtml(t("hf.readme_error"))} (${escapeHtml(err.message)})</div>`;
+  }
+}
+
+function hfSanitizeHtml(html) {
+  if (!html) return "";
+  // Strip dangerous tags: script, style, iframe, object, embed, form, input
+  let clean = html.replace(/<\s*(script|style|iframe|object|embed|form|input)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "");
+  clean = clean.replace(/<\s*(script|style|iframe|object|embed|form|input)[^>]*>/gi, "");
+
+  // Strip event handlers (onload, onerror, onclick, etc.) and javascript: links
+  clean = clean.replace(/\son[a-zA-Z]+\s*=\s*(['"][^'"]*['"]|[^\s>]+)/gi, "");
+  clean = clean.replace(/href\s*=\s*['"]\s*javascript:[^'"]*['"]/gi, 'href="#"');
+  clean = clean.replace(/src\s*=\s*['"]\s*javascript:[^'"]*['"]/gi, 'src=""');
+
+  // Enforce target="_blank" and rel="noopener noreferrer" on all links
+  clean = clean.replace(/<a\s+(?:[^>]*?\s+)?href="([^"]*)"([^>]*)>/gi, (_m, href, rest) => {
+    return `<a href="${href}" target="_blank" rel="noopener noreferrer"${rest}>`;
+  });
+
+  return clean;
+}
+
+function hfExtractYAMLFrontmatter(md) {
+  let text = String(md || "").replace(/\r\n/g, "\n");
+  let metaHTML = "";
+
+  // Check if starts with ---
+  if (text.startsWith("---\n")) {
+    const endIdx = text.indexOf("\n---\n", 4);
+    if (endIdx !== -1) {
+      const yamlContent = text.substring(4, endIdx);
+      text = text.substring(endIdx + 5);
+
+      const metaPills = [];
+      const lines = yamlContent.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+
+        if (trimmed.startsWith("base_model:")) {
+          const val = trimmed.replace("base_model:", "").replace(/[[\]'"]/g, "").trim();
+          if (val) metaPills.push(`<span class="badge badge-subtle">🏷️ Base: <strong>${escapeHtml(val)}</strong></span>`);
+        } else if (trimmed.startsWith("license:")) {
+          const val = trimmed.replace("license:", "").replace(/['"]/g, "").trim();
+          if (val) metaPills.push(`<span class="badge badge-subtle">⚖️ License: <strong>${escapeHtml(val)}</strong></span>`);
+        } else if (trimmed.startsWith("pipeline_tag:")) {
+          const val = trimmed.replace("pipeline_tag:", "").replace(/['"]/g, "").trim();
+          if (val) metaPills.push(`<span class="badge badge-subtle">⚡ ${escapeHtml(val)}</span>`);
+        }
+      }
+
+      if (metaPills.length > 0) {
+        metaHTML = `<div class="hf-readme-meta-strip">${metaPills.join(" ")}</div>`;
+      }
+    }
+  }
+
+  return { cleanText: text, metaHTML };
+}
+
+function hfExtractGFMTables(text, tables) {
+  const lines = text.split("\n");
+  const result = [];
+  let tableLines = [];
+
+  function flushTable() {
+    if (tableLines.length >= 2) {
+      const headerLine = tableLines[0];
+      const alignLine = tableLines[1];
+      const dataLines = tableLines.slice(2);
+
+      const headers = headerLine.split("|").slice(1, -1).map((h) => h.trim());
+      const aligns = alignLine.split("|").slice(1, -1).map((a) => {
+        a = a.trim();
+        if (a.startsWith(":") && a.endsWith(":")) return "center";
+        if (a.endsWith(":")) return "right";
+        return "left";
+      });
+
+      let html = '<div class="table-wrap"><table class="hf-quants-table"><thead><tr>';
+      headers.forEach((h, i) => {
+        const align = aligns[i] || "left";
+        html += `<th style="text-align:${align}">${h}</th>`;
+      });
+      html += '</tr></thead><tbody>';
+
+      dataLines.forEach((row) => {
+        const cells = row.split("|").slice(1, -1).map((c) => c.trim());
+        if (cells.length > 0) {
+          html += '<tr>';
+          headers.forEach((_, i) => {
+            const align = aligns[i] || "left";
+            const cell = cells[i] || "";
+            html += `<td style="text-align:${align}">${cell}</td>`;
+          });
+          html += '</tr>';
+        }
+      });
+      html += '</tbody></table></div>';
+
+      const key = `@@HFTABLE_${tables.length}@@`;
+      tables.push(html);
+      result.push(key);
+    } else {
+      result.push(...tableLines);
+    }
+    tableLines = [];
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith("|") && line.endsWith("|")) {
+      tableLines.push(line);
+    } else {
+      if (tableLines.length) flushTable();
+      result.push(lines[i]);
+    }
+  }
+  if (tableLines.length) flushTable();
+
+  return result.join("\n");
+}
+
+/**
+ * Turns README image URLs (absolute, protocol-relative, or repo-relative) into
+ * a safe https URL. javascript: and data: are rejected.
+ */
+function hfResolveReadmeUrl(url, repoId) {
+  const u = String(url || "").trim();
+  if (!u || /^(javascript|data|vbscript):/i.test(u)) return "";
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.startsWith("//")) return "https:" + u;
+  if (!repoId) return "";
+  const path = u.replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!path) return "";
+  return `https://huggingface.co/${repoId}/resolve/main/${path}`;
+}
+
+function hfAttr(raw, name) {
+  const quoted = raw.match(new RegExp(`\\b${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
+  if (quoted) return quoted[2];
+  const bare = raw.match(new RegExp(`\\b${name}\\s*=\\s*([^\\s>]+)`, "i"));
+  return bare ? bare[1] : "";
+}
+
+function hfRewriteHtmlImg(raw, repoId) {
+  const src = hfResolveReadmeUrl(hfAttr(raw, "src"), repoId);
+  if (!src) return "";
+  const alt = hfAttr(raw, "alt");
+  const width = hfAttr(raw, "width");
+  const height = hfAttr(raw, "height");
+  const size =
+    (/^\d+%?$/.test(width) ? ` width="${width}"` : "") +
+    (/^\d+%?$/.test(height) ? ` height="${height}"` : "");
+  return `<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${size} loading="lazy" class="hf-readme-img" />`;
+}
+
+/**
+ * Pulls HTML <img> tags — including the multiline form HuggingFace READMEs
+ * use — out of the markdown before the line-by-line parser can wrap each
+ * attribute in a <p> and break the tag.
+ */
+function hfExtractHtmlImages(text, images, repoId) {
+  return text.replace(/<img\b[\s\S]*?(?:\/\s*>|>)/gi, (raw) => {
+    if (raw.length > 2500) return raw;
+    const html = hfRewriteHtmlImg(raw, repoId);
+    if (!html) return "";
+    const key = `@@HFIMG_${images.length}@@`;
+    images.push(html);
+    return key;
+  });
+}
+
+/**
+ * Collapses HTML tags whose attributes are spread over several lines into a
+ * single line. READMEs commonly format <img> that way, and the line-by-line
+ * parser below would otherwise wrap each attribute in its own <p>.
+ */
+function hfJoinMultilineTags(text) {
+  const MAX_JOINED_LINES = 12;
+  const lines = text.split("\n");
+  const out = [];
+  let pending = null;
+  let pendingCount = 0;
+
+  const opensUnclosedTag = (line) => {
+    const re = /<\/?[a-zA-Z][a-zA-Z0-9-]*/g;
+    let lastIdx = -1;
+    let m;
+    while ((m = re.exec(line)) !== null) lastIdx = m.index;
+    return lastIdx !== -1 && !line.slice(lastIdx).includes(">");
+  };
+
+  for (const line of lines) {
+    if (pending !== null) {
+      pending += " " + line.trim();
+      pendingCount++;
+      if (pending.includes(">") || pendingCount >= MAX_JOINED_LINES) {
+        out.push(pending);
+        pending = null;
+        pendingCount = 0;
+      }
+      continue;
+    }
+    if (opensUnclosedTag(line)) {
+      pending = line.trimEnd();
+      pendingCount = 0;
+      continue;
+    }
+    out.push(line);
+  }
+  if (pending !== null) out.push(pending);
+
+  return out.join("\n");
+}
+
+function formatHFMarkdown(md, repoId) {
+  if (!md) return "";
+
+  // 1. Extract and format YAML frontmatter
+  const { cleanText, metaHTML } = hfExtractYAMLFrontmatter(md);
+  let work = cleanText;
+
+  // 2. Extract code blocks so markdown rules don't tamper with them
+  const codeBlocks = [];
+  work = work.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const key = `@@HFCODEBLOCK_${codeBlocks.length}@@`;
+    const langLabel = lang ? escapeHtml(lang) : "code";
+    const escapedCode = escapeHtml(code.trim());
+    codeBlocks.push(`
+      <div class="chat-code-wrap">
+        <div class="chat-code-header">
+          <span class="chat-code-lang">${langLabel}</span>
+          <button type="button" class="chat-code-copy-btn" data-code="${escapedCode}" onclick="navigator.clipboard.writeText(this.dataset.code); this.textContent='✓ Copied'; setTimeout(() => this.textContent='Copy', 2000);">Copy</button>
+        </div>
+        <pre class="chat-code mono"><code>${escapedCode}</code></pre>
+      </div>
+    `);
+    return key;
+  });
+
+  // HTML <img> tags (often split across lines) must come out before any
+  // per-line wrapping, otherwise the browser eats `<img` and prints the rest.
+  const htmlImages = [];
+  work = hfExtractHtmlImages(work, htmlImages, repoId);
+
+  // Rejoin remaining HTML tags split across lines
+  work = hfJoinMultilineTags(work);
+
+  // 3. Extract GFM Tables
+  const tableBlocks = [];
+  work = hfExtractGFMTables(work, tableBlocks);
+
+  // 4. Markdown headers
+  work = work.replace(/^######\s+(.+)$/gm, "<h6>$1</h6>");
+  work = work.replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>");
+  work = work.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+  work = work.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+  work = work.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
+  work = work.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+
+  // 5. Markdown images: ![alt](url) — including repo-relative paths
+  work = work.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, alt, url) => {
+    const src = hfResolveReadmeUrl(url, repoId);
+    if (!src) return "";
+    const key = `@@HFIMG_${htmlImages.length}@@`;
+    htmlImages.push(`<img src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" class="hf-readme-img" />`);
+    return key;
+  });
+
+  // 6. Markdown links: [text](url)
+  work = work.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1 ↗</a>');
+
+  // 7. Bold & Italics
+  work = work.replace(/\*\*\*([^*]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  work = work.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  work = work.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+  work = work.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+  work = work.replace(/_([^_\n]+)_/g, "<em>$1</em>");
+
+  // 8. Strikethrough
+  work = work.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+
+  // 9. Inline code: `code`
+  work = work.replace(/`([^`\n]+)`/g, '<code class="mono">$1</code>');
+
+  // 10. Horizontal rules
+  work = work.replace(/^([-*_]){3,}$/gm, '<hr class="hf-readme-hr" />');
+
+  // 11. Parse lists and blockquotes line by line
+  const lines = work.split("\n");
+  const out = [];
+  let inUl = false;
+  let inOl = false;
+  let inQuote = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Bullet list
+    if (/^[-*+]\s+(.*)$/.test(trimmed)) {
+      if (inOl) { out.push("</ol>"); inOl = false; }
+      if (!inUl) { out.push("<ul>"); inUl = true; }
+      const item = trimmed.replace(/^[-*+]\s+/, "");
+      out.push(`<li>${item}</li>`);
+      continue;
+    }
+
+    // Numbered list
+    if (/^\d+\.\s+(.*)$/.test(trimmed)) {
+      if (inUl) { out.push("</ul>"); inUl = false; }
+      if (!inOl) { out.push("<ol>"); inOl = true; }
+      const item = trimmed.replace(/^\d+\.\s+/, "");
+      out.push(`<li>${item}</li>`);
+      continue;
+    }
+
+    // End lists if normal line
+    if (inUl) { out.push("</ul>"); inUl = false; }
+    if (inOl) { out.push("</ol>"); inOl = false; }
+
+    // Blockquote
+    if (/^>\s?(.*)$/.test(trimmed)) {
+      if (!inQuote) { out.push("<blockquote>"); inQuote = true; }
+      const quoteText = trimmed.replace(/^>\s?/, "");
+      out.push(quoteText ? `<p>${quoteText}</p>` : "");
+      continue;
+    }
+    if (inQuote) { out.push("</blockquote>"); inQuote = false; }
+
+    // Table placeholder
+    if (/^@@HFTABLE_\d+@@$/.test(trimmed)) {
+      out.push(trimmed);
+      continue;
+    }
+
+    // Codeblock placeholder
+    if (/^@@HFCODEBLOCK_\d+@@$/.test(trimmed)) {
+      out.push(trimmed);
+      continue;
+    }
+
+    // Image placeholder
+    if (/^@@HFIMG_\d+@@$/.test(trimmed)) {
+      out.push(trimmed);
+      continue;
+    }
+
+    if (trimmed === "") {
+      out.push("");
+    } else {
+      // Pass HTML through: a full tag, an unclosed start tag (`<img`), a closer
+      // (`/>`), or an attribute continuation (`src="..."`). Wrapping any of
+      // those in <p> is what made README images leak as text.
+      if (
+        /^<\/?[a-zA-Z]/.test(trimmed) ||
+        /^\/?>$/.test(trimmed) ||
+        /^[a-zA-Z_:][\w:.-]*\s*=/.test(trimmed)
+      ) {
+        out.push(trimmed);
+      } else {
+        out.push(`<p>${trimmed}</p>`);
+      }
+    }
+  }
+
+  if (inUl) out.push("</ul>");
+  if (inOl) out.push("</ol>");
+  if (inQuote) out.push("</blockquote>");
+
+  let parsed = out.join("\n");
+
+  // 12. Restore tables
+  tableBlocks.forEach((tbl, idx) => {
+    parsed = parsed.replace(`@@HFTABLE_${idx}@@`, tbl);
+  });
+
+  // 13. Restore code blocks
+  codeBlocks.forEach((code, idx) => {
+    parsed = parsed.replace(`@@HFCODEBLOCK_${idx}@@`, code);
+  });
+
+  // 14. Restore extracted images (may sit inside restored tables)
+  htmlImages.forEach((img, idx) => {
+    parsed = parsed.replace(`@@HFIMG_${idx}@@`, img);
+  });
+
+  // 15. Sanitize final HTML to prevent XSS while allowing clean rendering
+  const sanitized = hfSanitizeHtml(parsed);
+
+  return `
+    <div class="hf-markdown-body">
+      ${metaHTML}
+      ${sanitized}
+    </div>
+  `;
+}
+
+// ---------- Event Listeners Bindings ----------
+
+function bindHFExplorerEvents() {
+  // Topbar button
+  $("hf-topbar-btn")?.addEventListener("click", showHFView);
+
+  // Open HF explorer from downloads modal button
+  $("dl-open-hf-btn")?.addEventListener("click", () => {
+    closeDownloads();
+    showHFView();
+  });
+
+  // Back button in HF view -> back to models view
+  $("hf-back-btn")?.addEventListener("click", () => {
+    showModelsView();
+    history.pushState(null, "", "/");
+  });
+
+  // Search input with debouncing
+  $("hf-search-input")?.addEventListener("input", (e) => {
+    const val = e.target.value;
+    const clearBtn = $("hf-search-clear");
+    if (clearBtn) clearBtn.hidden = !val;
+
+    clearTimeout(hfSearchDebounce);
+    hfSearchDebounce = setTimeout(() => {
+      doHFSearch(val);
+    }, 350);
+  });
+
+  $("hf-search-clear")?.addEventListener("click", () => {
+    const input = $("hf-search-input");
+    if (input) {
+      input.value = "";
+      $("hf-search-clear").hidden = true;
+      doHFSearch("");
+      input.focus();
+    }
+  });
+
+  // Sort dropdown
+  $("hf-sort-select")?.addEventListener("change", (e) => {
+    hfCurrentSort = e.target.value;
+    const query = $("hf-search-input")?.value || "";
+    doHFSearch(query);
+  });
+
+  // Filter chips (Type)
+  document.querySelectorAll(".hf-filter-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      document.querySelectorAll(".hf-filter-chip").forEach((c) => c.classList.remove("active"));
+      chip.classList.add("active");
+      hfCurrentFilter = chip.dataset.filter || "all";
+      const q = $("hf-search-input")?.value || "";
+      doHFSearch(q, false);
+    });
+  });
+
+  // Filter chips (Time)
+  document.querySelectorAll(".hf-time-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      document.querySelectorAll(".hf-time-chip").forEach((c) => c.classList.remove("active"));
+      chip.classList.add("active");
+      hfCurrentTimeFilter = chip.dataset.time || "all";
+      renderHFModelsList();
+    });
+  });
+
+  // Load more button
+  $("hf-load-more-btn")?.addEventListener("click", async () => {
+    if (hfLoadingMore || !hfNextCursor) return;
+    hfLoadingMore = true;
+    const btn = $("hf-load-more-btn");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = t("hf.loading_more");
+    }
+    const query = $("hf-search-input")?.value || "";
+    await doHFSearch(query, true);
+    hfLoadingMore = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = t("hf.load_more");
+    }
+  });
+
+  // Card click -> open detail modal
+  $("hf-models-list")?.addEventListener("click", (e) => {
+    const card = e.target.closest(".hf-card");
+    if (!card) return;
+    const repoId = card.dataset.repoId;
+    if (repoId) openHFModelDetail(repoId);
+  });
+
+  $("hf-models-list")?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const card = e.target.closest(".hf-card");
+    if (!card || !card.dataset.repoId) return;
+    e.preventDefault();
+    openHFModelDetail(card.dataset.repoId);
+  });
+
+  // Detail Modal tabs
+  $("hf-tab-quants")?.addEventListener("click", () => switchHFDetailTab("quants"));
+  $("hf-tab-readme")?.addEventListener("click", () => switchHFDetailTab("readme"));
+
+  // Detail Modal close
+  $("hf-detail-close")?.addEventListener("click", closeHFModelDetail);
+  $("hf-detail-modal")?.addEventListener("click", (e) => {
+    if (e.target === $("hf-detail-modal")) closeHFModelDetail();
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const modal = $("hf-detail-modal");
+    if (modal && !modal.hidden) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      closeHFModelDetail();
+    }
+  });
+
+  window.addEventListener("resize", () => {
+    if (!$("hf-detail-modal")?.hidden) updateHFQuantMarquees();
+  });
+
+  // Header Chat button click
+  $("hf-detail-chat-btn")?.addEventListener("click", (e) => {
+    const modelName = e.currentTarget?.dataset?.modelName;
+    if (!modelName) return;
+    closeHFModelDetail();
+    if (typeof showChatViewWithModel === "function") {
+      void showChatViewWithModel(modelName);
+    }
+  });
+
+  // Chat and Install buttons inside Quants table
+  $("hf-quants-tbody")?.addEventListener("click", async (e) => {
+    const chatBtn = e.target.closest(".hf-chat-btn");
+    if (chatBtn) {
+      const modelName = chatBtn.dataset.modelName;
+      if (!modelName) return;
+      closeHFModelDetail();
+      if (typeof showChatViewWithModel === "function") {
+        void showChatViewWithModel(modelName);
+      }
+      return;
+    }
+
+    const btn = e.target.closest(".hf-install-btn");
+    if (!btn) return;
+    const pullName = btn.dataset.pullName;
+    if (!pullName) return;
+
+    btn.disabled = true;
+    const origText = btn.innerHTML;
+    btn.textContent = "…";
+
+    try {
+      if (typeof promptDownloadModel === "function") {
+        await promptDownloadModel(pullName);
+      } else {
+        await api("/api/pull", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: pullName }),
+        });
+        toast(t("downloads.enqueued", { name: pullName }), "success");
+      }
+      btn.textContent = t("hf.queued_badge");
+      btn.className = "badge badge-subtle";
+    } catch (err) {
+      btn.disabled = false;
+      btn.innerHTML = origText;
+      toast(t("toast.error", { msg: err.message }), "error");
+    }
+  });
+}
+
+// Bind when DOM ready
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", bindHFExplorerEvents);
+} else {
+  bindHFExplorerEvents();
+}

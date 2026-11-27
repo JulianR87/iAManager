@@ -1,0 +1,1184 @@
+// Package jobs implements a FIFO download queue for Ollama model pulls.
+//
+// Concurrency is capped at 1 active job: when a job is enqueued the manager
+// starts it immediately if nothing is running, otherwise it waits in the
+// queue. Cancelling a job either removes it from the queue (if queued) or
+// stops the in-flight /api/pull (if running) by cancelling its context.
+//
+// Because Ollama stores downloaded blobs content-addressably, re-enqueuing
+// a cancelled/interrupted job effectively resumes the download: already
+// completed layers are not re-downloaded.
+//
+// Jobs are persisted to a JSON file so queued/finished state survives
+// restarts. On load, any job that was "running" is demoted to "queued" so
+// the worker picks it up again.
+package jobs
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/JulianR87/iAManager/internal/ollama"
+)
+
+// Status is the lifecycle state of a Job.
+type Status string
+
+const (
+	StatusQueued    Status = "queued"
+	StatusRunning   Status = "running"
+	StatusDone      Status = "done"
+	StatusError     Status = "error"
+	StatusCancelled Status = "cancelled"
+	StatusPaused    Status = "paused"
+)
+
+// IsTerminal reports whether s is a final, non-active state.
+func (s Status) IsTerminal() bool {
+	return s == StatusDone || s == StatusError || s == StatusCancelled
+}
+
+// NormalizePullName rewrites known Hugging Face aliases to the canonical
+// registry host that current Ollama versions accept.
+//
+// Background (ollama/ollama#15661): `ollama pull hf.co/org/model:tag` fails
+// with `realm host "huggingface.co" does not match original host "hf.co"`
+// because Ollama follows the manifest realm to huggingface.co and then
+// rejects the mismatch. `huggingface.co/org/model:tag` works, so we
+// canonicalize `hf.co/` → `huggingface.co/` up front. This is not a DNS
+// issue: no local resolver change would fix it.
+func NormalizePullName(name string) string {
+	s := strings.TrimSpace(name)
+	if s == "" {
+		return s
+	}
+	// Strip URL scheme if the user pasted a full URL: Ollama expects
+	// `huggingface.co/org/model:tag`, not `https://...`.
+	lower := strings.ToLower(s)
+	for _, scheme := range []string{"https://", "http://"} {
+		if strings.HasPrefix(lower, scheme) {
+			s = strings.TrimSpace(s[len(scheme):])
+			lower = strings.ToLower(s)
+			break
+		}
+	}
+	// Remove redundant slashes is not needed; just swap the host prefix
+	// case-insensitively while preserving the remainder's original case.
+	if len(s) >= len("hf.co/") && strings.EqualFold(s[:len("hf.co/")], "hf.co/") {
+		return "huggingface.co/" + s[len("hf.co/"):]
+	}
+	return s
+}
+
+// alternateHFHost returns the same model name with the HF registry host
+// swapped (hf.co ↔ huggingface.co). Empty string means no alternate exists.
+func alternateHFHost(name string) string {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if strings.HasPrefix(lower, "hf.co/") {
+		return "huggingface.co/" + strings.TrimSpace(name)[len("hf.co/"):]
+	}
+	if strings.HasPrefix(lower, "huggingface.co/") {
+		return "hf.co/" + strings.TrimSpace(name)[len("huggingface.co/"):]
+	}
+	return ""
+}
+
+// isRealmHostMismatch reports whether err is the Ollama registry error
+// `realm host "..." does not match original host "..."`.
+func isRealmHostMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "realm host") && strings.Contains(msg, "does not match original host")
+}
+
+// samePullName reports whether two job names refer to the same model,
+// treating hf.co ↔ huggingface.co as aliases (case-insensitive).
+func samePullName(a, b string) bool {
+	na := NormalizePullName(a)
+	nb := NormalizePullName(b)
+	if strings.EqualFold(na, nb) {
+		return true
+	}
+	// Old persisted jobs may still carry the hf.co form; match them anyway.
+	if alt := alternateHFHost(na); alt != "" && strings.EqualFold(alt, nb) {
+		return true
+	}
+	if alt := alternateHFHost(nb); alt != "" && strings.EqualFold(alt, na) {
+		return true
+	}
+	return false
+}
+
+// speedSample records an instantaneous speed measurement for rolling-window averaging.
+type speedSample struct {
+	when  time.Time `json:"-"`
+	value float64   `json:"-"`
+}
+
+type HFRecoveryFile struct {
+	Filename string `json:"filename"`
+	Size     int64  `json:"size"`
+	Digest   string `json:"digest"`
+}
+
+type HFRecoverySpec struct {
+	Repo      string           `json:"repo"`
+	Revision  string           `json:"revision"`
+	Files     []HFRecoveryFile `json:"files"`
+	Projector *HFRecoveryFile  `json:"projector,omitempty"`
+}
+
+// Job is a single model download tracked by the manager.
+type Job struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Status     Status    `json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	Completed  int64     `json:"completed"`
+	Total      int64     `json:"total"`
+	Percent    float64   `json:"percent"`
+	Speed      float64   `json:"speed,omitempty"` // bytes per second while running
+	Digest     string    `json:"digest,omitempty"`
+	StatusText string    `json:"status_text,omitempty"`
+	Error      string    `json:"error,omitempty"`
+
+	Recovery      *HFRecoverySpec `json:"recovery,omitempty"`
+	OriginalError string          `json:"original_error,omitempty"`
+
+	// cancel is set while the job is running so Cancel() can abort the
+	// underlying /api/pull stream.
+	cancel context.CancelFunc `json:"-"`
+
+	// pauseIntent is set by Pause() so the runner goroutine knows to
+	// transition to StatusPaused instead of StatusCancelled on context
+	// cancellation.
+	pauseIntent bool `json:"-"`
+
+	// Internal tracking for smoothed instantaneous speed.
+	lastCompleted int64         `json:"-"`
+	lastSpeedAt   time.Time     `json:"-"`
+	lastDigest    string        `json:"-"`
+	speedSamples  []speedSample `json:"-"`
+}
+
+// clone returns a value copy safe to hand out to callers / SSE subscribers.
+func (j *Job) clone() Job {
+	cp := *j
+	cp.cancel = nil
+	cp.speedSamples = nil
+	if j.Recovery != nil {
+		rs := *j.Recovery
+		rs.Files = append([]HFRecoveryFile(nil), j.Recovery.Files...)
+		if j.Recovery.Projector != nil {
+			pr := *j.Recovery.Projector
+			rs.Projector = &pr
+		}
+		cp.Recovery = &rs
+	}
+	return cp
+}
+
+// EventKind identifies the kind of broadcast emitted by the manager.
+type EventKind string
+
+const (
+	EventUpdate EventKind = "update"
+	EventRemove EventKind = "remove"
+)
+
+// Event is what subscribers receive through the channel returned by Subscribe.
+type Event struct {
+	Kind EventKind `json:"kind"`
+	Job  *Job      `json:"job,omitempty"`
+	ID   string    `json:"id,omitempty"`
+}
+
+// persistFile is the disk format for jobs.json.
+type persistFile struct {
+	Jobs        []Job `json:"jobs"`
+	QueuePaused bool  `json:"queue_paused,omitempty"`
+}
+
+// DownloadHistory stores aggregate outcomes for a model name across time,
+// independent from the visible jobs list.
+type DownloadHistory struct {
+	Name        string    `json:"name"`
+	DoneCount   int       `json:"done_count,omitempty"`
+	ErrorCount  int       `json:"error_count,omitempty"`
+	LastDoneAt  time.Time `json:"last_done_at,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+}
+
+type historyPersistFile struct {
+	Models []DownloadHistory `json:"models"`
+}
+
+// Manager coordinates the queue, execution, persistence and fan-out of
+// job events.
+type Manager struct {
+	mu          sync.Mutex
+	jobs        map[string]*Job
+	order       []string // insertion order of job ids
+	activeID    string   // id of the currently running job, or ""
+	queuePaused bool     // when true, new jobs are queued but not started
+	path        string
+	historyPath string
+	history     map[string]*DownloadHistory
+	ollama      *ollama.Client
+	logger      *log.Logger
+
+	recoveryRunner func(ctx context.Context, name string, spec HFRecoverySpec, onProgress func(ollama.PullProgress) error) error
+
+	subsMu  sync.Mutex
+	subs    map[int64]chan Event
+	nextSub int64
+}
+
+// New returns an empty manager. Call Load() to restore state from disk, then
+// Start() to kick off the first queued job (if any).
+func New(path string, historyPath string, client *ollama.Client, logger *log.Logger) *Manager {
+	if logger == nil {
+		logger = log.Default()
+	}
+	return &Manager{
+		jobs:        make(map[string]*Job),
+		path:        path,
+		historyPath: historyPath,
+		history:     make(map[string]*DownloadHistory),
+		ollama:      client,
+		logger:      logger,
+		subs:        make(map[int64]chan Event),
+	}
+}
+
+// Load reads jobs.json, if present. Any job persisted as "running" is
+// demoted to "queued" so the worker picks it up again on the next Start().
+func (m *Manager) Load() error {
+	pf := persistFile{}
+	if m.path != "" {
+		data, err := os.ReadFile(m.path)
+		if errors.Is(err, os.ErrNotExist) {
+			// no jobs file yet
+		} else if err != nil {
+			return fmt.Errorf("read %s: %w", m.path, err)
+		} else if err := json.Unmarshal(data, &pf); err != nil {
+			return fmt.Errorf("parse %s: %w", m.path, err)
+		}
+	}
+
+	hf := historyPersistFile{}
+	if m.historyPath != "" {
+		data, err := os.ReadFile(m.historyPath)
+		if errors.Is(err, os.ErrNotExist) {
+			// no history file yet
+		} else if err != nil {
+			return fmt.Errorf("read %s: %w", m.historyPath, err)
+		} else if err := json.Unmarshal(data, &hf); err != nil {
+			return fmt.Errorf("parse %s: %w", m.historyPath, err)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobs = make(map[string]*Job)
+	m.order = nil
+	m.queuePaused = pf.QueuePaused
+	for i := range pf.Jobs {
+		j := pf.Jobs[i]
+		if j.ID == "" || j.Name == "" {
+			continue
+		}
+		// Migrate old hf.co names to the canonical host (ollama#15661).
+		j.Name = NormalizePullName(j.Name)
+		if j.Status == StatusRunning {
+			j.Status = StatusQueued
+			j.StartedAt = time.Time{}
+			j.Percent = 0
+			j.Completed = 0
+			j.Total = 0
+			j.Speed = 0
+			j.StatusText = ""
+		}
+		jj := j
+		m.jobs[j.ID] = &jj
+		m.order = append(m.order, j.ID)
+	}
+	m.history = make(map[string]*DownloadHistory)
+	for i := range hf.Models {
+		h := hf.Models[i]
+		if h.Name == "" {
+			continue
+		}
+		hh := h
+		m.history[h.Name] = &hh
+	}
+	return nil
+}
+
+// History returns persisted aggregate download history for a model.
+func (m *Manager) History(name string) (DownloadHistory, bool) {
+	if name == "" {
+		return DownloadHistory{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	h, ok := m.history[name]
+	if !ok || h == nil {
+		return DownloadHistory{}, false
+	}
+	cp := *h
+	return cp, true
+}
+
+// AllHistory returns a copy of all persisted download history records.
+func (m *Manager) AllHistory() map[string]DownloadHistory {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]DownloadHistory, len(m.history))
+	for k, v := range m.history {
+		if v != nil {
+			out[k] = *v
+		}
+	}
+	return out
+}
+
+// Start kicks the worker: if there is no active job, it promotes the first
+// queued job (in insertion order) to running.
+func (m *Manager) Start() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tryStartNextLocked()
+}
+
+func (m *Manager) SetRecoveryRunner(fn func(ctx context.Context, name string, spec HFRecoverySpec, onProgress func(ollama.PullProgress) error) error) {
+	m.mu.Lock()
+	m.recoveryRunner = fn
+	m.mu.Unlock()
+}
+
+func (m *Manager) Get(id string) (Job, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.jobs[id]
+	if !ok || j == nil {
+		return Job{}, false
+	}
+	return j.clone(), true
+}
+
+// List returns a snapshot of all jobs in insertion order.
+func (m *Manager) List() []Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Job, 0, len(m.order))
+	for _, id := range m.order {
+		if j, ok := m.jobs[id]; ok {
+			out = append(out, j.clone())
+		}
+	}
+	return out
+}
+
+// Enqueue registers a new job and starts it if the worker is idle. Returns
+// a snapshot of the created job.
+//
+// If a job with the same model name already exists:
+//   - queued or running -> the existing job is returned unchanged (idempotent).
+//   - done / error / cancelled -> the same job slot is reused: its transient
+//     fields are reset and it goes back to queued, moved to the end of the
+//     queue. This avoids piling up duplicate "cancelled" cards every time the
+//     user re-adds (resumes) a model after cancelling.
+func (m *Manager) Enqueue(name string) (Job, error) {
+	name = NormalizePullName(strings.TrimSpace(name))
+	if name == "" {
+		return Job{}, errors.New("model name required")
+	}
+	m.mu.Lock()
+	for _, id := range m.order {
+		j := m.jobs[id]
+		if j == nil || !samePullName(j.Name, name) {
+			continue
+		}
+		// Migrate old hf.co names to the canonical host so retries and
+		// future pulls don't hit the realm mismatch again.
+		j.Name = name
+		switch j.Status {
+		case StatusQueued, StatusRunning, StatusPaused:
+			snap := j.clone()
+			m.mu.Unlock()
+			return snap, nil
+		case StatusDone, StatusError, StatusCancelled:
+			// Reuse this slot: reset and re-queue at the end.
+			if m.queuePaused {
+				j.Status = StatusPaused
+			} else {
+				j.Status = StatusQueued
+			}
+			j.CreatedAt = time.Now().UTC()
+			j.StartedAt = time.Time{}
+			j.FinishedAt = time.Time{}
+			j.Completed = 0
+			j.Total = 0
+			j.Percent = 0
+			j.Speed = 0
+			j.StatusText = ""
+			j.Error = ""
+			j.Digest = ""
+			j.Recovery = nil
+			j.OriginalError = ""
+			j.lastCompleted = 0
+			j.lastDigest = ""
+			j.lastSpeedAt = time.Time{}
+			j.speedSamples = nil
+			m.order = removeString(m.order, id)
+			m.order = append(m.order, id)
+			snap := j.clone()
+			m.tryStartNextLocked()
+			if err := m.saveLocked(); err != nil {
+				m.logger.Printf("jobs: save failed: %v", err)
+			}
+			m.mu.Unlock()
+			m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+			return snap, nil
+		}
+	}
+	id, err := newID()
+	if err != nil {
+		m.mu.Unlock()
+		return Job{}, err
+	}
+	j := &Job{
+		ID:   id,
+		Name: name,
+		Status: func() Status {
+			if m.queuePaused {
+				return StatusPaused
+			}
+			return StatusQueued
+		}(),
+		CreatedAt: time.Now().UTC(),
+	}
+	m.jobs[id] = j
+	m.order = append(m.order, id)
+	snap := j.clone()
+	m.tryStartNextLocked()
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	return snap, nil
+}
+
+func (m *Manager) Recover(id string, spec HFRecoverySpec) (Job, error) {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok || j == nil {
+		m.mu.Unlock()
+		return Job{}, errors.New("job not found")
+	}
+	if j.Status != StatusError {
+		snap := j.clone()
+		m.mu.Unlock()
+		return snap, fmt.Errorf("job is %s", j.Status)
+	}
+	if j.OriginalError == "" {
+		j.OriginalError = j.Error
+	}
+	specCopy := spec
+	specCopy.Files = append([]HFRecoveryFile(nil), spec.Files...)
+	if spec.Projector != nil {
+		pr := *spec.Projector
+		specCopy.Projector = &pr
+	}
+	j.Recovery = &specCopy
+	if m.queuePaused {
+		j.Status = StatusPaused
+	} else {
+		j.Status = StatusQueued
+	}
+	j.CreatedAt = time.Now().UTC()
+	j.StartedAt = time.Time{}
+	j.FinishedAt = time.Time{}
+	j.Completed = 0
+	j.Total = 0
+	j.Percent = 0
+	j.Speed = 0
+	j.StatusText = ""
+	j.Error = ""
+	j.Digest = ""
+	j.lastCompleted = 0
+	j.lastDigest = ""
+	j.lastSpeedAt = time.Time{}
+	j.speedSamples = nil
+	m.order = removeString(m.order, id)
+	m.order = append(m.order, id)
+	snap := j.clone()
+	m.tryStartNextLocked()
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	return snap, nil
+}
+
+// Cancel aborts a running job or removes a queued one from the queue. The
+// job is not deleted from history: it keeps the "cancelled" state so the UI
+// can show it (and the user can choose to remove it).
+func (m *Manager) Cancel(id string) error {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return errors.New("job not found")
+	}
+	switch j.Status {
+	case StatusQueued, StatusPaused:
+		j.Status = StatusCancelled
+		j.FinishedAt = time.Now().UTC()
+		j.pauseIntent = false
+		snap := j.clone()
+		if err := m.saveLocked(); err != nil {
+			m.logger.Printf("jobs: save failed: %v", err)
+		}
+		m.mu.Unlock()
+		m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+		return nil
+	case StatusRunning:
+		if j.cancel != nil {
+			j.cancel()
+		}
+		// The runner goroutine will set the terminal state and broadcast.
+		m.mu.Unlock()
+		return nil
+	default:
+		m.mu.Unlock()
+		return fmt.Errorf("job already %s", j.Status)
+	}
+}
+
+// Pause stops a queued job from starting or cancels a running job so the
+// runner transitions it to StatusPaused.
+func (m *Manager) Pause(id string) error {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return errors.New("job not found")
+	}
+	switch j.Status {
+	case StatusQueued:
+		j.Status = StatusPaused
+		snap := j.clone()
+		if err := m.saveLocked(); err != nil {
+			m.logger.Printf("jobs: save failed: %v", err)
+		}
+		m.mu.Unlock()
+		m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+		return nil
+	case StatusRunning:
+		j.pauseIntent = true
+		if j.cancel != nil {
+			j.cancel()
+		}
+		// The runner goroutine will transition to paused and broadcast.
+		m.mu.Unlock()
+		return nil
+	default:
+		m.mu.Unlock()
+		return fmt.Errorf("job already %s", j.Status)
+	}
+}
+
+// Resume puts a paused job back into the queue and tries to start it.
+// Resumed jobs are always placed at the end of the queue.
+func (m *Manager) Resume(id string) error {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return errors.New("job not found")
+	}
+	if j.Status != StatusPaused {
+		m.mu.Unlock()
+		return fmt.Errorf("job is %s", j.Status)
+	}
+	j.Status = StatusQueued
+	j.pauseIntent = false
+	m.queuePaused = false
+	// Move resumed job to the end of the queue ordering
+	m.order = removeString(m.order, id)
+	m.order = append(m.order, id)
+	snap := j.clone()
+	m.tryStartNextLocked()
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	return nil
+}
+
+// Promote moves a queued (or paused) job to the front of the download queue
+// so it starts first when the current job finishes. Paused jobs are resumed
+// to queued as part of the promotion. Returns an error if the job is running
+// or already terminal.
+func (m *Manager) Promote(id string) error {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return errors.New("job not found")
+	}
+	switch j.Status {
+	case StatusQueued, StatusPaused:
+		// no-op
+	case StatusRunning:
+		m.mu.Unlock()
+		return fmt.Errorf("job is %s", j.Status)
+	default:
+		m.mu.Unlock()
+		return fmt.Errorf("job is %s", j.Status)
+	}
+	// Un-pause so the promoted job is eligible to start.
+	j.Status = StatusQueued
+	j.pauseIntent = false
+	// Move this job to the front of the ordering, preserving the relative
+	// order of every other queued job.
+	m.order = removeString(m.order, id)
+	m.order = append([]string{id}, m.order...)
+	snap := j.clone()
+	// If nothing is running, starting the promoted job immediately is the
+	// expected "move to front" behaviour.
+	m.tryStartNextLocked()
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	return nil
+}
+
+// PauseQueue prevents new jobs from starting until ResumeQueue is called.
+// A currently running job is allowed to finish. All queued jobs are moved
+// to the paused state so they appear in the paused section.
+func (m *Manager) PauseQueue() {
+	m.mu.Lock()
+	m.queuePaused = true
+	var snaps []Job
+	for _, j := range m.jobs {
+		if j.Status == StatusQueued {
+			j.Status = StatusPaused
+			snaps = append(snaps, j.clone())
+		}
+	}
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	for _, snap := range snaps {
+		m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	}
+}
+
+// ResumeQueue allows queued jobs to start again. All paused jobs are
+// moved back to the queued state and placed at the end of the queue.
+func (m *Manager) ResumeQueue() {
+	m.mu.Lock()
+	m.queuePaused = false
+	var snaps []Job
+	var pausedIDs []string
+	for _, id := range m.order {
+		if j := m.jobs[id]; j != nil && j.Status == StatusPaused {
+			pausedIDs = append(pausedIDs, id)
+		}
+	}
+	for _, id := range pausedIDs {
+		if j := m.jobs[id]; j != nil {
+			j.Status = StatusQueued
+			j.pauseIntent = false
+			m.order = removeString(m.order, id)
+			m.order = append(m.order, id)
+			snaps = append(snaps, j.clone())
+		}
+	}
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.tryStartNextLocked()
+	m.mu.Unlock()
+	for _, snap := range snaps {
+		m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+	}
+}
+
+// IsQueuePaused reports whether the queue is currently paused.
+func (m *Manager) IsQueuePaused() bool {
+	m.mu.Lock()
+	v := m.queuePaused
+	m.mu.Unlock()
+	return v
+}
+
+// Remove deletes a job from history. Only terminal jobs can be removed.
+func (m *Manager) Remove(id string) error {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return errors.New("job not found")
+	}
+	if !j.Status.IsTerminal() {
+		m.mu.Unlock()
+		return fmt.Errorf("cannot remove job in state %s", j.Status)
+	}
+	status := j.Status
+	name := j.Name
+	delete(m.jobs, id)
+	m.order = removeString(m.order, id)
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+
+	// Only on manual remove of failed/cancelled jobs, attempt Ollama cleanup.
+	// Ignore cleanup errors so removing from history always succeeds.
+	if (status == StatusError || status == StatusCancelled) && name != "" && m.ollama != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := m.ollama.Delete(ctx, name)
+		cancel()
+		if err != nil {
+			m.logger.Printf("jobs: cleanup failed for %q: %v", name, err)
+		}
+	}
+
+	m.broadcast(Event{Kind: EventRemove, ID: id})
+	return nil
+}
+
+// ClearFinished removes all terminal jobs and returns the number removed.
+func (m *Manager) ClearFinished() int {
+	m.mu.Lock()
+	removed := make([]string, 0)
+	kept := make([]string, 0, len(m.order))
+	for _, id := range m.order {
+		j := m.jobs[id]
+		if j == nil {
+			continue
+		}
+		if j.Status.IsTerminal() {
+			delete(m.jobs, id)
+			removed = append(removed, id)
+		} else {
+			kept = append(kept, id)
+		}
+	}
+	m.order = kept
+	if len(removed) > 0 {
+		if err := m.saveLocked(); err != nil {
+			m.logger.Printf("jobs: save failed: %v", err)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range removed {
+		m.broadcast(Event{Kind: EventRemove, ID: id})
+	}
+	return len(removed)
+}
+
+// Subscribe returns a channel that receives every update/remove event. The
+// returned cancel function closes the channel and removes the subscription.
+// The channel is buffered and slow consumers may miss intermediate events;
+// clients are expected to re-hydrate via List() when reconnecting.
+func (m *Manager) Subscribe() (<-chan Event, func()) {
+	m.subsMu.Lock()
+	id := atomic.AddInt64(&m.nextSub, 1)
+	ch := make(chan Event, 64)
+	m.subs[id] = ch
+	m.subsMu.Unlock()
+	cancel := func() {
+		m.subsMu.Lock()
+		if sub, ok := m.subs[id]; ok {
+			delete(m.subs, id)
+			close(sub)
+		}
+		m.subsMu.Unlock()
+	}
+	return ch, cancel
+}
+
+// broadcast fans out an event to every live subscriber, dropping events for
+// subscribers whose buffer is full (to protect the runner from blocking).
+func (m *Manager) broadcast(ev Event) {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for id, ch := range m.subs {
+		select {
+		case ch <- ev:
+		default:
+			m.logger.Printf("jobs: subscriber %d is slow, dropping event", id)
+		}
+	}
+}
+
+// tryStartNextLocked must be called with m.mu held. If no job is currently
+// running it promotes the first queued job and launches the runner.
+func (m *Manager) tryStartNextLocked() {
+	if m.activeID != "" || m.queuePaused {
+		return
+	}
+	for _, id := range m.order {
+		j := m.jobs[id]
+		if j == nil {
+			continue
+		}
+		if j.Status == StatusQueued {
+			ctx, cancel := context.WithCancel(context.Background())
+			j.Status = StatusRunning
+			j.StartedAt = time.Now().UTC()
+			j.cancel = cancel
+			m.activeID = id
+			go m.run(ctx, id)
+			return
+		}
+	}
+}
+
+// run executes one job in its own goroutine. It streams progress events
+// from Ollama, updates the Job in place (under lock), and broadcasts a
+// throttled update. On exit it marks the terminal state, persists, and
+// starts the next queued job if any.
+func (m *Manager) run(ctx context.Context, id string) {
+	// Snapshot for broadcasting that the job just went running.
+	m.mu.Lock()
+	startJob := m.jobs[id]
+	if startJob == nil {
+		m.activeID = ""
+		m.mu.Unlock()
+		return
+	}
+	// Migrate persisted hf.co names to the canonical host before pulling.
+	name := NormalizePullName(startJob.Name)
+	startJob.Name = name
+	snap := startJob.clone()
+	recoverySpec := snap.Recovery
+	// Persist the queued->running transition.
+	if err := m.saveLocked(); err != nil {
+		m.logger.Printf("jobs: save failed: %v", err)
+	}
+	m.mu.Unlock()
+	m.broadcast(Event{Kind: EventUpdate, Job: &snap})
+
+	var lastEmit time.Time
+	const emitEvery = 250 * time.Millisecond
+
+	onProgress := func(ev ollama.PullProgress) error {
+		m.mu.Lock()
+		j := m.jobs[id]
+		if j == nil {
+			m.mu.Unlock()
+			return errors.New("job gone")
+		}
+		j.StatusText = ev.Status
+		if ev.Digest != "" {
+			j.Digest = ev.Digest
+		}
+		if ev.Total > 0 {
+			j.Total = ev.Total
+			j.Completed = ev.Completed
+			pct := float64(ev.Completed) / float64(ev.Total) * 100
+			if pct > 100 {
+				pct = 100
+			}
+			j.Percent = pct
+
+			now := time.Now()
+			if ev.Digest != j.lastDigest || ev.Completed < j.lastCompleted {
+				// New layer or progress reset — restart speed tracking.
+				j.lastDigest = ev.Digest
+				j.lastCompleted = ev.Completed
+				j.lastSpeedAt = now
+				j.speedSamples = nil
+				j.Speed = 0
+			} else if ev.Completed > j.lastCompleted && !j.lastSpeedAt.IsZero() {
+				deltaBytes := ev.Completed - j.lastCompleted
+				deltaSec := now.Sub(j.lastSpeedAt).Seconds()
+				if deltaSec > 0.1 {
+					instant := float64(deltaBytes) / deltaSec
+					j.speedSamples = append(j.speedSamples, speedSample{when: now, value: instant})
+					// Drop samples older than 60 seconds.
+					cutoff := now.Add(-60 * time.Second)
+					start := 0
+					for start < len(j.speedSamples) && j.speedSamples[start].when.Before(cutoff) {
+						start++
+					}
+					if start > 0 {
+						j.speedSamples = j.speedSamples[start:]
+					}
+					// Compute average over retained window.
+					if len(j.speedSamples) > 0 {
+						var sum float64
+						for _, s := range j.speedSamples {
+							sum += s.value
+						}
+						j.Speed = sum / float64(len(j.speedSamples))
+					}
+					j.lastCompleted = ev.Completed
+					j.lastSpeedAt = now
+				}
+			}
+		}
+		// Throttle broadcasts to avoid overwhelming SSE subscribers.
+		if time.Since(lastEmit) < emitEvery {
+			m.mu.Unlock()
+			return nil
+		}
+		lastEmit = time.Now()
+		cp := j.clone()
+		m.mu.Unlock()
+		m.broadcast(Event{Kind: EventUpdate, Job: &cp})
+		return nil
+	}
+
+	doPull := func(pullName string) error {
+		return m.ollama.Pull(ctx, pullName, onProgress)
+	}
+
+	var err error
+	if recoverySpec != nil {
+		m.mu.Lock()
+		runner := m.recoveryRunner
+		m.mu.Unlock()
+		if runner == nil {
+			err = errors.New("HF recovery runner is not configured")
+		} else {
+			err = runner(ctx, name, *recoverySpec, onProgress)
+		}
+	} else {
+		err = doPull(name)
+	}
+	// Auto-fix for ollama/ollama#15661: if Ollama rejects hf.co with a
+	// realm host mismatch, retry once with the alternate HF host.
+	if recoverySpec == nil && isRealmHostMismatch(err) && ctx.Err() == nil {
+		if alt := alternateHFHost(name); alt != "" && !strings.EqualFold(alt, name) {
+			m.logger.Printf("jobs: realm host mismatch for %q, retrying as %q", name, alt)
+			m.mu.Lock()
+			if j := m.jobs[id]; j != nil {
+				j.Name = alt
+				j.StatusText = "retrying with " + alt
+			}
+			m.mu.Unlock()
+			lastEmit = time.Time{}
+			if retryErr := doPull(alt); retryErr == nil {
+				name = alt
+				err = nil
+			} else if !isRealmHostMismatch(retryErr) || ctx.Err() != nil {
+				// Retry gave a different (real) result: keep it.
+				name = alt
+				err = retryErr
+				m.mu.Lock()
+				if j := m.jobs[id]; j != nil {
+					j.Name = alt
+				}
+				m.mu.Unlock()
+			} else {
+				// Both hosts failed with mismatch: restore original name,
+				// keep the first error.
+				m.mu.Lock()
+				if j := m.jobs[id]; j != nil {
+					j.Name = name
+				}
+				m.mu.Unlock()
+			}
+		}
+	}
+
+	// Finalize state.
+	m.mu.Lock()
+	j := m.jobs[id]
+	if j != nil {
+		j.cancel = nil
+		j.FinishedAt = time.Now().UTC()
+		switch {
+		case err == nil:
+			j.Status = StatusDone
+			j.Percent = 100
+			j.Speed = 0
+			j.speedSamples = nil
+			j.StatusText = "success"
+			j.Error = ""
+		case errors.Is(err, context.Canceled) || ctx.Err() != nil:
+			if j.pauseIntent {
+				j.Status = StatusPaused
+			} else {
+				j.Status = StatusCancelled
+			}
+			j.pauseIntent = false
+			j.Speed = 0
+			j.speedSamples = nil
+			j.Error = ""
+		default:
+			j.Status = StatusError
+			j.Speed = 0
+			j.speedSamples = nil
+			j.Error = err.Error()
+			if j.Recovery != nil && j.OriginalError != "" {
+				j.Error = "HF recovery: " + boundErrText(err.Error()) +
+					"; original pull: " + boundErrText(j.OriginalError)
+			}
+		}
+		m.recordHistoryLocked(j.Name, j.Status, j.Error, j.FinishedAt)
+	}
+	m.activeID = ""
+	var finalSnap Job
+	if j != nil {
+		finalSnap = j.clone()
+	}
+	if saveErr := m.saveLocked(); saveErr != nil {
+		m.logger.Printf("jobs: save failed: %v", saveErr)
+	}
+	m.tryStartNextLocked()
+	m.mu.Unlock()
+	if j != nil {
+		m.broadcast(Event{Kind: EventUpdate, Job: &finalSnap})
+	}
+}
+
+// saveLocked persists the current jobs list to disk. Must be called with
+// m.mu held.
+func (m *Manager) saveLocked() error {
+	if m.path == "" {
+		return nil
+	}
+	pf := persistFile{Jobs: make([]Job, 0, len(m.order)), QueuePaused: m.queuePaused}
+	for _, id := range m.order {
+		if j, ok := m.jobs[id]; ok {
+			pf.Jobs = append(pf.Jobs, j.clone())
+		}
+	}
+	// Stable order is the insertion order (m.order). Keep it.
+	data, err := json.MarshalIndent(pf, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmp := m.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, m.path)
+}
+
+func (m *Manager) recordHistoryLocked(name string, status Status, errMsg string, when time.Time) {
+	if name == "" || (status != StatusDone && status != StatusError) {
+		return
+	}
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	h := m.history[name]
+	if h == nil {
+		h = &DownloadHistory{Name: name}
+		m.history[name] = h
+	}
+	switch status {
+	case StatusDone:
+		h.DoneCount++
+		h.LastDoneAt = when
+	case StatusError:
+		h.ErrorCount++
+		h.LastErrorAt = when
+		h.LastError = errMsg
+	}
+	if err := m.saveHistoryLocked(); err != nil {
+		m.logger.Printf("jobs: history save failed: %v", err)
+	}
+}
+
+func (m *Manager) saveHistoryLocked() error {
+	if m.historyPath == "" {
+		return nil
+	}
+	pf := historyPersistFile{Models: make([]DownloadHistory, 0, len(m.history))}
+	for _, h := range m.history {
+		if h == nil || h.Name == "" {
+			continue
+		}
+		pf.Models = append(pf.Models, *h)
+	}
+	data, err := json.MarshalIndent(pf, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmp := m.historyPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, m.historyPath)
+}
+
+// Shutdown cancels the active job (if any) without changing state on disk
+// beyond what the runner persists. Useful for tests.
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	// Prevent the runner from auto-starting a queued job once the active one
+	// finalizes. This is what lets tests tear down cleanly and matches the
+	// intent that a shut-down manager should not begin new downloads.
+	m.queuePaused = true
+	if m.activeID != "" {
+		if j := m.jobs[m.activeID]; j != nil && j.cancel != nil {
+			j.cancel()
+		}
+	}
+	m.mu.Unlock()
+}
+
+func boundErrText(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, s)
+	const max = 400
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	return strings.TrimSpace(s)
+}
+
+// newID returns a short random hex id.
+func newID() (string, error) {
+	buf := make([]byte, 10)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func removeString(s []string, v string) []string {
+	for i, x := range s {
+		if x == v {
+			return append(s[:i], s[i+1:]...)
+		}
+	}
+	return s
+}

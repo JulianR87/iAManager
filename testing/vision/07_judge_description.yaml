@@ -1,0 +1,27 @@
+id: vis-judge-description
+name: 'Vision 07 · Judge Description'
+description: 'Evaluates if a candidate description accurately matches the library image.'
+group_id: vision
+active: true
+order: 6
+required_caps:
+  - vision
+
+cases:
+  - name: 'Judge library description'
+    steps:
+      - name: 'Evaluate description'
+        system_prompt: |
+          You are an impartial judge. Evaluate ONLY what is asked.
+          Reply in this exact format and nothing else:
+          Verdict: CORRECT  (or INCORRECT)
+          Reason: <one sentence>
+        prompt: |
+          Candidate description: "A municipal library building with large glass windows, a central entrance, and trees in front."
+          Does this description match the image without inventing or omitting objects?
+        attachment: 07_judge_description-1.jpg
+        options:
+          temperature: 0.2
+        evaluation:
+          type: regex
+          pattern: '(?i)verdict:\s*correct'

@@ -1,0 +1,520 @@
+"use strict";
+
+const t = (k, v) => window.I18n.t(k, v);
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+const fmtBytes = (n) => {
+  if (!n || n <= 0) return "—";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i > 0 ? 2 : 1)} ${u[i]}`;
+};
+const formatBytes = fmtBytes;
+const estimateTokens = (text) => {
+  if (!text || !text.trim()) return 0;
+  const matches = text.match(/[\w]+|[^\s\w]+/gu);
+  if (!matches) return 0;
+  let tokens = 0;
+  for (let i = 0; i < matches.length; i++) {
+    const len = matches[i].length;
+    tokens += Math.max(1, Math.ceil(len / 3.8));
+  }
+  return tokens;
+};
+window.estimateTokens = estimateTokens;
+const fmtTokens = (count) => {
+  const n = typeof count === "number" ? count : estimateTokens(count);
+  if (!n || n <= 0) return "0 tok";
+  return `~${n.toLocaleString()} tok`;
+};
+window.fmtTokens = fmtTokens;
+const fmtDate = (s) => {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return "—";
+  const now = new Date();
+  const diffDays = Math.floor((now - d) / 86400000);
+  const lang = window.I18n?.getLang?.() || "en";
+  const locale = lang === "es" ? "es-AR" : "en-US";
+  if (diffDays < 1) return d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
+  if (diffDays < 7) return getRelativeTimeFormatter().format(-diffDays, "day");
+  return d.toLocaleDateString(locale);
+};
+const fmtColdLoad = (ms) => {
+  if (!ms || ms <= 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+};
+// Embedding and decision (System One) models are not chat generators, so they
+// cannot be benchmarked. Accepts a capability Set (modelCaps) or an array.
+const capsCannotBench = (caps) => {
+  const arr = caps instanceof Set ? [...caps] : (Array.isArray(caps) ? caps : []);
+  return arr.some((c) => {
+    const k = String(c).toLowerCase();
+    return k === "embedding" || k === "decision";
+  });
+};
+const getToksRecordColor = (tps, minT, maxT) => {
+  if (!tps || tps <= 0) return "";
+  let min = typeof minT === "number" && isFinite(minT) ? minT : 10;
+  let max = typeof maxT === "number" && isFinite(maxT) ? maxT : 60;
+  if (typeof models !== "undefined" && Array.isArray(models) && (minT === undefined || maxT === undefined)) {
+    let globalMin = Infinity, globalMax = -Infinity;
+    for (const m of models) {
+      const v = Number(m?.record_tokens_per_sec) || 0;
+      if (v > 0) {
+        if (v < globalMin) globalMin = v;
+        if (v > globalMax) globalMax = v;
+      }
+    }
+    if (isFinite(globalMin) && isFinite(globalMax) && globalMax > globalMin) {
+      min = globalMin;
+      max = globalMax;
+    }
+  }
+  let ratio = 1.0;
+  if (max > min) {
+    ratio = Math.max(0, Math.min(1, (tps - min) / (max - min)));
+  }
+  const hue = Math.round(ratio * 120);
+  return `hsl(${hue}, 85%, 62%)`;
+};
+const RELATIVE_UNITS = [
+  { unit: "year", ms: 365 * 24 * 60 * 60 * 1000 },
+  { unit: "month", ms: 30 * 24 * 60 * 60 * 1000 },
+  { unit: "day", ms: 24 * 60 * 60 * 1000 },
+  { unit: "hour", ms: 60 * 60 * 1000 },
+  { unit: "minute", ms: 60 * 1000 },
+  { unit: "second", ms: 1000 },
+];
+const _rtfCache = new Map();
+function getRelativeTimeFormatter() {
+  const lang = window.I18n?.getLang?.() || "en";
+  const locale = lang === "es" ? "es-AR" : "en-US";
+  const key = `${locale}:auto`;
+  if (_rtfCache.has(key)) return _rtfCache.get(key);
+  const fmt = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+  _rtfCache.set(key, fmt);
+  return fmt;
+}
+function fmtRelativeTime(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return "—";
+  const diff = d.getTime() - Date.now();
+  const abs = Math.abs(diff);
+  const rtf = getRelativeTimeFormatter();
+  if (abs < 1000) return rtf.format(0, "second");
+  for (const u of RELATIVE_UNITS) {
+    if (abs >= u.ms || u.unit === "second") {
+      const value = Math.round(diff / u.ms);
+      return rtf.format(value, u.unit);
+    }
+  }
+  return "—";
+}
+function fmtDateTimeFull(s) {
+  if (!s) return "—";
+  const d = new Date(s);
+  if (isNaN(d)) return "—";
+  const lang = window.I18n?.getLang?.() || "en";
+  const locale = lang === "es" ? "es-AR" : "en-US";
+  return d.toLocaleString(locale, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+function fmtDuration(ms) {
+  if (ms == null || ms === undefined || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const s = (ms / 1000).toFixed(2);
+  const lang = window.I18n?.getLang?.() || "en";
+  return lang === "es" ? `${s.replace(".", ",")}s` : `${s}s`;
+}
+const fmtCtx = (n) => {
+  if (!n) return "—";
+  if (n >= 1024) return `${(n / 1024).toFixed(0)}K`;
+  return String(n);
+};
+
+function formatMetaElapsedSecondsTitle(ms) {
+  const n = Math.max(0, Number(ms) || 0);
+  if (n < 1000) {
+    return `${Math.round(n)}ms`;
+  }
+  const sec = n / 1000;
+  if (sec < 10) {
+    return `${sec.toFixed(1)}s`;
+  }
+  return `${Math.floor(sec)}s`;
+}
+
+function formatMetaElapsed(ms) {
+  const n = Math.max(0, Number(ms) || 0);
+  if (n < 1000) {
+    return t("chat.meta_time_ms", { ms: Math.round(n) });
+  }
+  const sec = n / 1000;
+  if (sec < 10) {
+    return t("chat.meta_time_s_dec", { s: sec.toFixed(1) });
+  }
+  if (sec < 60) {
+    return t("chat.meta_time", { s: Math.floor(sec) });
+  }
+  const totalSec = Math.floor(sec);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  const mins = Math.floor((totalSec % 3600) / 60);
+  const secs = totalSec % 60;
+
+  if (days > 0) {
+    return `${days}d${hours}h${mins}m${secs}s`;
+  }
+  if (hours > 0) {
+    return `${hours}h${mins}m${secs}s`;
+  }
+  return `${mins}m${secs}s`;
+}
+function fmtETA(totalSeconds) {
+  if (!isFinite(totalSeconds) || totalSeconds <= 0) return "";
+  const secs = Math.ceil(totalSeconds);
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  const s = secs % 60;
+  if (mins < 60) return `${mins}m ${s}s`;
+  const hrs = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${hrs}h ${m}m`;
+}
+function fmtSpeed(bps) {
+  if (!bps || bps <= 0) return "";
+  const u = ["B/s", "KB/s", "MB/s", "GB/s"];
+  let i = 0;
+  let n = bps;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(n < 10 && i > 0 ? 2 : 1)} ${u[i]}`;
+}
+const escapeHtml = (s) => String(s ?? "")
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+function externalProviderLabel(value, lang = null) {
+  const v = String(value || "").trim();
+  if (!v || v.toLowerCase() === "system") {
+    const fallback = (window.I18n && typeof window.I18n.t === "function")
+      ? window.I18n.t("models.external_badge", null, lang)
+      : "EXT";
+    return fallback || "EXT";
+  }
+  if (v.toLowerCase() === "omlx") return "oMLX";
+  return v;
+}
+window.externalProviderLabel = externalProviderLabel;
+
+function externalCleanEndpoint(raw) {
+  let u = String(raw || "").trim();
+  if (!u) return "";
+  try {
+    const parsed = new URL(u);
+    parsed.username = "";
+    parsed.password = "";
+    u = parsed.toString();
+  } catch { }
+  u = u.replace(/\/+$/g, "");
+  u = u.replace(/\/chat\/completions$/i, "").replace(/\/v1$/i, "").replace(/\/+$/g, "");
+  return u;
+}
+window.externalCleanEndpoint = externalCleanEndpoint;
+
+function attachmentImageSrc(a) {
+  if (!a || a.kind !== "image" || !a.data) return "";
+  const mime = (a.mime && String(a.mime).trim()) || "image/jpeg";
+  return `data:${mime};base64,${a.data}`;
+}
+
+function attachmentAudioSrc(a) {
+  if (!a || a.kind !== "audio" || !a.data) return "";
+  const mime = (a.mime && String(a.mime).trim()) || "audio/webm";
+  return `data:${mime};base64,${a.data}`;
+}
+
+function attachmentTextPreview(a, max = 140) {
+  const txt = String(a?.text || "").replace(/\s+/g, " ").trim();
+  if (!txt) return "";
+  if (txt.length <= max) return txt;
+  return `${txt.slice(0, max - 1)}…`;
+}
+
+const TEXT_ATTACHMENT_EXTS = new Set([
+  "txt", "text", "md", "markdown", "mdx", "rst", "adoc", "org", "tex", "log",
+  "json", "jsonc", "json5", "geojson", "yaml", "yml", "toml", "ini", "cfg", "conf", "config",
+  "env", "properties", "csv", "tsv", "xml", "xsd", "xsl", "svg",
+  "html", "htm", "xhtml", "vue", "svelte", "astro",
+  "css", "scss", "sass", "less", "styl",
+  "js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts",
+  "go", "py", "pyi", "rb", "rs", "c", "h", "cc", "cpp", "cxx", "hpp", "hh", "hxx",
+  "java", "kt", "kts", "scala", "cs", "fs", "php", "swift", "m", "mm", "dart",
+  "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
+  "sql", "graphql", "gql", "proto", "prisma",
+  "pl", "pm", "lua", "r", "jl", "ex", "exs", "erl", "hrl", "hs", "lhs", "clj", "cljs", "cljc", "edn", "elm", "nim", "zig", "v", "sol", "asm", "s",
+  "tf", "tfvars", "hcl", "nix", "dockerfile", "makefile", "mk", "cmake", "gradle", "bazel",
+  "diff", "patch", "srt", "vtt", "gitignore", "gitattributes", "editorconfig", "lock",
+]);
+
+const TEXT_ATTACHMENT_MIMES = new Set([
+  "application/json", "application/ld+json", "application/x-json",
+  "application/javascript", "application/x-javascript", "application/ecmascript",
+  "application/xml", "application/xhtml+xml",
+  "application/x-yaml", "application/yaml", "application/toml", "application/x-toml",
+  "application/x-sh", "application/x-shellscript",
+  "application/sql", "application/graphql", "application/x-httpd-php",
+  "application/x-python", "application/x-ruby", "application/x-perl",
+]);
+
+const TEXT_ATTACHMENT_BASENAMES = new Set([
+  "dockerfile", "makefile", "cmakelists.txt", "procfile", "readme", "license",
+  "licence", "changelog", "authors", "contributing", ".gitignore", ".gitattributes",
+  ".editorconfig", ".env", ".env.example", ".npmrc", ".babelrc", ".eslintrc",
+]);
+
+const TEXT_ATTACHMENT_ACCEPT = ".txt,.text,.md,.markdown,.mdx,.rst,.adoc,.org,.tex,.log,.json,.jsonc,.json5,.yaml,.yml,.toml,.ini,.cfg,.conf,.env,.properties,.csv,.tsv,.xml,.svg,.html,.htm,.css,.scss,.sass,.less,.js,.mjs,.cjs,.jsx,.ts,.tsx,.go,.py,.rb,.rs,.c,.h,.cpp,.hpp,.java,.kt,.cs,.php,.swift,.sh,.bash,.zsh,.ps1,.bat,.cmd,.sql,.graphql,.proto,.pl,.lua,.r,.dart,.ex,.erl,.hs,.clj,.elm,.tf,.nix,text/*";
+const CHAT_ATTACHMENT_ACCEPT = `image/*,audio/*,${TEXT_ATTACHMENT_ACCEPT}`;
+
+function attachmentExtension(name) {
+  const base = String(name || "").toLowerCase().split(/[\\/]/).pop() || "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1) : "";
+}
+
+function attachmentBasename(name) {
+  return String(name || "").toLowerCase().split(/[\\/]/).pop() || "";
+}
+
+function isTextAttachmentFile(file) {
+  const name = String(file?.name || "").toLowerCase();
+  const type = String(file?.type || "").toLowerCase();
+  const ext = attachmentExtension(name);
+  const base = attachmentBasename(name);
+  if (TEXT_ATTACHMENT_EXTS.has(ext) || TEXT_ATTACHMENT_BASENAMES.has(base)) return true;
+  if (type.startsWith("text/") || TEXT_ATTACHMENT_MIMES.has(type)) return true;
+  return false;
+}
+
+function openImagePreview(src, name) {
+  const modal = $("image-preview-modal");
+  const img = $("image-preview-img");
+  const cap = $("image-preview-caption");
+  if (!modal || !img) return;
+  img.src = src;
+  img.alt = name || "";
+  if (cap) {
+    cap.textContent = name || "";
+    cap.hidden = !String(name || "").trim();
+  }
+  modal.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeImagePreview() {
+  const modal = $("image-preview-modal");
+  const img = $("image-preview-img");
+  if (!modal) return;
+  modal.hidden = true;
+  if (img) {
+    img.removeAttribute("src");
+    img.alt = "";
+  }
+  document.body.style.overflow = "";
+}
+
+function openTextPreview(text, name) {
+  const modal = $("text-preview-modal");
+  const pre = $("text-preview-content");
+  const cap = $("text-preview-caption");
+  if (!modal || !pre) return;
+  pre.textContent = String(text || "");
+  if (cap) {
+    cap.textContent = name || "";
+    cap.hidden = !String(name || "").trim();
+  }
+  modal.hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function closeTextPreview() {
+  const modal = $("text-preview-modal");
+  const pre = $("text-preview-content");
+  if (!modal) return;
+  modal.hidden = true;
+  if (pre) pre.textContent = "";
+  document.body.style.overflow = "";
+}
+
+function toast(msg, kind = "") {
+  const div = document.createElement("div");
+  div.className = "toast-item " + kind;
+  div.textContent = msg;
+  $("toast").appendChild(div);
+  setTimeout(() => { div.style.opacity = "0"; div.style.transition = "opacity .3s"; }, 3500);
+  setTimeout(() => div.remove(), 4000);
+}
+
+function speechLangFromUi() {
+  const lang = window.I18n?.getLang?.() || "en";
+  return lang === "es" ? "es-ES" : "en-US";
+}
+
+function findBestVoice(langTag) {
+  if (!window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices() || [];
+  if (!voices.length) return null;
+  const want = String(langTag || "").toLowerCase();
+  const exact = voices.find((v) => String(v.lang || "").toLowerCase() === want);
+  if (exact) return exact;
+  const prefix = want.split("-")[0];
+  const byPrefix = voices.find((v) => String(v.lang || "").toLowerCase().startsWith(prefix));
+  return byPrefix || voices[0] || null;
+}
+
+function textForSpeech(raw) {
+  let s = String(raw || "");
+  s = s.replace(/```[\s\S]*?```/g, " ");
+  s = s.replace(/`([^`]+)`/g, "$1");
+  s = s.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1");
+  s = s.replace(/[#*_>~-]+/g, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
+const marqueeRafIds = typeof WeakMap !== "undefined" ? new WeakMap() : null;
+
+function updateMarquee(trackEl, textEl) {
+  if (!trackEl || !textEl) return;
+
+  if (marqueeRafIds && typeof cancelAnimationFrame === "function") {
+    const pendingId = marqueeRafIds.get(textEl);
+    if (pendingId !== undefined) {
+      cancelAnimationFrame(pendingId);
+      marqueeRafIds.delete(textEl);
+    }
+  }
+
+  const schedule = typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame
+    : (cb) => cb();
+
+  let finished = false;
+  const rafId = schedule(() => {
+    finished = true;
+    if (marqueeRafIds) marqueeRafIds.delete(textEl);
+    if (!trackEl || !textEl || trackEl.isConnected === false || textEl.isConnected === false) return;
+
+    const trackWidth = trackEl.clientWidth;
+    if (trackWidth <= 0) return;
+
+    const textWidth = textEl.scrollWidth;
+    const overflow = textWidth - trackWidth;
+    const textSig = textEl.textContent || "";
+
+    if (overflow > 2) {
+      const dist = Math.ceil(overflow) + 8;
+      const duration = Math.max(4, Math.min(16, dist / 20));
+      const distVal = `-${dist}px`;
+      const durVal = `${Number(duration.toFixed(2))}s`;
+      const prevDist = textEl.style.getPropertyValue("--marquee-dist");
+      const prevDur = textEl.style.getPropertyValue("--marquee-dur");
+      const prevText = textEl.dataset ? textEl.dataset.marqueeText : undefined;
+      const isBouncing = textEl.classList.contains("is-bouncing");
+
+      if (isBouncing && prevDist === distVal && prevDur === durVal && prevText === textSig) {
+        return;
+      }
+
+      textEl.style.setProperty("--marquee-dist", distVal);
+      textEl.style.setProperty("--marquee-dur", durVal);
+      if (textEl.dataset) textEl.dataset.marqueeText = textSig;
+
+      if (isBouncing && prevText !== undefined && prevText !== textSig) {
+        // Text on a reused node changed (e.g. Chat model selector): restart cleanly from 0%.
+        textEl.classList.remove("is-bouncing");
+        void textEl.offsetWidth;
+        textEl.classList.add("is-bouncing");
+      } else if (!isBouncing) {
+        textEl.classList.add("is-bouncing");
+      }
+    } else {
+      if (textEl.classList.contains("is-bouncing")) textEl.classList.remove("is-bouncing");
+      if (textEl.style.getPropertyValue("--marquee-dist")) textEl.style.removeProperty("--marquee-dist");
+      if (textEl.style.getPropertyValue("--marquee-dur")) textEl.style.removeProperty("--marquee-dur");
+      if (textEl.style.transform) textEl.style.transform = "";
+      if (textEl.dataset && "marqueeText" in textEl.dataset) delete textEl.dataset.marqueeText;
+    }
+  });
+
+  if (marqueeRafIds && !finished && rafId !== undefined) {
+    marqueeRafIds.set(textEl, rafId);
+  }
+}
+
+function getModelUrlKey(model) {
+  if (!model) return "";
+  if (model.digest) return model.digest.replace(":", "-");
+  return encodeURIComponent(model.name || "");
+}
+
+function findModelByUrlKey(key) {
+  if (!key || typeof models === "undefined" || !Array.isArray(models)) return null;
+  const decoded = decodeURIComponent(key);
+  return models.find((m) => m.digest && m.digest.replace(":", "-") === key) ||
+         models.find((m) => m.name === decoded || m.name === key) ||
+         models.find((m) => m.name.toLowerCase() === decoded.toLowerCase() || m.name.toLowerCase() === key.toLowerCase()) ||
+         null;
+}
+
+function hideAllMainViews() {
+  if (typeof stopBatteryPolling === "function") stopBatteryPolling();
+  if (typeof resetSettingsSecretVisibility === "function") resetSettingsSecretVisibility();
+  // Leaving the chat throws a quick chat away on purpose, but a persistent
+  // session outlives the view: it is still open on the server and still
+  // streaming. Wiping it here would drop the transcript the user came back to
+  // read, and any chunk that arrives after the switch would repopulate the chat
+  // with an assistant reply that has no user turn above it. Switching the model
+  // dropdown, clicking Reset or picking "Quick chat" are the deliberate ways to
+  // end a session, not navigating away from it.
+  const sessionOpen = typeof chatSessionId !== "undefined" && !!chatSessionId;
+  if (!sessionOpen && typeof currentView !== "undefined" && currentView === "chat") {
+    if (typeof resetChatState === "function") {
+      resetChatState();
+    }
+  }
+  const viewIds = [
+    "models-view",
+    "chat-view",
+    "tests-view",
+    "test-editor-view",
+    "agent-session-view",
+    "battery-progress-view",
+    "battery-results-view",
+    "battery-review-view",
+    "battery-history-view",
+    "battery-leaderboard-view",
+    "analytics-view",
+    "settings-view",
+    "rags-view",
+    "modelfile-view",
+    "hf-view",
+    "detail-panel"
+  ];
+  for (const id of viewIds) {
+    const el = $(id);
+    if (el) el.hidden = true;
+  }
+  document.querySelectorAll(".topbar-actions button").forEach((b) => b.classList.remove("active"));
+}
+

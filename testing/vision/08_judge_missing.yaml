@@ -1,0 +1,25 @@
+id: vis-judge-missing
+name: 'Vision 08 · Judge Missing'
+description: 'Identifies missing objects (succulent plant) from an incomplete desk description.'
+group_id: vision
+active: true
+order: 7
+required_caps:
+  - vision
+
+cases:
+  - name: 'Desk evaluation'
+    steps:
+      - name: 'Identify missing items'
+        system_prompt: |
+          You are an impartial judge. Evaluate ONLY what is asked.
+          Reply with the verdict first, then list every missing item.
+        prompt: |
+          Candidate description: "A wooden desk with a laptop and a white coffee mug."
+          Is anything visible in the image missing from this description? List each missing item.
+        attachment: 08_judge_missing-1.jpg
+        options:
+          temperature: 0.2
+        evaluation:
+          type: regex
+          pattern: '(?i)\b(plant|succulent|pot)\b'

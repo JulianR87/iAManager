@@ -1,0 +1,789 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/JulianR87/iAManager/internal/rag"
+)
+
+// sessionSettingsInput accepts the chat options panel exactly as the browser
+// reads it from the DOM, where numbers arrive as strings.
+type sessionSettingsInput struct {
+	System      any `json:"system"`
+	Temperature any `json:"temperature"`
+	TopK        any `json:"top_k"`
+	TopP        any `json:"top_p"`
+	NumCtxPct   any `json:"num_ctx"`
+	ThinkLevel  any `json:"think_level"`
+	WebTools    any `json:"web_tools"`
+	Artifacts   any `json:"artifacts"`
+	Skills         any `json:"skills"`
+	SelectedSkills any `json:"selected_skills"`
+	MCP            any `json:"mcp"`
+	MCPServers     any `json:"mcp_servers"`
+	RAGEnabled     any `json:"rag_enabled"`
+	RAGPaths       any `json:"rag_paths"`
+	RAGEditable    any `json:"rag_editable"`
+	ImageWidth     any `json:"image_width"`
+	ImageHeight    any `json:"image_height"`
+	ImageSteps     any `json:"image_steps"`
+	ImageSeed      any `json:"image_seed"`
+	Comfy          any `json:"comfy"`
+	// ComfyWorkflow is the id (or empty for "let the model choose") of the workflow
+	// this session should use by default.
+	ComfyWorkflow any `json:"comfy_workflow"`
+}
+
+// defaultSessionSettings mirrors the values the options panel starts with, so a
+// session created without a settings payload still looks like a fresh chat.
+func defaultSessionSettings() SessionSettings {
+	return SessionSettings{
+		Temperature: 0.7,
+		TopK:        40,
+		TopP:        0.9,
+		NumCtxPct:   100,
+		ThinkLevel:  "auto",
+		ImageWidth:  512,
+		ImageHeight: 512,
+		ImageSteps:  4,
+		ImageSeed:   0,
+	}
+}
+
+// mergeInto folds the fields the caller actually sent into an existing set of
+// settings. Absent fields keep their previous value, so a partial payload can
+// never silently drop options the user configured earlier in the session.
+func (in sessionSettingsInput) mergeInto(dst SessionSettings) SessionSettings {
+	if in.System != nil {
+		dst.System = sessionOptString(in.System)
+	}
+	if in.Temperature != nil {
+		dst.Temperature = sessionOptFloat(in.Temperature, dst.Temperature)
+	}
+	if in.TopK != nil {
+		dst.TopK = sessionOptInt(in.TopK, dst.TopK)
+	}
+	if in.TopP != nil {
+		dst.TopP = sessionOptFloat(in.TopP, dst.TopP)
+	}
+	if in.NumCtxPct != nil {
+		dst.NumCtxPct = normalizeSessionNumCtxPct(sessionOptInt(in.NumCtxPct, dst.NumCtxPct))
+	}
+	if in.ThinkLevel != nil {
+		if lvl := sessionOptString(in.ThinkLevel); lvl != "" {
+			dst.ThinkLevel = lvl
+		} else {
+			dst.ThinkLevel = "auto"
+		}
+	}
+	if in.WebTools != nil {
+		dst.WebTools = sessionOptBool(in.WebTools)
+	}
+	if in.Artifacts != nil {
+		dst.Artifacts = sessionOptBool(in.Artifacts)
+	}
+	if in.Skills != nil {
+		dst.Skills = sessionOptBool(in.Skills)
+	}
+	if in.SelectedSkills != nil {
+		list := sessionOptSelectedSkills(in.SelectedSkills)
+		dst.SelectedSkills = &list
+	}
+	if !dst.Skills {
+		dst.SelectedSkills = nil
+	}
+	if in.MCP != nil {
+		dst.MCP = sessionOptBool(in.MCP)
+	}
+	if in.MCPServers != nil {
+		dst.MCPServers = sessionOptMCPServers(in.MCPServers)
+	}
+	if !dst.MCP {
+		dst.MCPServers = nil
+	}
+	if in.RAGEnabled != nil {
+		dst.RAGEnabled = sessionOptBool(in.RAGEnabled)
+	}
+	if in.RAGPaths != nil {
+		dst.RAGPaths = sessionOptRAGPaths(in.RAGPaths)
+	}
+	if in.RAGEditable != nil {
+		dst.RAGEditable = sessionOptRAGPaths(in.RAGEditable)
+	}
+	if !dst.RAGEnabled {
+		dst.RAGPaths = nil
+		dst.RAGEditable = nil
+	}
+	dst.RAGEditable = filterRAGEditable(dst.RAGEditable, dst.RAGPaths)
+	if in.ImageWidth != nil {
+		dst.ImageWidth = sessionOptInt(in.ImageWidth, dst.ImageWidth)
+	}
+	if in.ImageHeight != nil {
+		dst.ImageHeight = sessionOptInt(in.ImageHeight, dst.ImageHeight)
+	}
+	if in.ImageSteps != nil {
+		dst.ImageSteps = sessionOptInt(in.ImageSteps, dst.ImageSteps)
+	}
+	if in.ImageSeed != nil {
+		dst.ImageSeed = sessionOptInt(in.ImageSeed, dst.ImageSeed)
+	}
+	if in.Comfy != nil {
+		dst.Comfy = sessionOptBool(in.Comfy)
+	}
+	if in.ComfyWorkflow != nil {
+		dst.ComfyWorkflow = sessionOptString(in.ComfyWorkflow)
+	}
+	return dst
+}
+
+// toSessionSettings coerces a full loose input into the persisted shape,
+// filling in the same defaults the options panel starts with.
+func (in sessionSettingsInput) toSessionSettings() SessionSettings {
+	return in.mergeInto(defaultSessionSettings())
+}
+
+func sessionOptString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case bool:
+		return strconv.FormatBool(t)
+	case nil:
+		return ""
+	default:
+		return ""
+	}
+}
+
+func sessionOptFloat(v any, def float64) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
+			return f
+		}
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func sessionOptInt(v any, def int) int {
+	switch t := v.(type) {
+	case float64:
+		return int(t)
+	case float32:
+		return int(t)
+	case int:
+		return t
+	case int64:
+		return int(t)
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			return n
+		}
+	case json.Number:
+		if n, err := t.Int64(); err == nil {
+			return int(n)
+		}
+	case bool:
+		if t {
+			return 1
+		}
+		return 0
+	}
+	return def
+}
+
+func sessionOptBool(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		b, err := strconv.ParseBool(strings.TrimSpace(t))
+		return err == nil && b
+	case float64:
+		return t != 0
+	case float32:
+		return t != 0
+	case int:
+		return t != 0
+	case int64:
+		return t != 0
+	}
+	return false
+}
+
+const maxSessionRAGPaths = 32
+
+// sessionOptRAGPaths accepts the loose JSON list the browser sends and keeps
+// only unique, path-safe .db names inside the configured RAG directory.
+func sessionOptRAGPaths(v any) []string {
+	var raw []any
+	switch t := v.(type) {
+	case []any:
+		raw = t
+	case []string:
+		raw = make([]any, len(t))
+		for i, s := range t {
+			raw[i] = s
+		}
+	case string:
+		if strings.TrimSpace(t) == "" {
+			return nil
+		}
+		raw = []any{t}
+	default:
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := map[string]bool{}
+	for _, item := range raw {
+		name := sessionOptString(item)
+		if !rag.ValidFilename(name) || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+		if len(out) >= maxSessionRAGPaths {
+			break
+		}
+	}
+	return out
+}
+
+func filterRAGEditable(editable, paths []string) []string {
+	if len(editable) == 0 || len(paths) == 0 {
+		return nil
+	}
+	allowed := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		allowed[p] = true
+	}
+	out := make([]string, 0, len(editable))
+	for _, e := range editable {
+		if allowed[e] {
+			out = append(out, e)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+const (
+	maxSessionMCPServers = 32
+	maxSessionSkills     = 128
+)
+
+func sessionOptStringList(v any, maxItems int) []string {
+	var raw []any
+	switch t := v.(type) {
+	case []any:
+		raw = t
+	case []string:
+		raw = make([]any, len(t))
+		for i, s := range t {
+			raw[i] = s
+		}
+	case string:
+		if strings.TrimSpace(t) == "" {
+			return []string{}
+		}
+		raw = []any{t}
+	default:
+		return []string{}
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+	for _, item := range raw {
+		name := strings.TrimSpace(sessionOptString(item))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+		if maxItems > 0 && len(out) >= maxItems {
+			break
+		}
+	}
+	return out
+}
+
+func sessionOptMCPServers(v any) []string {
+	out := sessionOptStringList(v, maxSessionMCPServers)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sessionOptSelectedSkills(v any) []string {
+	return sessionOptStringList(v, maxSessionSkills)
+}
+
+type createSessionRequest struct {
+	Model    string               `json:"model"`
+	Settings sessionSettingsInput `json:"settings"`
+}
+
+type sessionMessageRequest struct {
+	Content     string                `json:"content"`
+	Attachments []ChatAttach          `json:"attachments"`
+	Settings    *sessionSettingsInput `json:"settings"`
+	// Model is the model the browser currently has selected. The session adopts
+	// it, the same way it adopts the options panel, so a session always keeps
+	// generating with the configuration of its last input.
+	Model string `json:"model,omitempty"`
+	// ReplaceLast drops the assistant reply that follows the last user turn
+	// before the new turn is appended. The browser used to do this locally;
+	// on a session the server owns the transcript, so it has to.
+	ReplaceLast bool `json:"replace_last,omitempty"`
+	// EditLast rewrites the last user turn instead of appending a new one,
+	// which is what "edit and resend" means once the transcript is persisted.
+	EditLast bool `json:"edit_last,omitempty"`
+}
+
+type renameSessionRequest struct {
+	Title string `json:"title"`
+}
+
+// queueActionRequest names one queued turn for cancel or promote.
+type queueActionRequest struct {
+	QueueID string `json:"queue_id"`
+}
+
+// handleChatSessionsList serves the session rows used by the side panel and by
+// the badges next to each model.
+func (s *Server) handleChatSessionsList(w http.ResponseWriter, r *http.Request) {
+	if !s.chatSessionsEnabled() {
+		// Feature switched off in settings. Report it instead of an empty list so
+		// the UI can hide the panel rather than look like a bug.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"sessions":     []SessionSummary{},
+			"max_parallel": maxConcurrentChatSessions,
+			"enabled":      false,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sessions":     s.chatSessions.List(),
+		"max_parallel": maxConcurrentChatSessions,
+		"enabled":      true,
+	})
+}
+
+// handleChatSessionsDeleteAll wipes sessions ("clear all"). It never 404s:
+// clearing an already empty list is a no-op the UI can treat as success.
+//
+// An optional ?model= narrows the wipe to one model. Sessions are private to
+// their model, so the "clear all" button in the chat panel only deletes the
+// ones the user can see; the settings page calls it without the parameter and
+// still wipes everything.
+func (s *Server) handleChatSessionsDeleteAll(w http.ResponseWriter, r *http.Request) {
+	if model := strings.TrimSpace(r.URL.Query().Get("model")); model != "" {
+		n := s.chatSessions.DeleteByModel(model)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": n})
+		return
+	}
+	n := s.chatSessions.DeleteAll()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": n})
+}
+
+// chatSessionsEnabled reports the settings switch. Reading it takes the config
+// lock, so callers must not already hold it.
+func (s *Server) chatSessionsEnabled() bool {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.ChatSessions.IsEnabled()
+}
+
+// requireChatSessions writes a 403 and reports false when the feature is off.
+func (s *Server) requireChatSessions(w http.ResponseWriter) bool {
+	if s.chatSessionsEnabled() {
+		return true
+	}
+	writeError(w, http.StatusForbidden, errors.New("persistent chat sessions are disabled in settings"))
+	return false
+}
+
+// handleChatSessionCreate registers a new persistent session.
+func (s *Server) handleChatSessionCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.requireChatSessions(w) {
+		return
+	}
+	var req createSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	req.Model = strings.TrimSpace(req.Model)
+	if req.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("model is required"))
+		return
+	}
+	sess := s.chatSessions.Create(req.Model, req.Settings.toSessionSettings())
+	writeJSON(w, http.StatusOK, s.sessionDetail(sess))
+}
+
+// handleChatSessionGet returns the full transcript plus the saved options.
+func (s *Server) handleChatSessionGet(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess := s.chatSessions.Get(id)
+	if sess == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.sessionDetail(sess))
+}
+
+func (s *Server) sessionDetail(sess *ChatSession) map[string]any {
+	s.chatSessions.mu.Lock()
+	defer s.chatSessions.mu.Unlock()
+	detail := map[string]any{
+		"id":           sess.ID,
+		"title":        sess.Title,
+		"custom_title": sess.CustomTitle,
+		"model":        sess.Model,
+		"status":       sess.Status,
+		"unseen":       sess.Unseen,
+		"error":        sess.Error,
+		"settings":     sess.Settings,
+		// Hydrated on the way out: the stored transcript keeps attachment bytes on
+		// disk, but the browser has to be able to render them again.
+		"messages":       s.chatSessions.hydrateMessages(sess.Messages),
+		"queue":          s.chatSessions.hydrateMessages(sess.Queue),
+		"seq":            sess.Seq,
+		"created_at":     sess.CreatedAt,
+		"updated_at":     sess.UpdatedAt,
+		"last_active_at": sess.LastActive,
+		"watching":       s.chatSessions.watchers[sess.ID] > 0,
+	}
+	return detail
+}
+
+// handleChatSessionSettingsPatch lets the open session update option references
+// without sending a chat turn. The browser uses this when a stored RAG file no
+// longer exists and the restored selection has to be cleaned immediately.
+func (s *Server) handleChatSessionSettingsPatch(w http.ResponseWriter, r *http.Request) {
+	if !s.requireChatSessions(w) {
+		return
+	}
+	id := r.PathValue("id")
+	if s.chatSessions.Get(id) == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	var in sessionSettingsInput
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	s.chatSessions.MergeSettings(id, in)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionPatch renames a session.
+func (s *Server) handleChatSessionPatch(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req renameSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	if !s.chatSessions.Rename(id, req.Title) {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionDelete cancels any run and removes the session for good.
+func (s *Server) handleChatSessionDelete(w http.ResponseWriter, r *http.Request) {
+	if !s.requireChatSessions(w) {
+		return
+	}
+	id := r.PathValue("id")
+	if !s.chatSessions.Delete(id) {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionSend appends a user turn and starts a detached run. It
+// answers 202 right away: the browser never waits for the model. A message sent
+// while the session is busy is queued in the session and runs when its turn
+// comes, instead of being refused.
+func (s *Server) handleChatSessionSend(w http.ResponseWriter, r *http.Request) {
+	if !s.requireChatSessions(w) {
+		return
+	}
+	id := r.PathValue("id")
+	if s.chatSessions.Get(id) == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	var req sessionMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	if strings.TrimSpace(req.Content) == "" && len(req.Attachments) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("content is required"))
+		return
+	}
+	// Whether the message waits or runs now. It is read before the append so the
+	// answer can tell the browser to draw the message in the queue panel.
+	wasBusy := s.chatSessions.IsBusy(id)
+	if req.Settings != nil {
+		s.chatSessions.MergeSettings(id, *req.Settings)
+	}
+	if model := strings.TrimSpace(req.Model); model != "" {
+		s.chatSessions.SetModel(id, model)
+	}
+
+	queueID := ""
+	if req.ReplaceLast || req.EditLast {
+		// Regenerate and edit-and-resend rewrite the last user turn in place, so
+		// there is nothing to queue: the run answers the turn already there.
+		if req.ReplaceLast {
+			s.chatSessions.TrimAfterLastUser(id)
+		}
+		if req.EditLast {
+			s.chatSessions.ReplaceLastUser(id, req.Content, req.Attachments)
+		}
+	} else {
+		qid, ok := s.chatSessions.enqueueUser(id, req.Content, req.Attachments, wasBusy)
+		if !ok {
+			writeError(w, http.StatusNotFound, errors.New("session not found"))
+			return
+		}
+		queueID = qid
+	}
+	// Sending a message counts as wanting the queue to move: a queue paused by
+	// Stop picks up where it left off, with the new message at the end.
+	s.chatSessions.Resume(id)
+	s.dispatchSessionTurn(id)
+	sum := s.chatSessions.Summary(id)
+	if sum == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	queue := s.chatSessions.queueEchoForSend(id, queueID, wasBusy)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":       true,
+		"status":   sum.Status,
+		"queued":   wasBusy,
+		"queue_id": queueID,
+		"queue":    queue,
+	})
+}
+
+// handleChatSessionQueueRemove takes a queued turn back out of the session and
+// returns it so the browser can restore the text to the composer.
+func (s *Server) handleChatSessionQueueRemove(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req queueActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	msg, ok := s.chatSessions.RemoveQueued(id, req.QueueID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("queued message not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
+}
+
+// handleChatSessionQueuePromote moves a queued turn to the front and interrupts
+// the running one so it runs next.
+func (s *Server) handleChatSessionQueuePromote(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req queueActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	if !s.chatSessions.PromoteQueued(id, req.QueueID) {
+		writeError(w, http.StatusNotFound, errors.New("queued message not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionCancel stops the turn in flight, leaving the session intact.
+func (s *Server) handleChatSessionCancel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.chatSessions.Get(id) == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	s.chatSessions.Cancel(id)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionReset empties a session in place. The id, model and settings
+// stay, so the Reset button restarts the session the user is in instead of
+// dropping them back into the throwaway quick chat.
+func (s *Server) handleChatSessionReset(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.chatSessions.Get(id) == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	if !s.chatSessions.ResetSession(id) {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatSessionSeen clears the white badge once the user has read the reply.
+func (s *Server) handleChatSessionSeen(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if s.chatSessions.Get(id) == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	s.chatSessions.MarkSeen(id)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleChatEvents is the global badge feed: every session state change and
+// every live stream event, so a closed tab still learns when work finishes.
+func (s *Server) handleChatEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	writeSSEHeaders(w)
+	send := func(event string, payload any) {
+		buf, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\n", event)
+		fmt.Fprintf(w, "data: %s\n\n", buf)
+		flusher.Flush()
+	}
+	send("snapshot", map[string]any{
+		"sessions":     s.chatSessions.List(),
+		"max_parallel": maxConcurrentChatSessions,
+	})
+	ch, cancel := s.chatSessions.Subscribe()
+	defer cancel()
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			send("session", ev)
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// handleChatSessionEvents tails one session: it replays whatever was buffered
+// after ?from= and then follows the live stream, so a tab opened mid-run catches
+// up instead of starting from nothing.
+func (s *Server) handleChatSessionEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess := s.chatSessions.Get(id)
+	if sess == nil {
+		writeError(w, http.StatusNotFound, errors.New("session not found"))
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, errors.New("streaming not supported"))
+		return
+	}
+	from := 0
+	if v := r.URL.Query().Get("from"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			from = n
+		}
+	}
+	writeSSEHeaders(w)
+	send := func(event string, payload any) {
+		buf, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\n", event)
+		fmt.Fprintf(w, "data: %s\n\n", buf)
+		flusher.Flush()
+	}
+
+	// Subscribe before replaying so nothing produced in between is lost.
+	ch, cancel := s.chatSessions.Subscribe()
+	defer cancel()
+	s.chatSessions.AddWatcher(id)
+	defer s.chatSessions.RemoveWatcher(id)
+
+	s.chatSessions.mu.Lock()
+	replay := append([]SessionEvent(nil), sess.Events...)
+	sum := summaryOf(sess)
+	s.chatSessions.mu.Unlock()
+
+	send("snapshot", map[string]any{
+		"session": sum,
+		"seq":     sess.Seq,
+	})
+	for _, ev := range replay {
+		if ev.Seq <= from {
+			continue
+		}
+		send(ev.Event, map[string]any{"seq": ev.Seq, "data": ev.Data})
+	}
+
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, ok := <-ch:
+			if !ok {
+				return
+			}
+			if ev.ID != id || ev.Kind != chatSessionEventStream {
+				continue
+			}
+			send(ev.Event, map[string]any{"seq": ev.Seq, "data": ev.Data})
+		case <-ticker.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}

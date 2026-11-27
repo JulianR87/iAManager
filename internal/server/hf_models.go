@@ -1,0 +1,798 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// HFModelSummary represents a model returned from the search endpoint.
+type HFModelSummary struct {
+	ID           string    `json:"id"`
+	Author       string    `json:"author"`
+	Name         string    `json:"name"`
+	Downloads    int       `json:"downloads"`
+	Likes        int       `json:"likes"`
+	LastModified time.Time `json:"last_modified"`
+	Tags         []string  `json:"tags"`
+	PipelineTag  string    `json:"pipeline_tag"`
+	IsPrivate    bool      `json:"private"`
+	// IsGated is true when the repo requires accepting conditions on
+	// huggingface.co before Ollama can pull it (HF "gated": "manual"/"auto").
+	IsGated   bool   `json:"is_gated,omitempty"`
+	Gated     string `json:"gated,omitempty"`
+	HasGGUF   bool   `json:"has_gguf"`
+	HasOllama bool   `json:"has_ollama"`
+	HasVision bool   `json:"has_vision"`
+	GGUFCount int    `json:"gguf_count"`
+}
+
+// HFQuantVariant is a non-primary file that shares a quantization scheme with
+// an option's representative file (e.g. the "NEO" file when the "NEO-MAX" one is
+// the representative, or vice versa). Hugging Face resolves the bare
+// `:<scheme>` tag to the representative only, so these are surfaced as
+// read-only detail rather than installable options.
+type HFQuantVariant struct {
+	Filename  string `json:"filename"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+// HFQuantFile represents a single GGUF or mmproj file in a repository.
+type HFQuantFile struct {
+	Filename      string `json:"filename"`
+	Quant         string `json:"quant"`
+	SizeBytes     int64  `json:"size_bytes"`
+	IsVisionProj  bool   `json:"is_vision_proj"`
+	PullName      string `json:"pull_name"`
+	IsInstalled   bool   `json:"is_installed"`
+	IsDownloading bool   `json:"is_downloading"`
+	// ExtraVariants lists the other files that share this option's quantization
+	// scheme but are not the one HF's registry serves for the bare tag.
+	ExtraVariants []HFQuantVariant `json:"extra_variants,omitempty"`
+}
+
+// HFModelDetail contains detailed repository metadata and files.
+type HFModelDetail struct {
+	ID             string        `json:"id"`
+	Author         string        `json:"author"`
+	Name           string        `json:"name"`
+	Downloads      int           `json:"downloads"`
+	Likes          int           `json:"likes"`
+	LastModified   time.Time     `json:"last_modified"`
+	Tags           []string      `json:"tags"`
+	PipelineTag    string        `json:"pipeline_tag"`
+	License        string        `json:"license,omitempty"`
+	Description    string        `json:"description,omitempty"`
+	GGUFFiles      []HFQuantFile `json:"gguf_files"`
+	VisionFiles    []HFQuantFile `json:"vision_files"`
+	HasVision      bool          `json:"has_vision"`
+	TotalGGUFCount int           `json:"total_gguf_count"`
+	SuggestedQuant string        `json:"suggested_quant,omitempty"`
+	// IsGated mirrors HFModelSummary.IsGated for the detail view.
+	IsGated bool   `json:"is_gated,omitempty"`
+	Gated   string `json:"gated,omitempty"`
+	// UsesXet is a best-effort probe: true when the first GGUF resolves to
+	// an XET CDN host (xet-bridge / cdn.hf.co). Those pulls currently fail
+	// on Ollama with "blocked redirect to a different host" — usually
+	// transient, retry later or use `ollama pull --insecure` in a terminal.
+	UsesXet bool `json:"uses_xet,omitempty"`
+}
+
+// parseHFGated normalizes the HF "gated" field, which is either boolean
+// false or a string ("manual", "auto", "true").
+func parseHFGated(raw json.RawMessage) (bool, string) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		sl := strings.ToLower(strings.TrimSpace(s))
+		if sl == "" || sl == "false" || sl == "no" {
+			return false, ""
+		}
+		return true, sl
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		if b {
+			return true, "true"
+		}
+		return false, ""
+	}
+	// Unknown shape: treat truthy non-empty as gated.
+	t := strings.TrimSpace(string(raw))
+	if t != "" && t != "false" && t != "0" {
+		return true, t
+	}
+	return false, ""
+}
+
+// probeHFXet does a no-redirect HEAD against the resolve URL of one GGUF
+// file. Returns true when HF answers with a redirect to an XET/CDN host.
+func probeHFXet(ctx context.Context, repoID, filePath string) bool {
+	if repoID == "" || filePath == "" {
+		return false
+	}
+	encParts := make([]string, 0, 4)
+	for _, p := range strings.Split(strings.TrimPrefix(path.Clean("/"+filePath), "/"), "/") {
+		if p != "" {
+			encParts = append(encParts, url.PathEscape(p))
+		}
+	}
+	if len(encParts) == 0 {
+		return false
+	}
+	resolveURL := fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", cleanRepoPath(repoID), strings.Join(encParts, "/"))
+	reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodHead, resolveURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "iAManager/0.1.0")
+	client := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       5 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 300 || resp.StatusCode > 399 {
+		return false
+	}
+	loc := strings.ToLower(resp.Header.Get("Location"))
+	return strings.Contains(loc, "xet-bridge") || strings.Contains(loc, "cdn.hf.co") ||
+		strings.Contains(loc, "cas-bridge") || strings.Contains(loc, "xethub")
+}
+
+var (
+	// K/IQ quants always carry a variant suffix (Q4_K_M, IQ4_XS, Q8_0); floats
+	// have no suffix. A bare "Q<n>" is deliberately NOT matched: base-model
+	// version tokens such as the "Q3.8" in "Qwen3.8" would otherwise be read as
+	// a "Q3" quant and produce an invalid `ollama pull :Q3` reference.
+	quantRegex   = regexp.MustCompile(`(?i)(?:^|[-._])(ud-iq[0-9]+_[a-z0-9_]+|ud-q[0-9]+_[a-z0-9_]+|iq[0-9]+_[a-z0-9_]+|q[0-9]+_[a-z0-9_]+|mxfp4|f16|f32|bf16)(?:[-._]|$)`)
+	mmprojRegex  = regexp.MustCompile(`(?i)mmproj`)
+	imatrixRegex = regexp.MustCompile(`(?i)(?:^|[-._])imatrix(?:[-._]|$)`)
+	// The leading [a-z]* catches vendor-prefixed variants such as "FastMTP" or
+	// "SpecDraft"; the trailing digit allows suffixes like "FastMTP32K".
+	mtpRegex       = regexp.MustCompile(`(?i)(?:^|[-._])[a-z]*mtp(?:[-._0-9]|$)`)
+	draftRegex     = regexp.MustCompile(`(?i)(?:^|[-._])[a-z]*draft(?:[-._0-9]|$)`)
+	paramSizeRegex = regexp.MustCompile(`(?i)(?:^|[-._])([0-9]+(?:\.[0-9]+)?[bm])(?:[-._]|$)`)
+)
+
+// IsImatrixFile checks if the filename corresponds to an imatrix calibration data file.
+func IsImatrixFile(filename string) bool {
+	lower := strings.ToLower(filename)
+	return imatrixRegex.MatchString(lower) || strings.Contains(lower, "imatrix")
+}
+
+// IsAuxiliaryGGUF checks if the file is an auxiliary, draft, or calibration file (imatrix, mtp, draft).
+func IsAuxiliaryGGUF(filename string) bool {
+	lower := strings.ToLower(filename)
+	if IsImatrixFile(lower) {
+		return true
+	}
+	return mtpRegex.MatchString(lower) || draftRegex.MatchString(lower)
+}
+
+// ExtractQuantization extracts the quant name from a GGUF filename.
+func ExtractQuantization(filename string) string {
+	lower := strings.ToLower(filename)
+	// Remove .gguf extension
+	base := strings.TrimSuffix(lower, ".gguf")
+
+	// Check if this is an auxiliary non-standalone file (imatrix, mtp, draft)
+	if IsAuxiliaryGGUF(base) {
+		return "AUXILIARY"
+	}
+
+	// Check if this is a vision mmproj file
+	if mmprojRegex.MatchString(base) {
+		return "MMPROJ"
+	}
+
+	matches := quantRegex.FindStringSubmatch(base)
+	if len(matches) > 1 {
+		return strings.ToUpper(matches[1])
+	}
+
+	// Fallback to searching common quant patterns if prefix matching missed it
+	for _, q := range []string{
+		"q4_k_m", "q4_k_s", "q4_0", "q4_1",
+		"q5_k_m", "q5_k_s", "q5_0", "q5_1",
+		"q8_0", "q6_k", "q3_k_l", "q3_k_m", "q3_k_s",
+		"q2_k", "iq4_xs", "iq4_nl", "iq3_m", "iq3_s", "iq3_xxs",
+		"iq2_m", "iq2_s", "iq2_xxs", "iq1_s", "iq1_m",
+		"mxfp4", "f16", "f32", "bf16",
+	} {
+		if strings.Contains(base, q) {
+			return strings.ToUpper(q)
+		}
+	}
+
+	return "OTHER"
+}
+
+// hfDedupeQuants collapses GGUF files into one option per quantization scheme,
+// mirroring the "Quick Links" Hugging Face exposes for Ollama. When several
+// files share a scheme — e.g. the "NEO" and "NEO-MAX" variants DavidAU
+// publishes, both labelled "IQ4_XS" — the alphabetically-first file becomes the
+// option because that is the one HF's registry resolves the bare `:scheme` tag
+// to; the other files are attached as read-only ExtraVariants. Files with no
+// scheme in their name keep the "OTHER" label so they can still be offered via
+// the repository's default (`latest`).
+//
+// The returned order is first-seen; PullName is left for the caller to set.
+func hfDedupeQuants(files []HFQuantFile) []HFQuantFile {
+	index := make(map[string]int, len(files))
+	out := make([]HFQuantFile, 0, len(files))
+	for _, f := range files {
+		i, ok := index[f.Quant]
+		if !ok {
+			index[f.Quant] = len(out)
+			out = append(out, f)
+			continue
+		}
+		if strings.ToLower(f.Filename) < strings.ToLower(out[i].Filename) {
+			// New representative; demote the previous one.
+			prev := out[i]
+			f.ExtraVariants = append(f.ExtraVariants, HFQuantVariant{Filename: prev.Filename, SizeBytes: prev.SizeBytes})
+			f.ExtraVariants = append(f.ExtraVariants, prev.ExtraVariants...)
+			out[i] = f
+		} else {
+			out[i].ExtraVariants = append(out[i].ExtraVariants, HFQuantVariant{Filename: f.Filename, SizeBytes: f.SizeBytes})
+		}
+	}
+	for i := range out {
+		sort.Slice(out[i].ExtraVariants, func(a, b int) bool {
+			return out[i].ExtraVariants[a].SizeBytes < out[i].ExtraVariants[b].SizeBytes
+		})
+	}
+	return out
+}
+
+// IsVisionProjector checks if the filename corresponds to a multimodal vision projector.
+func IsVisionProjector(filename string) bool {
+	return mmprojRegex.MatchString(filename)
+}
+
+// handleHFSearch handles GET /api/hf/search
+// Query params:
+//   - q: search query (e.g. "qwen", "llama")
+//   - sort: "downloads" (default), "likes", "lastModified", "trending"
+//   - limit: max items (default 30, max 100)
+//   - cursor: opaque cursor for next-page pagination (from previous response)
+//
+// hfAuthToken returns the configured HuggingFace token (may be empty).
+func (s *Server) hfAuthToken() string {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return strings.TrimSpace(s.cfg.HFToken)
+}
+
+// applyHFAuth sets the HuggingFace Authorization header when a token is
+// configured, so gated/private repos resolve and rate limits are relaxed.
+func (s *Server) applyHFAuth(req *http.Request) {
+	if token := s.hfAuthToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
+func (s *Server) handleHFSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	sortParam := strings.TrimSpace(r.URL.Query().Get("sort"))
+	if sortParam == "" {
+		sortParam = "trending"
+	}
+	limitParam := strings.TrimSpace(r.URL.Query().Get("limit"))
+	limit := 30
+	if n, err := strconv.Atoi(limitParam); err == nil && n > 0 && n <= 100 {
+		limit = n
+	}
+
+	filterParam := strings.TrimSpace(r.URL.Query().Get("filter"))
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+
+	// Construct HuggingFace API search URL
+	hfURL, err := url.Parse("https://huggingface.co/api/models")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	q := hfURL.Query()
+	if query != "" {
+		q.Set("search", query)
+	}
+
+	if filterParam == "ollama" {
+		q.Set("apps", "ollama")
+		q.Set("filter", "gguf")
+	} else if filterParam == "vision" {
+		q.Set("pipeline_tag", "image-text-to-text")
+		q.Set("filter", "gguf")
+	} else {
+		q.Set("filter", "gguf")
+	}
+
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("full", "true")
+	q.Set("config", "false")
+
+	// If cursor is provided, add it to load the next page
+	if cursor != "" {
+		q.Set("cursor", cursor)
+	}
+
+	switch sortParam {
+	case "downloads":
+		q.Set("sort", "downloads")
+		q.Set("direction", "-1")
+	case "likes":
+		q.Set("sort", "likes")
+		q.Set("direction", "-1")
+	case "lastModified", "modified", "recent":
+		q.Set("sort", "lastModified")
+		q.Set("direction", "-1")
+	default: // "trending"
+		q.Set("sort", "trendingScore")
+		q.Set("direction", "-1")
+	}
+
+	hfURL.RawQuery = q.Encode()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hfURL.String(), nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("User-Agent", "iAManager/0.1.0")
+	s.applyHFAuth(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("failed to reach HuggingFace: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		writeJSON(w, resp.StatusCode, map[string]string{"error": fmt.Sprintf("HuggingFace API returned %d: %s", resp.StatusCode, string(body))})
+		return
+	}
+
+	// Extract next-page cursor from Link header
+	// Format: <https://huggingface.co/api/models?...&cursor=XXXX>; rel="next"
+	nextCursor := ""
+	if linkHeader := resp.Header.Get("Link"); linkHeader != "" {
+		nextCursor = extractNextCursor(linkHeader)
+	}
+
+	var rawModels []struct {
+		ID           string          `json:"id"`
+		Author       string          `json:"author"`
+		Downloads    int             `json:"downloads"`
+		Likes        int             `json:"likes"`
+		LastModified time.Time       `json:"lastModified"`
+		Tags         []string        `json:"tags"`
+		PipelineTag  string          `json:"pipeline_tag"`
+		Private      bool            `json:"private"`
+		Gated        json.RawMessage `json:"gated"`
+		Siblings     []struct {
+			RFilename string `json:"rfilename"`
+		} `json:"siblings"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawModels); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to parse HuggingFace response: %v", err)})
+		return
+	}
+
+	results := make([]HFModelSummary, 0, len(rawModels))
+	for _, m := range rawModels {
+		if m.Private {
+			continue
+		}
+
+		quants := make(map[string]struct{})
+		hasVisionFile := false
+		for _, s := range m.Siblings {
+			baseName := path.Base(s.RFilename)
+			fn := strings.ToLower(baseName)
+			if strings.HasSuffix(fn, ".gguf") {
+				if IsAuxiliaryGGUF(baseName) {
+					continue
+				}
+				if IsVisionProjector(baseName) {
+					hasVisionFile = true
+				} else {
+					quants[ExtractQuantization(baseName)] = struct{}{}
+				}
+			}
+		}
+		ggufCount := len(quants)
+
+		// Filter out any repo that has 0 usable GGUF files so only models with quants appear
+		if ggufCount == 0 {
+			continue
+		}
+
+		author := m.Author
+		name := m.ID
+		if parts := strings.SplitN(m.ID, "/", 2); len(parts) == 2 {
+			if author == "" {
+				author = parts[0]
+			}
+			name = parts[1]
+		}
+
+		hasGGUF := ggufCount > 0
+		hasOllama := filterParam == "ollama"
+		hasVision := hasVisionFile
+
+		for _, t := range m.Tags {
+			tl := strings.ToLower(t)
+			if tl == "gguf" {
+				hasGGUF = true
+			}
+			if tl == "ollama" || strings.Contains(tl, "ollama") {
+				hasOllama = true
+			}
+			if tl == "vision" || tl == "multimodal" || tl == "image-to-text" || tl == "image-text-to-text" {
+				hasVision = true
+			}
+		}
+
+		if m.PipelineTag == "image-to-text" || m.PipelineTag == "image-text-to-text" {
+			hasVision = true
+		}
+
+		results = append(results, HFModelSummary{
+			ID:           m.ID,
+			Author:       author,
+			Name:         name,
+			Downloads:    m.Downloads,
+			Likes:        m.Likes,
+			LastModified: m.LastModified,
+			Tags:         m.Tags,
+			PipelineTag:  m.PipelineTag,
+			IsPrivate:    m.Private,
+			HasGGUF:      hasGGUF,
+			HasOllama:    hasOllama,
+			HasVision:    hasVision,
+			GGUFCount:    ggufCount,
+		})
+		// Fill gated flag after append to keep the literal above readable.
+		if isG, gLabel := parseHFGated(m.Gated); isG {
+			results[len(results)-1].IsGated = true
+			results[len(results)-1].Gated = gLabel
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models":      results,
+		"count":       len(results),
+		"next_cursor": nextCursor,
+	})
+}
+
+// extractNextCursor parses the Link header to find the cursor for the next page.
+// Format: <https://huggingface.co/api/models?...&cursor=XXXX>; rel="next"
+func extractNextCursor(linkHeader string) string {
+	// Find rel="next"
+	parts := strings.Split(linkHeader, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if !strings.Contains(part, `rel="next"`) {
+			continue
+		}
+		// Extract URL between < and >
+		start := strings.Index(part, "<")
+		end := strings.Index(part, ">")
+		if start == -1 || end == -1 || end <= start {
+			continue
+		}
+		linkURL := part[start+1 : end]
+		// Parse the URL and extract the cursor parameter
+		parsed, err := url.Parse(linkURL)
+		if err != nil {
+			continue
+		}
+		if c := parsed.Query().Get("cursor"); c != "" {
+			return c
+		}
+	}
+	return ""
+}
+
+func cleanRepoPath(repoID string) string {
+	parts := strings.Split(repoID, "/")
+	for i, p := range parts {
+		parts[i] = url.PathEscape(strings.TrimSpace(p))
+	}
+	return strings.Join(parts, "/")
+}
+
+// handleHFModelDetails handles GET /api/hf/model?id={repo_id}
+func (s *Server) handleHFModelDetails(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	repoID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if repoID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing model 'id' parameter"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	cleanedPath := cleanRepoPath(repoID)
+
+	// 1. Fetch metadata from https://huggingface.co/api/models/{id}
+	metaURL := fmt.Sprintf("https://huggingface.co/api/models/%s", cleanedPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("User-Agent", "iAManager/0.1.0")
+	s.applyHFAuth(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("failed to fetch model details from HuggingFace: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		writeJSON(w, resp.StatusCode, map[string]string{"error": fmt.Sprintf("HuggingFace returned %d: %s", resp.StatusCode, string(body))})
+		return
+	}
+
+	var rawDetail struct {
+		ID           string          `json:"id"`
+		Author       string          `json:"author"`
+		Downloads    int             `json:"downloads"`
+		Likes        int             `json:"likes"`
+		LastModified time.Time       `json:"lastModified"`
+		Tags         []string        `json:"tags"`
+		PipelineTag  string          `json:"pipeline_tag"`
+		Description  string          `json:"description"`
+		Gated        json.RawMessage `json:"gated"`
+		Private      bool            `json:"private"`
+		Disabled     bool            `json:"disabled"`
+		CardData     struct {
+			License string `json:"license"`
+		} `json:"cardData"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&rawDetail); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to parse model details: %v", err)})
+		return
+	}
+
+	// 2. Fetch repository file tree from https://huggingface.co/api/models/{id}/tree/main?recursive=true
+	treeURL := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/main?recursive=true", cleanedPath)
+	treeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, treeURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	treeReq.Header.Set("User-Agent", "iAManager/0.1.0")
+	s.applyHFAuth(treeReq)
+
+	treeResp, err := http.DefaultClient.Do(treeReq)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("failed to fetch tree from HuggingFace: %v", err)})
+		return
+	}
+	defer treeResp.Body.Close()
+
+	var treeFiles []struct {
+		Type string `json:"type"`
+		Path string `json:"path"`
+		Size int64  `json:"size"`
+	}
+
+	if treeResp.StatusCode == http.StatusOK {
+		_ = json.NewDecoder(treeResp.Body).Decode(&treeFiles)
+	}
+
+	// 3. Process GGUF files and mmproj files
+	ggufFiles := make([]HFQuantFile, 0)
+	visionFiles := make([]HFQuantFile, 0)
+	hasVision := false
+
+	// GGUF candidates are collapsed into one option per quantization scheme
+	// (see hfDedupeQuants) before their pull references are built.
+	type ggufCandidate struct {
+		filePath string
+		baseName string
+		size     int64
+	}
+	candidates := make([]ggufCandidate, 0, len(treeFiles))
+
+	// Check tags for vision
+	for _, t := range rawDetail.Tags {
+		tl := strings.ToLower(t)
+		if tl == "vision" || tl == "multimodal" || tl == "image-to-text" || tl == "image-text-to-text" {
+			hasVision = true
+		}
+	}
+	if rawDetail.PipelineTag == "image-to-text" || rawDetail.PipelineTag == "image-text-to-text" {
+		hasVision = true
+	}
+
+	for _, f := range treeFiles {
+		if f.Type != "file" {
+			continue
+		}
+		baseName := path.Base(f.Path)
+		if !strings.HasSuffix(strings.ToLower(baseName), ".gguf") {
+			continue
+		}
+
+		if IsAuxiliaryGGUF(baseName) {
+			continue
+		}
+
+		if IsVisionProjector(baseName) {
+			hasVision = true
+			visionFiles = append(visionFiles, HFQuantFile{
+				Filename:     f.Path,
+				Quant:        "MMPROJ",
+				SizeBytes:    f.Size,
+				IsVisionProj: true,
+				// Canonical host: hf.co fails on recent Ollama with
+				// `realm host "huggingface.co" does not match original host "hf.co"`.
+				PullName: fmt.Sprintf("huggingface.co/%s", rawDetail.ID),
+			})
+			continue
+		}
+
+		candidates = append(candidates, ggufCandidate{filePath: f.Path, baseName: baseName, size: f.Size})
+	}
+
+	// Collapse the files into one option per quantization scheme, matching the
+	// "Quick Links" Hugging Face exposes for Ollama, then point each option at
+	// `huggingface.co/<repo>:<scheme>`. Files without a scheme in their name
+	// ("OTHER") fall back to the repository's default (`latest`).
+	options := make([]HFQuantFile, 0, len(candidates))
+	for _, c := range candidates {
+		options = append(options, HFQuantFile{
+			Filename:  c.filePath,
+			Quant:     ExtractQuantization(c.baseName),
+			SizeBytes: c.size,
+		})
+	}
+	for _, opt := range hfDedupeQuants(options) {
+		pullName := fmt.Sprintf("huggingface.co/%s", rawDetail.ID)
+		if opt.Quant != "OTHER" {
+			pullName = fmt.Sprintf("huggingface.co/%s:%s", rawDetail.ID, opt.Quant)
+		}
+		opt.PullName = pullName
+		opt.IsVisionProj = false
+		ggufFiles = append(ggufFiles, opt)
+	}
+
+	author := rawDetail.Author
+	name := rawDetail.ID
+	if parts := strings.SplitN(rawDetail.ID, "/", 2); len(parts) == 2 {
+		if author == "" {
+			author = parts[0]
+		}
+		name = parts[1]
+	}
+
+	detail := HFModelDetail{
+		ID:             rawDetail.ID,
+		Author:         author,
+		Name:           name,
+		Downloads:      rawDetail.Downloads,
+		Likes:          rawDetail.Likes,
+		LastModified:   rawDetail.LastModified,
+		Tags:           rawDetail.Tags,
+		PipelineTag:    rawDetail.PipelineTag,
+		License:        rawDetail.CardData.License,
+		Description:    rawDetail.Description,
+		GGUFFiles:      ggufFiles,
+		VisionFiles:    visionFiles,
+		HasVision:      hasVision,
+		TotalGGUFCount: len(ggufFiles),
+	}
+	if isG, gLabel := parseHFGated(rawDetail.Gated); isG {
+		detail.IsGated = true
+		detail.Gated = gLabel
+	}
+	// Best-effort XET probe on the smallest GGUF (cheapest HEAD). Never
+	// fails the detail request: on any error UsesXet just stays false.
+	if len(ggufFiles) > 0 {
+		probeFile := ggufFiles[0].Filename
+		for _, f := range ggufFiles {
+			if f.SizeBytes > 0 && f.SizeBytes < ggufFiles[0].SizeBytes {
+				probeFile = f.Filename
+			}
+		}
+		if probeHFXet(ctx, rawDetail.ID, probeFile) {
+			detail.UsesXet = true
+		}
+	}
+
+	writeJSON(w, http.StatusOK, detail)
+}
+
+// handleHFReadme handles GET /api/hf/readme?id={repo_id}
+func (s *Server) handleHFReadme(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	repoID := strings.TrimSpace(r.URL.Query().Get("id"))
+	if repoID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing model 'id' parameter"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	readmeURL := fmt.Sprintf("https://huggingface.co/%s/raw/main/README.md", cleanRepoPath(repoID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, readmeURL, nil)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	req.Header.Set("User-Agent", "iAManager/0.1.0")
+	s.applyHFAuth(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("failed to fetch README from HuggingFace: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		writeJSON(w, resp.StatusCode, map[string]string{"error": fmt.Sprintf("README not found (status %d)", resp.StatusCode)})
+		return
+	}
+
+	// Limit README size to 1MB
+	lr := io.LimitReader(resp.Body, 1024*1024)
+	content, err := io.ReadAll(lr)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to read README: %v", err)})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":      repoID,
+		"content": string(content),
+	})
+}

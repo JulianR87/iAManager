@@ -1,0 +1,793 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/JulianR87/iAManager/internal/runner"
+	"github.com/JulianR87/iAManager/internal/tests"
+)
+
+// ---------- battery runner ----------
+
+func (s *Server) handleBatteryRun(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		GroupID  string   `json:"group_id"`
+		GroupIDs []string `json:"group_ids"`
+		TestID   string   `json:"test_id"`
+		ModelIDs []string `json:"model_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	if len(body.ModelIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("at least one model is required"))
+		return
+	}
+
+	if activeProg, ok := s.runner.GetActiveProgress(); ok {
+		if activeProg.WaitingReview {
+			writeError(w, http.StatusConflict, errors.New("a battery run is awaiting human review: "+activeProg.RunID))
+		} else {
+			writeError(w, http.StatusConflict, errors.New("a battery run is already in progress: "+activeProg.RunID))
+		}
+		return
+	}
+	if s.runnerStore != nil {
+		if run, _, ok := s.runnerStore.GetLatestRunPendingReview(); ok {
+			writeError(w, http.StatusConflict, errors.New("a battery run is awaiting human review: "+run.ID))
+			return
+		}
+	}
+
+	var group tests.Group
+	var testsList []tests.Test
+
+	if body.TestID != "" {
+		test, ok := s.testsStore.GetTest(body.TestID)
+		if !ok {
+			writeError(w, http.StatusNotFound, errors.New("test not found"))
+			return
+		}
+		if g, ok := s.testsStore.GetGroup(test.GroupID); ok {
+			group = g
+		} else {
+			group = tests.Group{ID: test.GroupID, Name: test.Name}
+		}
+		testsList = []tests.Test{test}
+	} else if len(body.GroupIDs) > 0 {
+		// Multi-category run: tests from any of the given groups.
+		allowed := make(map[string]bool, len(body.GroupIDs))
+		var resolved []tests.Group
+		for _, gid := range body.GroupIDs {
+			if allowed[gid] {
+				continue
+			}
+			g, ok := s.testsStore.GetGroup(gid)
+			if !ok {
+				writeError(w, http.StatusNotFound, errors.New("group not found: "+gid))
+				return
+			}
+			allowed[gid] = true
+			resolved = append(resolved, g)
+		}
+		_, allTests := s.testsStore.List()
+		for _, t := range allTests {
+			if allowed[t.GroupID] {
+				testsList = append(testsList, t)
+			}
+		}
+		if len(resolved) == 1 {
+			group = resolved[0]
+		} else {
+			names := make([]string, 0, len(resolved))
+			for _, g := range resolved {
+				if g.Name != "" {
+					names = append(names, g.Name)
+				} else {
+					names = append(names, g.ID)
+				}
+			}
+			group = tests.Group{ID: "all", Name: strings.Join(names, ", ")}
+		}
+	} else if body.GroupID == "" || body.GroupID == "all" {
+		group = tests.Group{ID: "all", Name: "All Tests"}
+		_, allTests := s.testsStore.List()
+		testsList = allTests
+	} else {
+		g, ok := s.testsStore.GetGroup(body.GroupID)
+		if !ok {
+			writeError(w, http.StatusNotFound, errors.New("group not found"))
+			return
+		}
+		group = g
+		_, allTests := s.testsStore.List()
+		for _, t := range allTests {
+			if t.GroupID == body.GroupID {
+				testsList = append(testsList, t)
+			}
+		}
+	}
+
+	// Fail fast on unknown evaluation types (they would score silent false).
+	if err := runner.ValidateTestsForBattery(testsList); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Effective caps: union of test-level and category-level required_caps,
+	// so a category marked vision/audio skips models lacking it even when
+	// individual tests don't declare it.
+	_, allGroups := s.testsStore.List()
+	groupCaps := make(map[string][]string, len(allGroups))
+	for _, g := range allGroups {
+		if len(g.RequiredCaps) > 0 {
+			groupCaps[g.ID] = g.RequiredCaps
+		}
+	}
+	if len(groupCaps) > 0 {
+		for i, tst := range testsList {
+			gc := groupCaps[tst.GroupID]
+			if len(gc) == 0 {
+				continue
+			}
+			seen := make(map[string]bool, len(tst.RequiredCaps)+len(gc))
+			merged := make([]string, 0, len(tst.RequiredCaps)+len(gc))
+			for _, c := range tst.RequiredCaps {
+				k := strings.ToLower(strings.TrimSpace(c))
+				if k == "" || seen[k] {
+					continue
+				}
+				seen[k] = true
+				merged = append(merged, c)
+			}
+			for _, c := range gc {
+				k := strings.ToLower(strings.TrimSpace(c))
+				if k == "" || seen[k] {
+					continue
+				}
+				seen[k] = true
+				merged = append(merged, strings.ToLower(c))
+			}
+			testsList[i].RequiredCaps = merged
+		}
+	}
+
+	// Order tests by category so multi-category runs execute (and save
+	// progress) one category at a time instead of interleaved: group
+	// order first, then test order within the group. The runner preserves
+	// this order and the frontend timeline queue mirrors it.
+	if len(testsList) > 1 {
+		grps, _ := s.testsStore.List()
+		gOrder := make(map[string]int, len(grps))
+		for _, g := range grps {
+			gOrder[g.ID] = g.Order
+		}
+		sort.SliceStable(testsList, func(i, j int) bool {
+			oi, oki := gOrder[testsList[i].GroupID]
+			oj, okj := gOrder[testsList[j].GroupID]
+			if oki && okj && oi != oj {
+				return oi < oj
+			}
+			if testsList[i].GroupID != testsList[j].GroupID {
+				return testsList[i].GroupID < testsList[j].GroupID
+			}
+			if testsList[i].Order != testsList[j].Order {
+				return testsList[i].Order < testsList[j].Order
+			}
+			return testsList[i].Name < testsList[j].Name
+		})
+	}
+
+	// Fetch capabilities for selected models.
+	ctx := r.Context()
+	models, err := s.ollama.List(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	modelMeta := s.fetchModelMeta(ctx, models)
+	modelCaps := make(map[string][]string, len(body.ModelIDs))
+	for _, m := range models {
+		for _, sel := range body.ModelIDs {
+			if m.Name == sel {
+				modelCaps[sel] = modelMeta[m.Digest].Capabilities
+				break
+			}
+		}
+	}
+	// External (OpenAI-compatible) models are not in Ollama's list,
+	// so fill their capabilities from the external store. Without this
+	// they get empty caps and either get wrongly skipped or run without
+	// their vision/tools/thinking flags.
+	if s.externalModels != nil {
+		for _, sel := range body.ModelIDs {
+			if _, ok := modelCaps[sel]; ok {
+				continue
+			}
+			if rec, ok := s.externalModels.Get(sel); ok {
+				caps := append([]string(nil), rec.Capabilities...)
+				if len(caps) == 0 {
+					caps = []string{"completion", "tools", "thinking"}
+				}
+				modelCaps[sel] = caps
+			}
+		}
+	}
+
+	// Detect system info for this run.
+	sysInfo := runner.DetectSysInfo()
+
+	// Snapshot the per-stage auto-skip limits so this run enforces the
+	// testing settings active at start time.
+	s.cfgMu.RLock()
+	testingLimits := s.cfg.Testing
+	s.cfgMu.RUnlock()
+	stageRules := make([]runner.StageSkipRule, 0, len(testingLimits.SkipRules))
+	for _, r := range testingLimits.SkipRules {
+		stageRules = append(stageRules, runner.StageSkipRule{
+			MinTPS:     r.MinTPS,
+			MaxTPS:     r.MaxTPS,
+			MaxTokens:  r.MaxTokens,
+			MaxSeconds: r.MaxSeconds,
+			Mode:       r.Mode,
+		})
+	}
+	s.runner.SetStageLimits(runner.StageLimits{
+		MaxTokens:  testingLimits.MaxStageTokens,
+		MaxSeconds: testingLimits.MaxStageSeconds,
+		Mode:       testingLimits.Mode,
+		Rules:      stageRules,
+	})
+
+	// Use background context so async execution survives HTTP request completion.
+	bgCtx := context.Background()
+	runID := s.runner.ExecuteBatteryAsync(bgCtx, group, testsList, body.ModelIDs, modelCaps, sysInfo, func(run *runner.BatteryRun) {
+		if run == nil {
+			return
+		}
+		if len(run.Results) == 0 {
+			// Discarded aborts, fully-skipped runs (no caps match) and total
+			// failures carry no results: don't persist an empty shell. It
+			// would pollute the history list, serialize as "results": null
+			// and create bogus per-exercise history files.
+			return
+		}
+		_ = s.runnerStore.SaveRun(run)
+		for _, testRes := range run.Results {
+			if testRes.Model == "" || !runner.HasReviewableOutput(testRes) {
+				// A model that answered nothing (broken output, crash or skip)
+				// must not touch the stats: it neither counts as a call nor
+				// sets a tok/s record.
+				continue
+			}
+			if testRes.TokensPerSec > 0 {
+				s.recordModelTPS(testRes.Model, testRes.TokensPerSec, run.Timestamp)
+			} else {
+				s.recordModelTPS(testRes.Model, 0, run.Timestamp)
+			}
+			for _, sub := range testRes.SubResults {
+				if sub.TokensPerSec > 0 {
+					s.recordModelTPS(testRes.Model, sub.TokensPerSec, run.Timestamp)
+				}
+			}
+		}
+		hasPendingReviews := false
+		for _, r := range run.Results {
+			if r.Passed == nil && r.Error == "" && runner.HasReviewableOutput(r) {
+				hasPendingReviews = true
+				break
+			}
+		}
+		if !hasPendingReviews {
+			go s.RegenerateLeaderboardCache()
+		}
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"run_id": runID})
+}
+
+// handleListRuns returns a lightweight, newest-first view of stored runs with
+// optional filtering (q / model / category / test_id) and AJAX pagination
+// (offset / limit). When limit is 0 all matching runs are returned, which keeps
+// older callers working.
+func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	q := strings.ToLower(strings.TrimSpace(query.Get("q")))
+	modelFilter := strings.ToLower(strings.TrimSpace(query.Get("model")))
+	category := strings.TrimSpace(query.Get("category"))
+	testID := strings.TrimSpace(query.Get("test_id"))
+	offset := atoiDefault(query.Get("offset"), 0)
+	limit := atoiDefault(query.Get("limit"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > 500 {
+		limit = 500
+	}
+
+	// testID -> groupID, used to match a category by any of the run's tests.
+	testGroup := map[string]string{}
+	if category != "" && s.testsStore != nil {
+		_, allTests := s.testsStore.List()
+		for _, t := range allTests {
+			testGroup[t.ID] = t.GroupID
+		}
+	}
+	categoryLower := strings.ToLower(category)
+
+	type modelRunStat struct {
+		Pass   int     `json:"pass"`
+		Total  int     `json:"total"`
+		AvgTps float64 `json:"avg_tps,omitempty"`
+	}
+	type lightRun struct {
+		ID         string                  `json:"id"`
+		Timestamp  string                  `json:"timestamp"`
+		GroupName  string                  `json:"group_name"`
+		Models     []string                `json:"models"`
+		TestIDs    []string                `json:"test_ids"`
+		TestCount  int                     `json:"test_count"`
+		PassCount  int                     `json:"pass_count"`
+		FailCount  int                     `json:"fail_count"`
+		TotalCount int                     `json:"total_count"`
+		ModelStats map[string]modelRunStat `json:"model_stats,omitempty"`
+	}
+
+	type summaryAcc struct {
+		pass    int
+		total   int
+		timeSum int64
+		tpsSum  float64
+		tpsN    int
+	}
+
+	runs := s.runnerStore.GetRuns() // newest first
+	out := make([]lightRun, 0, len(runs))
+	var summary *summaryAcc
+	if modelFilter != "" {
+		summary = &summaryAcc{}
+	}
+
+	for _, run := range runs {
+		tids := make(map[string]bool)
+		modelStats := map[string]modelRunStat{}
+		lr := lightRun{
+			ID:        run.ID,
+			Timestamp: run.Timestamp.Format("2006-01-02T15:04:05Z"),
+			GroupName: run.GroupName,
+			Models:    run.Models,
+		}
+		for _, res := range run.Results {
+			if res.TestID != "" {
+				tids[res.TestID] = true
+			}
+			lr.TotalCount++
+			if res.Passed != nil {
+				if *res.Passed {
+					lr.PassCount++
+				} else {
+					lr.FailCount++
+				}
+			} else {
+				lr.TestCount++ // human_review or skipped
+			}
+			if res.Model != "" {
+				st := modelStats[res.Model]
+				st.Total++
+				if res.Passed != nil && *res.Passed {
+					st.Pass++
+				}
+				if res.TokensPerSec > 0 {
+					st.AvgTps += res.TokensPerSec
+				}
+				modelStats[res.Model] = st
+			}
+		}
+		// Finalize per-model average tok/s.
+		for name, st := range modelStats {
+			if st.Total > 0 && st.AvgTps > 0 {
+				st.AvgTps = st.AvgTps / float64(st.Total)
+				modelStats[name] = st
+			}
+		}
+		lr.TestIDs = make([]string, 0, len(tids))
+		for tid := range tids {
+			lr.TestIDs = append(lr.TestIDs, tid)
+		}
+		if len(modelStats) > 0 {
+			lr.ModelStats = modelStats
+		}
+
+		// ---- filters ----
+		if modelFilter != "" && !runHasModel(run.Models, modelFilter) {
+			continue
+		}
+		if testID != "" && !tids[testID] {
+			continue
+		}
+		if category != "" && !runMatchesCategory(run.GroupName, lr.TestIDs, testGroup, categoryLower) {
+			continue
+		}
+		if q != "" && !runMatchesQuery(run.GroupName, run.Models, lr.TestIDs, q) {
+			continue
+		}
+
+		if summary != nil {
+			for _, res := range run.Results {
+				if strings.ToLower(res.Model) != modelFilter {
+					continue
+				}
+				summary.total++
+				if res.Passed != nil && *res.Passed {
+					summary.pass++
+				}
+				summary.timeSum += res.ResponseTimeMs
+				if res.TokensPerSec > 0 {
+					summary.tpsSum += res.TokensPerSec
+					summary.tpsN++
+				}
+			}
+		}
+
+		out = append(out, lr)
+	}
+
+	total := len(out)
+	hasMore := false
+	if limit > 0 {
+		if offset > total {
+			offset = total
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		out = out[offset:end]
+		hasMore = offset+len(out) < total
+	}
+
+	resp := map[string]any{
+		"runs":     out,
+		"total":    total,
+		"offset":   offset,
+		"limit":    limit,
+		"has_more": hasMore,
+	}
+	if summary != nil {
+		avgMs := int64(0)
+		if summary.total > 0 {
+			avgMs = summary.timeSum / int64(summary.total)
+		}
+		avgTps := 0.0
+		if summary.tpsN > 0 {
+			avgTps = summary.tpsSum / float64(summary.tpsN)
+		}
+		resp["model_summary"] = map[string]any{
+			"model":   modelFilter,
+			"pass":    summary.pass,
+			"total":   summary.total,
+			"avg_ms":  avgMs,
+			"avg_tps": avgTps,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func atoiDefault(s string, def int) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return def
+		}
+		n = n*10 + int(c-'0')
+		if n > 1_000_000 {
+			return def
+		}
+	}
+	return n
+}
+
+func runHasModel(models []string, target string) bool {
+	for _, m := range models {
+		if strings.ToLower(m) == target {
+			return true
+		}
+	}
+	return false
+}
+
+func runMatchesCategory(groupName string, testIDs []string, testGroup map[string]string, categoryLower string) bool {
+	if categoryLower == "" {
+		return true
+	}
+	if categoryLower == "all" {
+		return true
+	}
+	if groupName != "" && strings.Contains(strings.ToLower(groupName), categoryLower) {
+		return true
+	}
+	for _, tid := range testIDs {
+		if g, ok := testGroup[tid]; ok && strings.ToLower(g) == categoryLower {
+			return true
+		}
+	}
+	return false
+}
+
+func runMatchesQuery(groupName string, models, testIDs []string, q string) bool {
+	if strings.Contains(strings.ToLower(groupName), q) {
+		return true
+	}
+	for _, m := range models {
+		if strings.Contains(strings.ToLower(m), q) {
+			return true
+		}
+	}
+	for _, tid := range testIDs {
+		if strings.Contains(strings.ToLower(tid), q) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	run, ok := s.runnerStore.GetRun(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("run not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (s *Server) handleRateRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	var body struct {
+		TestID string `json:"test_id"`
+		Model  string `json:"model"`
+		Rating string `json:"rating"` // "bad", "regular", "good"
+		Passed *bool  `json:"passed,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	if body.TestID == "" || body.Model == "" {
+		writeError(w, http.StatusBadRequest, errors.New("test_id and model are required"))
+		return
+	}
+	if body.Passed != nil {
+		if err := s.runnerStore.UpdateResultPassed(id, body.TestID, body.Model, *body.Passed); err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		if s.runner != nil {
+			s.runner.RateReviewResult(id, body.TestID, body.Model, *body.Passed)
+		}
+	} else if body.Rating != "" {
+		if err := s.runnerStore.UpdateHumanRating(id, body.TestID, body.Model, body.Rating); err != nil {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		if s.runner != nil {
+			s.runner.RateReviewResult(id, body.TestID, body.Model, body.Rating == "good")
+		}
+	} else {
+		writeError(w, http.StatusBadRequest, errors.New("rating or passed is required"))
+		return
+	}
+	if s.runnerStore != nil {
+		if run, ok := s.runnerStore.GetRun(id); ok {
+			pending := 0
+			for _, res := range run.Results {
+				if res.Passed == nil && res.Error == "" {
+					pending++
+				}
+			}
+			if pending == 0 && s.runner != nil {
+				s.runner.ClearProgress(id)
+			}
+		}
+	}
+	go s.RegenerateLeaderboardCache()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	if err := s.runnerStore.DeleteRun(id); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	go s.RegenerateLeaderboardCache()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleDeleteModelHistory removes all battery results for one model across
+// every run. The model name travels in a wildcard segment because names may
+// contain slashes (e.g. hf.co/org/model:tag).
+func (s *Server) handleDeleteModelHistory(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing model name"))
+		return
+	}
+	if err := s.runnerStore.DeleteModelHistory(name); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	go s.RegenerateLeaderboardCache()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCancelBatteryRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	cancelled := s.runner.CancelRun(id)
+	writeJSON(w, http.StatusOK, map[string]any{"cancelled": cancelled})
+}
+
+func (s *Server) handleRetryBatteryTest(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	retried := s.runner.RetryCurrentTest(id)
+	writeJSON(w, http.StatusOK, map[string]any{"retried": retried})
+}
+
+func (s *Server) handleSkipBatteryTest(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	skipped := s.runner.SkipCurrentTest(id)
+	writeJSON(w, http.StatusOK, map[string]any{"skipped": skipped})
+}
+
+func (s *Server) handleSkipBatteryModel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	skipped := s.runner.SkipCurrentModel(id)
+	writeJSON(w, http.StatusOK, map[string]any{"skipped": skipped})
+}
+
+func (s *Server) handleAbortBatteryRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Mode != "save-completed" {
+		body.Mode = "discard"
+	}
+	aborted := s.runner.AbortRun(id, body.Mode)
+	writeJSON(w, http.StatusOK, map[string]any{"aborted": aborted, "mode": body.Mode})
+}
+
+func (s *Server) handleBatteryProgress(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing run id"))
+		return
+	}
+	p, ok := s.runner.GetProgress(id)
+	if !ok {
+		if s.runnerStore != nil {
+			if run, found := s.runnerStore.GetRun(id); found {
+				writeJSON(w, http.StatusOK, runner.Progress{
+					RunID:           run.ID,
+					StartedAtUnixMs: run.Timestamp.UnixMilli(),
+					Done:            true,
+					GroupID:         run.GroupID,
+					GroupName:       run.GroupName,
+					Models:          run.Models,
+					TotalTests:      len(run.Results),
+					TestIndex:       len(run.Results),
+					Results:         run.Results,
+				})
+				return
+			}
+		}
+		// If no active progress and not found in store — return done flag.
+		writeJSON(w, http.StatusOK, runner.Progress{RunID: id, Done: true})
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+func (s *Server) handleActiveBatteryRun(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.runner.GetActiveProgress()
+	if !ok && s.runnerStore != nil {
+		if run, pending, hasPending := s.runnerStore.GetLatestRunPendingReview(); hasPending {
+			p = runner.Progress{
+				RunID:          run.ID,
+				GroupName:      run.GroupName,
+				GroupID:        run.GroupID,
+				Models:         run.Models,
+				TotalTests:     len(run.Results),
+				TestIndex:      len(run.Results),
+				WaitingReview:  true,
+				PendingReviews: pending,
+				Results:        run.Results,
+			}
+			ok = true
+		}
+	}
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":          true,
+		"run_id":          p.RunID,
+		"waiting_review":  p.WaitingReview,
+		"pending_reviews": p.PendingReviews,
+		"progress":        p,
+	})
+}
+
+func (s *Server) handleGetTestHistory(w http.ResponseWriter, r *http.Request) {
+	testID := r.PathValue("id")
+	if testID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing test id"))
+		return
+	}
+	history := s.runnerStore.GetTestHistory(testID)
+	writeJSON(w, http.StatusOK, map[string]any{"history": history})
+}
+
+func (s *Server) handleGetGroupHistory(w http.ResponseWriter, r *http.Request) {
+	groupID := r.PathValue("id")
+	if groupID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("missing group id"))
+		return
+	}
+	summary := s.runnerStore.GetGroupHistory(groupID)
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary})
+}
+
+func (s *Server) handleSysInfo(w http.ResponseWriter, r *http.Request) {
+	info := runner.DetectSysInfo()
+	writeJSON(w, http.StatusOK, info)
+}
+
+// Ensure runner types are used.
+var _ = runner.BatteryRun{}

@@ -1,0 +1,20 @@
+id: vis-follow-instructions
+name: 'Vision 02 · Follow Image Instructions'
+description: 'Reads safety instructions from the workshop sign.'
+group_id: vision
+active: true
+order: 1
+required_caps:
+  - vision
+
+cases:
+  - name: 'Safety sign'
+    steps:
+      - name: 'Follow instructions'
+        prompt: Read the instructions shown in this image and tell me what action to take. Quote the relevant part.
+        attachment: 02_follow_image_instructions-1.jpg
+        options:
+          temperature: 0.2
+        evaluation:
+          type: regex
+          pattern: '(?i)(safety glasses|hard hat)'

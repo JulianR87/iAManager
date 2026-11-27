@@ -1,0 +1,21 @@
+id: es-memory-bilingual
+name: 'Spanish 05 · Memoria Bilingüe'
+description: Multi-step memory across languages. A fact stated in English is recalled in Spanish.
+group_id: spanish
+active: true
+order: 4
+
+system_prompt: Be concise.
+
+cases:
+  - name: Set fact EN
+    prompt: My sister Clara is a marine biologist who studies octopuses. Remember this.
+    evaluation:
+      type: contains
+      expected: Clara
+    steps:
+      - name: Recall ES
+        prompt: ¿A qué se dedica mi hermana? Responde en una frase corta.
+        evaluation:
+          type: contains
+          expected: biol

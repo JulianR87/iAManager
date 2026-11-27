@@ -1,0 +1,496 @@
+"use strict";
+
+// ---------- chat ----------
+function nanoid() {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function modelByName(name) {
+  return models.find((m) => m.name === name) || null;
+}
+
+function modelCaps(name) {
+  const m = modelByName(name);
+  const out = new Set();
+  for (const c of (m?.capabilities || [])) out.add(String(c).toLowerCase());
+  return out;
+}
+
+function isImageGenerationOnlyCaps(caps) {
+  return caps.has("image") && !caps.has("vision") && !caps.has("completion");
+}
+
+function formatCapabilityLabel(raw) {
+  const k = String(raw || "").toLowerCase().trim();
+  if (!k) return "";
+  const i18nKey = `chat.cap.${k.replace(/[^a-z0-9]+/g, "_")}`;
+  const tr = t(i18nKey);
+  if (tr !== i18nKey) return tr;
+  return k.charAt(0).toUpperCase() + k.slice(1);
+}
+
+const CAPABILITY_ORDER = ["embedding", "decision", "completion", "tools", "thinking", "vision", "audio", "speech"];
+
+function capabilityOrderKey(cap) {
+  const k = String(cap || "").toLowerCase().trim();
+  const idx = CAPABILITY_ORDER.indexOf(k);
+  return idx === -1 ? CAPABILITY_ORDER.length : idx;
+}
+
+function renderCapabilityPills(caps) {
+  return (caps || [])
+    .slice()
+    .sort((a, b) => capabilityOrderKey(a) - capabilityOrderKey(b))
+    .map((c) => {
+      const raw = String(c);
+      const slug = raw.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+      const label = formatCapabilityLabel(raw);
+      return `<span class="pill chat-cap-pill" data-cap="${escapeHtml(slug)}">${escapeHtml(label)}</span>`;
+    })
+    .join("");
+}
+
+function updateChatModelDisplay() {
+  const sel = $("chat-model");
+  const display = $("chat-model-display");
+  const track = $("chat-model-marquee-track");
+  if (sel && display) {
+    display.textContent = sel.selectedOptions?.[0]?.textContent || sel.value || "";
+    display.title = sel.value || "";
+    updateMarquee(track, display);
+  }
+  const nameVal = $("chat-model-name-value");
+  const nameTrack = $("chat-model-name-track");
+  if (nameVal && nameTrack) {
+    updateMarquee(nameTrack, nameVal);
+  }
+}
+
+function syncChatModelOptions() {
+  const sel = $("chat-model");
+  if (!sel) return;
+  const previous = sel.value;
+  const activeModels = models.filter(m => !m.archived);
+  const archivedModels = models.filter(m => !!m.archived);
+  const sorted = applySort(activeModels);
+  const sortedArchived = applySort(archivedModels);
+
+  const remoteNameCounts = new Map();
+  for (const m of models) {
+    if (m.is_external) {
+      const rn = m.remote_name || m.name;
+      remoteNameCounts.set(rn, (remoteNameCounts.get(rn) || 0) + 1);
+    }
+  }
+  const optionLabel = (m) => {
+    if (!m.is_external) return m.name;
+    const rn = m.remote_name || m.name;
+    if ((remoteNameCounts.get(rn) || 0) > 1) {
+      const prov = (typeof externalProviderLabel === "function") ? externalProviderLabel(m.provider) : "";
+      const ep = (typeof externalCleanEndpoint === "function") ? externalCleanEndpoint(m.url) : (m.url || "");
+      const suffix = [prov, ep].filter(Boolean).join(" · ");
+      return suffix ? `${rn} · ${suffix}` : rn;
+    }
+    return rn;
+  };
+  let html = sorted.map((m) => `<option value="${escapeHtml(m.name)}">${escapeHtml(optionLabel(m))}</option>`).join("");
+  if (sortedArchived.length) {
+    const archLabel = t("settings.archived_section") || "Archived Models";
+    html += `<optgroup label="${escapeHtml(archLabel)}">` +
+      sortedArchived.map((m) => `<option value="${escapeHtml(m.name)}">📦 ${escapeHtml(m.name)}</option>`).join("") +
+      `</optgroup>`;
+  }
+  sel.innerHTML = html;
+
+  const allAvailable = [...sorted, ...sortedArchived];
+  if (!allAvailable.length) return;
+  if (previous && allAvailable.some((m) => m.name === previous)) {
+    sel.value = previous;
+  } else if (activeName && allAvailable.some((m) => m.name === activeName)) {
+    sel.value = activeName;
+  } else {
+    const loaded = sorted.find((m) => m.loaded) || sortedArchived.find((m) => m.loaded);
+    sel.value = (loaded || sorted[0] || sortedArchived[0]).name;
+  }
+  updateChatModelLoadDot();
+  updateChatModelDisplay();
+  if (typeof updateSpeechUI === "function") updateSpeechUI();
+}
+
+function updateChatCapabilityUI() {
+  const model = $("chat-model").value;
+  if ($("chat-model-name-value")) {
+    const selModel = modelByName(model);
+    const visible = (selModel && selModel.is_external && selModel.remote_name) ? selModel.remote_name : model;
+    $("chat-model-name-value").textContent = visible;
+    $("chat-model-name-value").title = model;
+  }
+  updateChatModelDisplay();
+  const caps = modelCaps(model);
+  const isImageModel = isImageGenerationOnlyCaps(caps);
+  const canVision = caps.has("vision");
+  const canAudio = caps.has("audio");
+  const canThink = caps.has("thinking");
+  const canTools = caps.has("tools");
+  $("chat-image-btn").hidden = !canVision;
+  $("chat-audio-btn").hidden = !canAudio;
+  $("chat-record-btn").hidden = !canAudio;
+  $("chat-think-wrap").hidden = !canThink;
+  $("chat-web-tools-wrap").hidden = !canTools;
+  $("chat-artifacts-wrap").hidden = !canTools;
+  if ($("chat-skills-wrap")) $("chat-skills-wrap").hidden = !canTools;
+  if (typeof updateSkillsChatUI === "function") updateSkillsChatUI();
+  if ($("chat-mcp-wrap")) $("chat-mcp-wrap").hidden = !canTools;
+  if (typeof updateMcpChatUI === "function") updateMcpChatUI();
+  if (typeof updateChatRagAvailability === "function") updateChatRagAvailability();
+  // The workflow list is fetched once and cached; this only re-applies the gate
+  // and the selector contents against it.
+  if (typeof updateComfyChatUI === "function") {
+    updateComfyChatUI();
+    void refreshComfyChatUI(false);
+  }
+
+  const artBtn = $("chat-model-artifacts-btn");
+  if (artBtn) artBtn.hidden = true;
+
+  void refreshModelArtifactCount();
+
+  const imgOpts = $("chat-image-options-wrap");
+  if (imgOpts) imgOpts.hidden = !isImageModel;
+  const sysField = $("chat-system-field");
+  if (sysField) sysField.hidden = isImageModel;
+  const tempField = $("chat-temperature-field");
+  if (tempField) tempField.hidden = isImageModel;
+  const topKField = $("chat-top-k-field");
+  if (topKField) topKField.hidden = isImageModel;
+  const topPField = $("chat-top-p-field");
+  if (topPField) topPField.hidden = isImageModel;
+  const numCtxField = $("chat-num-ctx-field");
+  if (numCtxField) numCtxField.hidden = isImageModel;
+
+  const inputEl = $("chat-input");
+  if (inputEl && !chatIsRecording) {
+    inputEl.placeholder = isImageModel
+      ? (t("chat.image_input_placeholder") || "Describe the image you want to generate…")
+      : (t("chat.input_placeholder") || "Write your message…");
+  }
+
+  if (!canAudio && chatIsRecording) {
+    stopAudioRecording(true);
+  }
+
+
+  const m = modelByName(model);
+
+  // Update Model Performance Stats (Record Tok/s and Min Cold Load)
+  const toksValEl = $("chat-model-stat-toks-val");
+  const toksCard = $("chat-model-stat-toks");
+  const loadValEl = $("chat-model-stat-load-val");
+  const loadCard = $("chat-model-stat-load");
+
+  if (toksValEl && toksCard) {
+    const tps = Number(m?.record_tokens_per_sec) || 0;
+    const decisionMinMs = Number(m?.decision_min_ms) || 0;
+    const speechCps = Number(m?.record_chars_per_sec) || 0;
+    if (tps > 0) {
+      const col = (typeof getToksRecordColor === "function") ? getToksRecordColor(tps) : "";
+      const colStyle = col ? `style="color:${col}"` : "";
+      toksValEl.innerHTML = `<span ${colStyle}>${tps.toFixed(1)}</span> <span class="stat-unit">tok/s</span>`;
+      toksCard.title = m.record_tokens_per_sec_at
+        ? t("detail.record_at", { date: fmtDateTimeFull(m.record_tokens_per_sec_at) })
+        : t("detail.record_tokens");
+    } else if (speechCps > 0) {
+      // Speech models synthesize characters instead of tokens, so their record
+      // speed is chars/s, the closest counterpart of tok/s.
+      const col = (typeof getToksRecordColor === "function") ? getToksRecordColor(speechCps) : "";
+      const colStyle = col ? `style="color:${col}"` : "";
+      toksValEl.innerHTML = `<span ${colStyle}>${Math.round(speechCps)}</span> <span class="stat-unit">chars/s</span>`;
+      toksCard.title = m.record_chars_per_sec_at
+        ? t("detail.record_at", { date: fmtDateTimeFull(m.record_chars_per_sec_at) })
+        : t("detail.record_chars");
+    } else if (decisionMinMs > 0) {
+      // Decision (System One) models have no tok/s; show their best latency.
+      toksValEl.innerHTML = `<span>${Math.round(decisionMinMs)}</span> <span class="stat-unit">ms</span>`;
+      toksCard.title = t("analytics.usage_stat_decision_min");
+    } else {
+      toksValEl.innerHTML = `<span style="color:var(--muted)">—</span>`;
+      toksCard.title = t("detail.record_tokens");
+    }
+  }
+
+  if (loadValEl && loadCard) {
+    const isExt = !!(m && m.is_external);
+    const hasMinLoad = (Number(m?.min_cold_load_ms) || 0) > 0;
+    const decisionColdMs = Number(m?.decision_cold_ms) || 0;
+    // Decision models do not record min_cold_load_ms; their cold latency is the
+    // closest thing to a load time, so fall back to it.
+    const coldMs = hasMinLoad ? Number(m.min_cold_load_ms) : decisionColdMs;
+    if (!isExt && coldMs > 0) {
+      loadValEl.textContent = fmtColdLoad(coldMs);
+      const at = hasMinLoad ? m.min_cold_load_at : m.decision_cold_at;
+      loadCard.title = at
+        ? t("detail.min_load_at", { date: fmtDateTimeFull(at) })
+        : t("detail.min_cold_load");
+    } else {
+      loadValEl.innerHTML = `<span style="color:var(--muted)">—</span>`;
+      // A model that already answered but has no cold load was in memory when
+      // the app first used it (a run from the terminal, another client), so
+      // there was no load to time. Say that instead of leaving a bare dash.
+      const usedWithoutCold = (Number(m?.total_calls) || 0) > 0;
+      loadCard.title = isExt
+        ? t("detail.external_model")
+        : usedWithoutCold ? t("chat.cold_load_unmeasured") : t("detail.min_cold_load");
+    }
+  }
+
+  const capsHtml = renderCapabilityPills(m?.capabilities);
+  const capBlock = $("chat-cap-block");
+  const capHost = $("chat-cap-flags");
+  if (capBlock && capHost) {
+    if (!capsHtml) {
+      capBlock.hidden = true;
+      capHost.innerHTML = "";
+    } else {
+      capBlock.hidden = false;
+      capHost.innerHTML = capsHtml;
+    }
+  }
+  updateChatModelLoadDot();
+  if (typeof adjustChatSystemPromptHeight === "function") {
+    adjustChatSystemPromptHeight();
+  }
+  if (typeof updateDecisionChatUI === "function") {
+    updateDecisionChatUI();
+  }
+  // A speech-only model uses its own voice list, so the Speech block has to
+  // follow the chat model too, not only the installed speech models.
+  if (typeof updateSpeechUI === "function") {
+    updateSpeechUI();
+  }
+}
+
+function updateChatContextMeter() {
+  const meter = $("chat-context-meter");
+  const selectedName = $("chat-model")?.value || "";
+  const selected = modelByName(selectedName);
+  const maxCtx = Number(selected?.context_length) || 0;
+  const ring = $("chat-context-ring");
+  if (!maxCtx) {
+    if (meter) meter.textContent = "—";
+    if (ring) {
+      ring.style.setProperty("--ctx-pct", "0%");
+      ring.title = "";
+    }
+    return;
+  }
+  const used = Math.max(0, Number(chatLastUsedTokens) || 0);
+  const pct = Math.min(999, Math.round((used / maxCtx) * 100));
+  const ringPct = `${Math.max(0, Math.min(100, (used / maxCtx) * 100))}%`;
+  if (meter) meter.textContent = `${fmtCtx(used)} / ${fmtCtx(maxCtx)} (${pct}%)`;
+  if (ring) {
+    ring.style.setProperty("--ctx-pct", ringPct);
+    ring.title = `${fmtCtx(used)} / ${fmtCtx(maxCtx)} (${pct}%)`;
+  }
+}
+
+function showModelsView() {
+  hideAllMainViews();
+  const chatView = $("chat-view");
+  const modelsView = $("models-view");
+  chatView?.classList.remove("chat-options-open");
+  syncChatPanels(chatView);
+  stopSpeechPlayback();
+  currentView = "models";
+  if (modelsView) modelsView.hidden = false;
+  if (window.location.pathname !== "/") {
+    history.pushState(null, "", "/");
+  }
+  renderTable();
+  void refreshModels();
+}
+
+function resetChatState() {
+  stopAudioRecording(true);
+  stopSpeechPlayback();
+  if (chatAbortController) {
+    try { chatAbortController.abort(); } catch (_) { }
+    chatAbortController = null;
+  }
+  chatStreamLock = false;
+  chatSessionResetting = false;
+  chatMessages = [];
+  chatAttachments = [];
+  chatPendingQueue = [];
+  chatLastUsedTokens = 0;
+  chatEditingMessageId = "";
+  chatEditingDraft = "";
+  chatEditingAttachments = [];
+  chatDndDepth = 0;
+  stopThinkTicker();
+  updateStreamBar();
+  closeImagePreview();
+  hideArtifactPanel();
+  activeArtifactTimestamp = null;
+  activeArtifactName = null;
+  activeArtifactUrl = null;
+  updateArtifactResourceBtn();
+  updateChatContextMeter();
+  if ($("chat-dropzone")) $("chat-dropzone").hidden = true;
+  if ($("chat-attachments")) {
+    $("chat-attachments").hidden = true;
+    $("chat-attachments").innerHTML = "";
+  }
+  renderChatQueue();
+  if ($("chat-messages")) $("chat-messages").innerHTML = `<div class="chat-empty muted">${escapeHtml(t("chat.empty"))}</div>`;
+  if ($("chat-input")) $("chat-input").value = "";
+  if (typeof updateChatSendEnabled === "function") {
+    updateChatSendEnabled();
+  }
+  try {
+    sessionStorage.removeItem("iamanager_active_chat_session");
+  } catch (_) { }
+}
+
+const CHAT_SESSION_STORAGE_KEY = "iamanager_active_chat_session";
+
+// pendingChatSessionOpenId is set when a reload happened while a persistent
+// session was open. app-sessions.js picks it up and reloads from the server.
+let pendingChatSessionOpenId = null;
+
+function saveActiveChatSession() {
+  try {
+    if (typeof chatMessages === "undefined") return;
+    const model = $("chat-model")?.value || "";
+    const input = $("chat-input")?.value || "";
+    const hasData = (chatMessages && chatMessages.length > 0) || (input && input.trim()) || (chatAttachments && chatAttachments.length > 0);
+    if (!hasData) {
+      sessionStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
+      return;
+    }
+    const sessionData = {
+      model,
+      messages: chatMessages,
+      input,
+      attachments: chatAttachments,
+      activeArtifactTimestamp,
+      activeArtifactName,
+      activeArtifactUrl,
+      chatLastUsedTokens,
+      sessionId: typeof chatSessionId === "undefined" ? null : chatSessionId,
+      savedAt: Date.now(),
+    };
+    sessionStorage.setItem(CHAT_SESSION_STORAGE_KEY, JSON.stringify(sessionData));
+  } catch (_) { }
+}
+
+function restoreActiveChatSession() {
+  try {
+    const raw = sessionStorage.getItem(CHAT_SESSION_STORAGE_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    if (!data || ((!data.messages || !data.messages.length) && !data.input && (!data.attachments || !data.attachments.length))) {
+      sessionStorage.removeItem(CHAT_SESSION_STORAGE_KEY);
+      return false;
+    }
+    // A persistent session lives on the server, so there is nothing to replay
+    // from sessionStorage: just remember which one was open and let
+    // app-sessions.js fetch the real transcript once the DOM is ready.
+    if (data.sessionId) {
+      pendingChatSessionOpenId = data.sessionId;
+      return true;
+    }
+    if (data.model && $("chat-model")) {
+      $("chat-model").value = data.model;
+    }
+    if (Array.isArray(data.messages) && data.messages.length) {
+      chatMessages = data.messages;
+    }
+    if (data.input && $("chat-input")) {
+      $("chat-input").value = data.input;
+    }
+    if (Array.isArray(data.attachments)) {
+      chatAttachments = data.attachments;
+    }
+    if (data.activeArtifactTimestamp) activeArtifactTimestamp = data.activeArtifactTimestamp;
+    if (data.activeArtifactName) activeArtifactName = data.activeArtifactName;
+    if (data.activeArtifactUrl) activeArtifactUrl = data.activeArtifactUrl;
+    if (data.chatLastUsedTokens) chatLastUsedTokens = data.chatLastUsedTokens;
+
+    if (typeof renderChatMessages === "function") renderChatMessages();
+    if (typeof renderAttachments === "function") renderAttachments();
+    if (typeof updateArtifactResourceBtn === "function") updateArtifactResourceBtn();
+    if (typeof updateChatContextMeter === "function") updateChatContextMeter();
+    if (typeof updateChatSendEnabled === "function") updateChatSendEnabled();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function showChatView() {
+  const chatView = $("chat-view");
+  const modelsView = $("models-view");
+  if (!chatView || !modelsView) {
+    toast(t("toast.error", { msg: "chat UI is not available; refresh the page" }), "error");
+    return;
+  }
+  if (currentView !== "chat" && !chatMessages.length && !$("chat-input")?.value?.trim()) {
+    resetChatState();
+  }
+  hideAllMainViews();
+  currentView = "chat";
+  chatView.classList.remove("chat-options-open");
+  chatView.hidden = false;
+  if (typeof updateChatSessionChrome === "function") updateChatSessionChrome();
+  syncChatPanels(chatView);
+  $("chat-btn")?.classList.add("active");
+  if (activeName) {
+    activeName = null;
+    document.querySelectorAll("tbody tr.row.active").forEach((tr) => tr.classList.remove("active"));
+  }
+  if (window.location.pathname.startsWith("/settings") || window.location.pathname.startsWith("/hf") || window.location.pathname.startsWith("/modelfile") || window.location.pathname.startsWith("/tests") || window.location.pathname.startsWith("/analytics") || window.location.pathname.startsWith("/leaderboard")) {
+    history.pushState(null, "", "/");
+  }
+  syncChatModelOptions();
+  updateChatCapabilityUI();
+  if (typeof chatRagValidateSelection === "function") {
+    void chatRagValidateSelection(typeof chatSessionId !== "undefined" && !!chatSessionId);
+  }
+  updateChatContextMeter();
+  updateChatSendEnabled();
+  void applyChatDefaultsForModel($("chat-model").value);
+  // The session panel is scoped to the selected model, so a full view switch
+  // has to re-apply that filter (and drop a session that belongs elsewhere).
+  if (typeof syncChatModelScope === "function") syncChatModelScope();
+  // Coming back to the chat is the same as reading the last message of an open
+  // session, so its unread badge has to go. It cannot wait for openChatSession:
+  // a session that was already open is never re-opened on the way back, only
+  // re-displayed. The guard keeps the quick chat, which has no sessions, working
+  // exactly as before.
+  if (typeof chatSessionId !== "undefined" && chatSessionId && typeof markChatSessionSeen === "function") {
+    markChatSessionSeen(chatSessionId);
+  }
+  setTimeout(() => $("chat-input")?.focus(), 20);
+}
+
+$("chat-input")?.addEventListener("input", () => {
+  saveActiveChatSession();
+});
+
+if (typeof ResizeObserver !== "undefined") {
+  const chatMarqueeRO = new ResizeObserver(() => {
+    if (typeof updateChatModelDisplay === "function") {
+      updateChatModelDisplay();
+    }
+  });
+  const t1 = $("chat-model-marquee-track");
+  if (t1) chatMarqueeRO.observe(t1);
+  const t2 = $("chat-model-name-track");
+  if (t2) chatMarqueeRO.observe(t2);
+}
+window.addEventListener("resize", () => {
+  if (typeof currentView !== "undefined" && currentView === "chat" && typeof updateChatModelDisplay === "function") {
+    updateChatModelDisplay();
+  }
+});
+
